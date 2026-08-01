@@ -39,7 +39,7 @@ body:
     id: plugins
     attributes:
       label: 相关插件
-      description: 请列出 GroupChatPlus、LivingMemory、Self Learning、AnySearch 等插件的版本与启用状态。
+      description: 请列出 LivingMemory、AnySearch 及其他会改写 LLM 请求的插件版本与启用状态。
     validations:
       required: true
   - type: textarea
