@@ -1,0 +1,184 @@
+{
+  "enabled": {
+    "description": "启用星汐回复链",
+    "type": "bool",
+    "hint": "控制 Planner、表达检索和角色回复。关闭它不会关闭下方的内置权限守卫；普通群友仍然只能使用明确加入白名单的只读工具。",
+    "default": true
+  },
+  "owner_ids": {
+    "description": "主人 ID 白名单",
+    "type": "list",
+    "hint": "星汐权限守卫与主人任务模式共同使用的唯一白名单。只有这里列出的发送者 ID 可以保留完整 Agent、MCP、浏览器、Shell、沙箱、代码执行及其他高权限工具。",
+    "default": []
+  },
+  "permission_guard_enabled": {
+    "description": "启用内置 Agent 权限守卫",
+    "type": "bool",
+    "hint": "强烈建议始终开启。普通用户在 LLM 执行前只保留下方精确白名单中的只读工具；发送者 ID 缺失时仍清空全部工具；主人保留完整 Agent 能力。",
+    "default": true
+  },
+  "guest_allowed_tools": {
+    "description": "普通用户只读工具白名单",
+    "type": "list",
+    "hint": "按 LLM 工具名称精确匹配。默认开放 AnySearch 普通搜索和网页提取；批量搜索未默认开放，以控制额度、Token 与等待时间。只加入你亲自确认过的只读查询工具，绝对不要加入浏览器控制、文件、Shell、代码执行、服务器管理或其他可写工具。",
+    "default": ["anysearch_search", "anysearch_extract"]
+  },
+  "inject_verified_context": {
+    "description": "向模型注入已验证权限状态",
+    "type": "bool",
+    "hint": "推荐开启。权限状态仅在当前请求临时存在，不写入聊天历史；普通角色聊天开始前还会自动清除该技术标签。",
+    "default": true
+  },
+  "permission_audit_log": {
+    "description": "记录工具拦截日志",
+    "type": "bool",
+    "hint": "开启后，AstrBot 日志会记录普通用户请求中被白名单移除的工具数量和部分名称；获准的只读工具不会被记作拦截。",
+    "default": true
+  },
+  "persona_name": {
+    "description": "角色名称",
+    "type": "string",
+    "hint": "用于 Replyer 确认当前说话角色。",
+    "default": "亚托莉"
+  },
+  "voice_card": {
+    "description": "角色说话风格卡",
+    "type": "text",
+    "hint": "留空使用内置的精简 ATRI 风格卡。这里只写稳定性格和语言习惯，不要粘贴权限、工具或长篇世界观规则。",
+    "default": ""
+  },
+  "planner_enabled": {
+    "description": "启用隐藏说话规划",
+    "type": "bool",
+    "hint": "推荐开启。Planner 只生成紧凑 JSON，不直接写群聊台词。关闭后使用本地规则降级。",
+    "default": true
+  },
+  "planner_provider_id": {
+    "description": "Planner 聊天模型",
+    "type": "string",
+    "hint": "推荐使用速度快、JSON 遵循能力好的便宜模型。留空使用当前会话模型。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "replyer_provider_id": {
+    "description": "违规重写模型",
+    "type": "string",
+    "hint": "仅在最终回复严重违规、需要重写时使用。留空使用当前会话模型。主回复仍由当前 AstrBot 会话模型生成。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "embedding_provider_id": {
+    "description": "表达检索 Embedding Provider",
+    "type": "string",
+    "hint": "建议填写已部署的 qwen3-embedding:0.6b 对应 Provider ID。留空则使用本地文字匹配。",
+    "default": "",
+    "options": [""],
+    "labels": ["不使用 Embedding（本地文字匹配）"],
+    "_provider_type": "embedding"
+  },
+  "rerank_provider_id": {
+    "description": "表达精排 Reranker Provider",
+    "type": "string",
+    "hint": "建议填写 bge-reranker-v2-m3 对应 Provider ID。留空则直接使用 Embedding 排序。",
+    "default": "",
+    "options": [""],
+    "labels": ["不使用 Reranker（沿用初筛顺序）"],
+    "_provider_type": "rerank"
+  },
+  "style_candidate_count": {
+    "description": "精排候选表达数",
+    "type": "int",
+    "hint": "Embedding 初筛后交给 Reranker 的候选数量。",
+    "default": 12
+  },
+  "style_top_k": {
+    "description": "最终表达参考数",
+    "type": "int",
+    "hint": "最多支持 3 条。推荐 2 或 3；设为 0 可关闭表达范例。",
+    "default": 3
+  },
+  "max_context_messages": {
+    "description": "Replyer 历史消息数",
+    "type": "int",
+    "hint": "只保留真实 user/assistant 消息，并尽量保留来源群 ID、每位群成员的昵称和发送者 ID；system、工具结果和隐藏记忆不会直接进入 Replyer。",
+    "default": 16
+  },
+  "max_context_chars": {
+    "description": "Replyer 历史最大字符数",
+    "type": "int",
+    "hint": "防止群聊历史过长导致延迟和 Token 消耗。",
+    "default": 9000
+  },
+  "planner_material_chars": {
+    "description": "Planner 资料最大字符数",
+    "type": "int",
+    "hint": "包含人格、LivingMemory 等插件注入资料。只供 Planner 提炼，不直接发给 Replyer。",
+    "default": 9000
+  },
+  "chat_soft_chars": {
+    "description": "闲聊建议总长度",
+    "type": "int",
+    "hint": "这是给模型的软目标，不是截断线。闲聊会尽量简短，但绝不会从固定字符处把话切断。",
+    "default": 100
+  },
+  "long_form_soft_chars": {
+    "description": "内容型回答建议长度",
+    "type": "int",
+    "hint": "用于资料解释、教程、对比和排错。只是篇幅参考，必要内容仍会完整回答。",
+    "default": 1200
+  },
+  "enable_chat_bubbles": {
+    "description": "闲聊分成多个聊天气泡",
+    "type": "bool",
+    "hint": "开启后，一至三段自然口语会像真人一样分开发送；内容型长回答不会拆成碎句。",
+    "default": true
+  },
+  "chat_max_bubbles": {
+    "description": "闲聊最多气泡数",
+    "type": "int",
+    "hint": "推荐 2 或 3。多出的完整句会自然合并，不会丢失或硬截断。",
+    "default": 3
+  },
+  "bubble_interval_min_ms": {
+    "description": "气泡最短间隔（毫秒）",
+    "type": "int",
+    "hint": "两条闲聊消息之间的随机等待下限。",
+    "default": 450
+  },
+  "bubble_interval_max_ms": {
+    "description": "气泡最长间隔（毫秒）",
+    "type": "int",
+    "hint": "两条闲聊消息之间的随机等待上限。",
+    "default": 1200
+  },
+  "retry_on_violation": {
+    "description": "严重 OOC 时重写一次",
+    "type": "bool",
+    "hint": "只在空回复、篇幅明显失控、解释 AI/人设或总结腔等严重问题出现时增加一次模型请求；重写失败也会保留完整原文，不再硬截断。",
+    "default": true
+  },
+  "owner_task_bypass": {
+    "description": "主人任务自动绕过",
+    "type": "bool",
+    "hint": "Planner 判断主人正在执行工具、文件、代码或服务器任务时，不接管请求，保留完整 AstrBot Agent 能力。",
+    "default": true
+  },
+  "owner_task_prefixes": {
+    "description": "主人强制任务前缀",
+    "type": "list",
+    "hint": "主人消息以其中之一开头时，不经过 Planner，直接使用原始 Agent 链。",
+    "default": ["/agent", "/task"]
+  },
+  "owner_chat_prefixes": {
+    "description": "主人强制角色聊天前缀",
+    "type": "list",
+    "hint": "用于 Planner 可能误判时强制走星汐聊天链，前缀不会发送给 Replyer。",
+    "default": ["/chat", "/role"]
+  },
+  "debug_log": {
+    "description": "输出调试日志",
+    "type": "bool",
+    "hint": "开启后记录说话计划和守卫命中原因，不记录完整隐藏提示词。",
+    "default": false
+  }
+}

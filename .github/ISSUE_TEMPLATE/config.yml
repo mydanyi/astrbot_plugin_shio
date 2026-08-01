@@ -1,0 +1,6 @@
+blank_issues_enabled: false
+contact_links:
+  - name: AstrBot 官方文档
+    url: https://docs.astrbot.app/
+    about: AstrBot 安装、Provider、平台适配器和通用插件问题请先查看官方文档。
+

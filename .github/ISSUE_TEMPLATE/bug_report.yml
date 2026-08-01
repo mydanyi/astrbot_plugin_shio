@@ -1,0 +1,93 @@
+name: Bug 报告
+description: 报告可复现的回复、权限、身份、联网或插件兼容问题
+title: "[Bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢测试星汐。请先删除 API Key、Cookie、真实 QQ 号、群号、私聊和他人记忆，再提交日志。
+  - type: input
+    id: shio_version
+    attributes:
+      label: 星汐版本
+      placeholder: 例如 0.1.9
+    validations:
+      required: true
+  - type: input
+    id: astrbot_version
+    attributes:
+      label: AstrBot 版本
+      placeholder: 例如 4.26.7
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: 平台与适配器
+      placeholder: 例如 QQ / aiocqhttp / NapCat
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: 聊天模型与 Provider
+      placeholder: 模型名称、Provider 类型，是否支持工具调用
+    validations:
+      required: true
+  - type: textarea
+    id: plugins
+    attributes:
+      label: 相关插件
+      description: 请列出 GroupChatPlus、LivingMemory、Self Learning、AnySearch 等插件的版本与启用状态。
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: 星汐相关配置
+      description: 只贴与问题有关的脱敏配置；不要提交任何密钥。
+      render: yaml
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 用户 A 发送……
+        2. 用户 B 发送……
+        3. 机器人出现……
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 完整脱敏日志
+      description: 从 Core 收到消息开始，到 Prepare to send 或发送结束为止。使用固定占位符保留人物与群的对应关系。
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 提交确认
+      options:
+        - label: 我已搜索现有 Issue，未发现相同问题。
+          required: true
+        - label: 我已移除密钥、Cookie、真实账号、群号、私聊和他人记忆。
+          required: true
+        - label: 如果这是越权漏洞，我不会公开利用细节，而会按照 SECURITY.md 私下报告。
+          required: true
