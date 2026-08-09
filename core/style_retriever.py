@@ -127,6 +127,7 @@ class StyleRetriever:
         rerank_provider: Any = None,
         candidate_count: int = 12,
         top_k: int = 3,
+        feedback_scores: dict[str, float] | None = None,
     ) -> list[Expression]:
         expressions = self.load()
         if not expressions or top_k <= 0:
@@ -189,4 +190,18 @@ class StyleRetriever:
                     candidates = selected
             except Exception as exc:
                 self.logger.warning("[星汐] Reranker 调用失败，使用向量排序结果：%s", exc)
+        if feedback_scores:
+            original_order = {index: rank for rank, index in enumerate(candidates)}
+            candidates = sorted(
+                candidates,
+                key=lambda index: (
+                    -original_order[index]
+                    + max(
+                        -2.0,
+                        min(2.0, float(feedback_scores.get(expressions[index].id, 0.0))),
+                    )
+                    * 0.30
+                ),
+                reverse=True,
+            )
         return [expressions[index] for index in candidates[:top_k]]

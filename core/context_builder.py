@@ -4,6 +4,7 @@ import json
 import re
 from typing import Any
 
+
 def content_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content.strip()
@@ -42,6 +43,63 @@ def _raw_contexts(request_contexts: list[dict] | None) -> list[Any]:
     return list(request_contexts or [])
 
 
+def normalize_group_id(value: Any) -> str:
+    """把 LivingMemory 的完整 UMO 或普通群号统一成群 ID。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parts = text.split(":")
+    if len(parts) >= 3 and "group" in parts[-2].lower():
+        return parts[-1].strip()
+    return text
+
+
+def _sender_fields(item: dict[str, Any]) -> tuple[str, str, str]:
+    metadata = item.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    sender = item.get("sender", {})
+    if not isinstance(sender, dict):
+        sender = {}
+    sender_id = str(
+        item.get("sender_id")
+        or item.get("user_id")
+        or sender.get("user_id")
+        or sender.get("id")
+        or metadata.get("sender_id")
+        or ""
+    ).strip()
+    sender_name = str(
+        item.get("sender_name")
+        or item.get("username")
+        or item.get("nickname")
+        or item.get("name")
+        or sender.get("nickname")
+        or sender.get("name")
+        or metadata.get("sender_name")
+        or ""
+    ).strip()
+    source_group_id = normalize_group_id(
+        item.get("group_id") or metadata.get("group_id") or ""
+    )
+    return sender_id, sender_name, source_group_id
+
+
+def _is_prelabelled_user(text: str) -> bool:
+    return text.startswith(("[群ID:", "[发送者："))
+
+
+def _contains_sender_id(text: str, sender_id: str) -> bool:
+    if not sender_id:
+        return True
+    return bool(
+        re.search(
+            rf"(?:ID|id)\s*[:：]\s*{re.escape(sender_id)}(?:\D|$)",
+            text,
+        )
+    )
+
+
 def clean_contexts(
     event: Any,
     request_contexts: list[dict] | None,
@@ -49,10 +107,13 @@ def clean_contexts(
     max_messages: int,
     max_chars: int,
     group_id: str = "",
+    current_sender_id: str = "",
 ) -> list[dict[str, str]]:
-    """保留原生真实对话与可信身份字段，清除 system/tool/隐藏参考消息。"""
+    """保留可信对话并隔离群成员；群聊中丢弃无法确认发送者的完整旧轮次。"""
     cleaned: list[dict[str, str]] = []
     raw_contexts = _raw_contexts(request_contexts)
+    normalized_group_id = normalize_group_id(group_id)
+    trusted_group_turn = not bool(normalized_group_id)
     for item in raw_contexts:
         if not isinstance(item, dict):
             model_dump = getattr(item, "model_dump", None)
@@ -66,64 +127,50 @@ def clean_contexts(
         text = content_to_text(item.get("content", ""))
         if not text:
             continue
-        if role == "user" and not text.startswith(("[群ID:", "[发送者：")):
-            metadata = item.get("metadata", {})
-            if not isinstance(metadata, dict):
-                metadata = {}
-            sender = item.get("sender", {})
-            if not isinstance(sender, dict):
-                sender = {}
-            sender_id = str(
-                item.get("sender_id")
-                or item.get("user_id")
-                or sender.get("user_id")
-                or sender.get("id")
-                or metadata.get("sender_id")
-                or ""
-            ).strip()
-            sender_name = str(
-                item.get("sender_name")
-                or item.get("username")
-                or item.get("nickname")
-                or item.get("name")
-                or sender.get("nickname")
-                or sender.get("name")
-                or metadata.get("sender_name")
-                or ""
-            ).strip()
-            source_group_id = str(
-                item.get("group_id")
-                or metadata.get("group_id")
-                or group_id
-                or ""
-            ).strip()
+        if role == "user" and not _is_prelabelled_user(text):
+            sender_id, sender_name, source_group_id = _sender_fields(item)
             if sender_id or sender_name:
+                source_group_id = source_group_id or normalized_group_id
                 scope = f"群ID:{source_group_id}｜" if source_group_id else ""
                 text = (
                     f"[{scope}发送者：{sender_name or '未知用户'}｜ID:{sender_id or 'unknown'}] "
                     + text
                 )
+                trusted_group_turn = True
+            elif normalized_group_id:
+                # AstrBot 原生群聊 contexts 常把全群成员压成同一个 user，且不带
+                # sender_id。保留这种轮次会把前一个人的“我”继承给当前群友。
+                trusted_group_turn = False
+                continue
         elif role == "user" and text.startswith("[发送者："):
             # 兼容已经标注发送者、但尚未标注来源群的上游上下文。
-            metadata = item.get("metadata", {})
-            if not isinstance(metadata, dict):
-                metadata = {}
-            source_group_id = str(
-                item.get("group_id")
-                or metadata.get("group_id")
-                or group_id
-                or ""
-            ).strip()
+            _, _, source_group_id = _sender_fields(item)
+            source_group_id = source_group_id or normalized_group_id
             if source_group_id:
                 text = f"[群ID:{source_group_id}｜{text[1:]}"
+            trusted_group_turn = True
+        elif role == "user":
+            trusted_group_turn = True
+        elif normalized_group_id and not trusted_group_turn:
+            # 与上一条无身份 user 配对的 assistant 回复同样可能含有“你/主人”等
+            # 人物关系，必须整轮丢弃，不能留下半截污染后续身份判断。
+            continue
         cleaned.append({"role": role, "content": text[:2000]})
 
-    while current_message.strip() and cleaned and cleaned[-1]["role"] == "user":
-        tail = cleaned[-1]["content"].strip()
-        if tail == current_message.strip() or current_message.strip() in tail[-len(current_message) - 20 :]:
-            cleaned.pop()
-        else:
-            break
+    current = current_message.strip()
+    if current:
+        # LivingMemory 可能已在 on_llm_request 前记录当前消息。按发送者 ID 从尾部
+        # 精确移除本轮，避免当前问题既在 history 又在 prompt 中出现。
+        for index in range(len(cleaned) - 1, -1, -1):
+            item = cleaned[index]
+            if item["role"] != "user":
+                continue
+            tail = item["content"].strip()
+            if not _contains_sender_id(tail, current_sender_id):
+                continue
+            if tail == current or current in tail[-len(current) - 80 :]:
+                cleaned.pop(index)
+                break
 
     cleaned = cleaned[-max(1, max_messages) :]
     total = 0

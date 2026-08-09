@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import time
 from typing import Any
 
 from .models import SpeechPlan
@@ -114,6 +116,8 @@ class SpeechPlanner:
         self,
         *,
         provider: Any,
+        fallback_provider: Any = None,
+        timeout_seconds: float = 20.0,
         sender_name: str,
         sender_id: str,
         platform_id: str,
@@ -134,6 +138,21 @@ class SpeechPlanner:
         if group_id:
             verified_target += f"（群ID:{group_id}）"
         fallback.target = verified_target
+        identity_role = "主人" if is_owner else "普通群友"
+        fallback.facts = [
+            f"当前发送者是{sender_name or '未知昵称'}（ID:{sender_id or '缺失'}），代码验证身份为{identity_role}。",
+            *fallback.facts,
+        ][:5]
+        fallback.avoid = [
+            *fallback.avoid,
+            "把当前发送者、主人和消息中的第三人称对象混为一人",
+            "根据历史昵称、自称或代词猜测当前发送者身份",
+        ][:6]
+        if re.search(r"(?:他|她|它|TA|ta|那个人|刚刚那人|刚才那人)", current_message):
+            fallback.facts = [
+                *fallback.facts,
+                "当前消息中的第三人称对象身份未由代码验证；保持原有指代，不得默认当成当前发送者或主人。",
+            ][:5]
         if not enabled or provider is None:
             return fallback
         prompt = build_planner_prompt(
@@ -149,18 +168,48 @@ class SpeechPlanner:
             transcript=transcript,
             supporting_material=supporting_material,
         )
-        try:
-            response = await provider.text_chat(
-                prompt=prompt,
-                contexts=[],
-                system_prompt=PLANNER_SYSTEM_PROMPT,
-                func_tool=None,
-                request_max_retries=1,
-            )
-            parsed = parse_json_object(response.completion_text)
+        attempts: list[tuple[str, Any]] = [("主", provider)]
+        if fallback_provider is not None and fallback_provider is not provider:
+            attempts.append(("备用", fallback_provider))
+        # 生产配置在调用方限制为 3～60 秒；这里保留更小值便于精确单元测试。
+        timeout_seconds = min(60.0, max(0.01, float(timeout_seconds)))
+
+        for attempt_name, candidate in attempts:
+            provider_name = self._provider_name(candidate)
+            started = time.monotonic()
+            try:
+                completion_text = await asyncio.wait_for(
+                    self._request_completion(candidate, prompt),
+                    timeout=timeout_seconds,
+                )
+            except TimeoutError:
+                elapsed = time.monotonic() - started
+                self.logger.warning(
+                    "[星汐/Planner] %s Provider %s 达到插件硬超时 %.1f 秒，已取消 SDK 内部等待。",
+                    attempt_name,
+                    provider_name,
+                    elapsed,
+                )
+                continue
+            except Exception as exc:
+                elapsed = time.monotonic() - started
+                self.logger.warning(
+                    "[星汐/Planner] %s Provider %s 调用失败（%s，%.1f 秒）。",
+                    attempt_name,
+                    provider_name,
+                    type(exc).__name__,
+                    elapsed,
+                )
+                continue
+
+            parsed = parse_json_object(completion_text)
             if parsed is None:
-                self.logger.warning("[星汐] Planner 未返回合法 JSON，已使用本地降级计划。")
-                return fallback
+                self.logger.warning(
+                    "[星汐/Planner] %s Provider %s 未返回合法 JSON，继续降级。",
+                    attempt_name,
+                    provider_name,
+                )
+                continue
             plan = SpeechPlan.from_mapping(parsed)
             plan.target = verified_target
             # 明确要求搜索或回答强时效信息时，代码规则拥有最终决定权。
@@ -173,7 +222,79 @@ class SpeechPlanner:
                 plan.use_allowed_tools = False
             if not is_owner:
                 plan.mode = "chat"
+            if attempt_name == "备用":
+                self.logger.info(
+                    "[星汐/Planner] 备用 Provider %s 已接管规划，耗时 %.1f 秒。",
+                    provider_name,
+                    time.monotonic() - started,
+                )
             return plan
-        except Exception as exc:
-            self.logger.warning("[星汐] Planner 调用失败，已使用本地降级计划：%s", exc)
-            return fallback
+
+        self.logger.warning("[星汐/Planner] 所有 Provider 均失败，已使用身份安全的本地降级计划。")
+        return fallback
+
+    async def _request_completion(self, provider: Any, prompt: str) -> str:
+        """调用 Planner Provider，且不改动共享的主对话配置。
+
+        DeepSeek V4 默认启用思考。AstrBot 4.26.7 虽然接收额外的
+        ``text_chat`` 参数，但在组装请求时不会把它们放进最终载荷，因此
+        直接传入 ``thinking`` 不会生效。官方 DeepSeek V4 走 AstrBot 的
+        单次请求路径显式关闭思考，让主对话仍保留原本的思考配置。
+        """
+        if self._supports_deepseek_nonthinking_query(provider):
+            query = getattr(provider, "_query")
+            model = str(provider.get_model() or "").strip()
+            payloads = {
+                "messages": [
+                    {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                "model": model,
+                "max_tokens": 512,
+                "response_format": {"type": "json_object"},
+                "thinking": {"type": "disabled"},
+            }
+            response = await query(payloads, None, request_max_retries=1)
+        else:
+            response = await provider.text_chat(
+                prompt=prompt,
+                contexts=[],
+                system_prompt=PLANNER_SYSTEM_PROMPT,
+                func_tool=None,
+                request_max_retries=1,
+            )
+
+        completion_text = str(getattr(response, "completion_text", "") or "").strip()
+        if not completion_text:
+            raise ValueError("planner provider returned empty completion text")
+        return completion_text
+
+    @staticmethod
+    def _supports_deepseek_nonthinking_query(provider: Any) -> bool:
+        query = getattr(provider, "_query", None)
+        get_model = getattr(provider, "get_model", None)
+        if not callable(query) or not callable(get_model):
+            return False
+
+        model = str(get_model() or "").strip().lower()
+        deepseek_models = ("deepseek-v4", "deepseek-chat", "deepseek-reasoner")
+        if not any(marker in model for marker in deepseek_models):
+            return False
+
+        config = getattr(provider, "provider_config", {})
+        api_base = str(config.get("api_base", "") if isinstance(config, dict) else "")
+        client_base = str(getattr(getattr(provider, "client", None), "base_url", ""))
+        return "api.deepseek.com" in f"{api_base} {client_base}".lower()
+
+    @staticmethod
+    def _provider_name(provider: Any) -> str:
+        try:
+            provider_id = str(getattr(provider.meta(), "id", "") or "").strip()
+            if provider_id:
+                return provider_id
+        except Exception:
+            pass
+        provider_id = str(
+            getattr(provider, "provider_config", {}).get("id", "") or ""
+        ).strip()
+        return provider_id or type(provider).__name__

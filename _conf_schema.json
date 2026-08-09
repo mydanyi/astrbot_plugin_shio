@@ -5,6 +5,132 @@
     "hint": "控制 Planner、表达检索和角色回复。关闭它不会关闭下方的内置权限守卫；普通群友仍然只能使用明确加入白名单的只读工具。",
     "default": true
   },
+  "ambient_participation_enabled": {
+    "description": "允许未被点名时自然接话",
+    "type": "bool",
+    "hint": "开启后，星汐会被动听取群聊，并在去抖后通过本地“听／等／回复”门控决定是否参与。它不会回答每条消息，也不会为这种主动接话开放任何工具。为避免升级后突然改变行为，默认关闭。",
+    "default": false
+  },
+  "ambient_group_whitelist": {
+    "description": "自然接话群白名单",
+    "type": "list",
+    "hint": "填写群 ID。留空表示所有群都可使用自然接话；建议先只填测试群，确认存在感和阈值合适后再逐步开放。",
+    "default": []
+  },
+  "ambient_debounce_seconds": {
+    "description": "接话前静默去抖（秒）",
+    "type": "float",
+    "hint": "等待群友把连续几条话说完，再只对最新一批消息判定一次。推荐 3～6 秒。",
+    "default": 4.0
+  },
+  "ambient_reply_threshold": {
+    "description": "自然接话阈值",
+    "type": "float",
+    "hint": "越高越安静。疑问、邀请观点、提到角色以及多人活跃话题会加分；短反应、指令、纯链接和明确拒绝参与会减分。推荐先用 4.2。",
+    "default": 4.2
+  },
+  "ambient_reply_cooldown_seconds": {
+    "description": "自然接话冷却（秒）",
+    "type": "int",
+    "hint": "机器人刚说完后至少等待多久，避免在群里连续抢话。",
+    "default": 45
+  },
+  "ambient_max_replies_per_hour": {
+    "description": "每群每小时自然接话上限",
+    "type": "int",
+    "hint": "只统计未被点名的主动接话与主动话题，限制 Token 和群聊存在感。",
+    "default": 8
+  },
+  "ambient_recent_window_seconds": {
+    "description": "参与判定消息窗口（秒）",
+    "type": "int",
+    "hint": "只在这个时间范围内选择最值得回应的目标消息。",
+    "default": 180
+  },
+  "ambient_recent_window_messages": {
+    "description": "参与判定最多消息数",
+    "type": "int",
+    "hint": "限制每次门控查看的近期消息数量，避免长群聊拖慢处理。",
+    "default": 12
+  },
+  "ambient_ignore_prefixes": {
+    "description": "自然接话忽略前缀",
+    "type": "list",
+    "hint": "以这些前缀开头的未点名消息只记录上下文，不主动参与，避免抢其他机器人或群命令。",
+    "default": ["/", "!", "！", "."]
+  },
+  "quiet_topic_enabled": {
+    "description": "长时间安静后主动发起话题",
+    "type": "bool",
+    "hint": "完全静默也可主动说话。此功能会产生额外模型调用，只对下方明确列出的群生效，并且永远不携带工具。默认关闭。",
+    "default": false
+  },
+  "quiet_topic_group_whitelist": {
+    "description": "主动话题群白名单",
+    "type": "list",
+    "hint": "必须填写群 ID；留空时即使上方开关已开启也不会发送，防止误触所有群。",
+    "default": []
+  },
+  "quiet_topic_idle_minutes": {
+    "description": "群聊安静多久后可开话题（分钟）",
+    "type": "int",
+    "hint": "从该群最后一条真人消息开始计算，最低按 5 分钟处理。推荐 60～180 分钟。",
+    "default": 90
+  },
+  "quiet_topic_cooldown_minutes": {
+    "description": "主动话题冷却（分钟）",
+    "type": "int",
+    "hint": "机器人任意回复后至少等待这么久再主动开新话题，推荐不低于 180 分钟。",
+    "default": 240
+  },
+  "quiet_topic_max_per_day": {
+    "description": "每群每日主动话题上限",
+    "type": "int",
+    "hint": "限制完全静默时的主动发言次数和模型费用。",
+    "default": 2
+  },
+  "quiet_topic_active_start": {
+    "description": "主动话题开始时间",
+    "type": "string",
+    "hint": "使用 AstrBot 容器本地时间，格式 HH:MM。",
+    "default": "09:00"
+  },
+  "quiet_topic_active_end": {
+    "description": "主动话题结束时间",
+    "type": "string",
+    "hint": "使用 AstrBot 容器本地时间，格式 HH:MM；支持跨午夜时间段。",
+    "default": "23:30"
+  },
+  "quiet_topic_check_seconds": {
+    "description": "主动话题检查间隔（秒）",
+    "type": "int",
+    "hint": "后台只做轻量时间检查，真正满足条件时才调用模型。推荐保持 30～60 秒。",
+    "default": 45
+  },
+  "quiet_topic_context_messages": {
+    "description": "主动话题参考消息数",
+    "type": "int",
+    "hint": "只从内存中的该群近期消息寻找自然话题线索；不会调用搜索或其他工具。",
+    "default": 10
+  },
+  "social_profile_enabled": {
+    "description": "使用轻量互动画像",
+    "type": "bool",
+    "hint": "仅保存按群和用户隔离的互动次数与反馈倾向，用来调整熟络或克制程度；不把群友关系混到其他群，也不另存完整聊天文本。",
+    "default": true
+  },
+  "social_feedback_enabled": {
+    "description": "学习回复后的自然反馈",
+    "type": "bool",
+    "hint": "识别后续群消息中的明显正向或负向反馈，以很小的权重调整表达范例排序。不会自动改写角色卡或生成新的表达库内容。",
+    "default": true
+  },
+  "social_feedback_window_minutes": {
+    "description": "回复反馈观察窗口（分钟）",
+    "type": "int",
+    "hint": "只把机器人回复后这段时间内的明确反应当作弱反馈，避免把很久之后的话误归因到上一条回复。",
+    "default": 10
+  },
   "owner_ids": {
     "description": "主人 ID 白名单",
     "type": "list",
@@ -60,6 +186,19 @@
     "default": "",
     "_special": "select_provider"
   },
+  "planner_fallback_provider_id": {
+    "description": "Planner 备用聊天模型",
+    "type": "string",
+    "hint": "主 Planner 超时、报错或返回非法 JSON 时接管。留空时复用违规重写模型；两者都留空则直接使用身份安全的本地降级计划。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "planner_timeout_seconds": {
+    "description": "Planner 单模型硬超时（秒）",
+    "type": "float",
+    "hint": "每个 Planner Provider 的实际总等待上限，会取消 SDK 内部隐藏重试。建议 15～20 秒，可填 3～60。",
+    "default": 20
+  },
   "replyer_provider_id": {
     "description": "违规重写模型",
     "type": "string",
@@ -97,10 +236,16 @@
     "hint": "最多支持 3 条。推荐 2 或 3；设为 0 可关闭表达范例。",
     "default": 3
   },
+  "prefer_livingmemory_group_history": {
+    "description": "优先使用 LivingMemory 群聊身份历史",
+    "type": "bool",
+    "hint": "推荐开启。检测到 LivingMemory 时，星汐会读取其带群 ID、发送者 ID 和昵称的近期消息，避免 AstrBot 原生群聊 contexts 把全群成员压成同一个 user。LivingMemory 不可用时自动安全降级。",
+    "default": true
+  },
   "max_context_messages": {
     "description": "Replyer 历史消息数",
     "type": "int",
-    "hint": "只保留真实 user/assistant 消息，并尽量保留来源群 ID、每位群成员的昵称和发送者 ID；system、工具结果和隐藏记忆不会直接进入 Replyer。",
+    "hint": "只保留真实 user/assistant 消息，并强制保留来源群 ID、每位群成员的昵称和发送者 ID；无法确认发送者的原生群聊旧轮次会整轮丢弃，防止串人。",
     "default": 16
   },
   "max_context_chars": {
@@ -154,7 +299,7 @@
   "retry_on_violation": {
     "description": "严重 OOC 时重写一次",
     "type": "bool",
-    "hint": "只在空回复、篇幅明显失控、解释 AI/人设或总结腔等严重问题出现时增加一次模型请求；重写失败也会保留完整原文，不再硬截断。",
+    "hint": "在空回复、篇幅明显失控、解释 AI/人设、总结腔或把普通群友认成主人/群主时增加一次模型请求；身份错误连续出现时会改用安全校准回复。",
     "default": true
   },
   "owner_task_bypass": {
