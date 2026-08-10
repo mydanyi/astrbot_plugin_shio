@@ -38,6 +38,7 @@ from .core.response_guard import (
     TOOL_PROTOCOL_VIOLATION,
     clean_response,
     contains_tool_protocol,
+    extract_and_clean_internal_meme_references,
     find_violations,
     identity_safe_fallback,
     protocol_safe_fallback,
@@ -1342,6 +1343,34 @@ class ShioPlugin(Star):
             )
             return
         original = str(response.completion_text or "")
+        original, leaked_meme_references = (
+            extract_and_clean_internal_meme_references(original)
+        )
+        if leaked_meme_references:
+            candidate_map = event.get_extra(
+                "meme_manager_semantic_candidates", None
+            )
+            selected_reference = next(
+                (
+                    reference
+                    for reference in leaked_meme_references
+                    if isinstance(candidate_map, dict) and reference in candidate_map
+                ),
+                "",
+            )
+            if selected_reference:
+                event.set_extra(
+                    "meme_manager_semantic_selected_ids", [selected_reference]
+                )
+                logger.info(
+                    "[星汐/表达守卫] 已清理畸形表情引用并恢复模型选图：%s",
+                    selected_reference,
+                )
+            else:
+                logger.warning(
+                    "[星汐/表达守卫] 已清理无法验证的畸形表情引用：%s",
+                    ",".join(leaked_meme_references),
+                )
         reply_shape = str(payload.get("reply_shape", "chat_bubbles"))
         is_owner = bool(payload.get("is_owner", False))
         chat_max_bubbles = max(1, int(payload.get("chat_max_bubbles", 3)))
@@ -1437,6 +1466,10 @@ class ShioPlugin(Star):
                     ),
                 )
                 event.set_extra(SHIO_REPLY_RECORDED, True)
+        elif leaked_meme_references:
+            # Marker-only replies are valid when Meme Manager attaches an image.
+            # Leaving the original text here would expose the machine reference.
+            response.completion_text = ""
         if violations and bool(self._config("debug_log", False)):
             logger.info("[星汐] 输出守卫命中：%s", "、".join(violations))
 
@@ -1461,6 +1494,20 @@ class ShioPlugin(Star):
         ]
         if not text_components:
             return
+        final_meme_references: list[str] = []
+        for component in text_components:
+            cleaned_text, references = extract_and_clean_internal_meme_references(
+                component.text
+            )
+            component.text = cleaned_text
+            for reference in references:
+                if reference not in final_meme_references:
+                    final_meme_references.append(reference)
+        if final_meme_references:
+            logger.warning(
+                "[星汐/表达守卫] 发送前拦截残留表情引用：%s",
+                ",".join(final_meme_references),
+            )
         visible_text = "".join(comp.text for comp in text_components).strip()
         if contains_tool_protocol(visible_text):
             text_components[0].text = protocol_safe_fallback()

@@ -34,6 +34,19 @@ TOOL_PROTOCOL_PATTERNS: tuple[str, ...] = (
 )
 
 
+INTERNAL_MEME_REFERENCE_PATTERN = re.compile(
+    r"(?<![\w])"
+    r"(?:&{1,2}\s*)?"
+    r"(?:`{1,3}\s*)?"
+    r"(?:(?:meme)\s*:\s*){1,2}"
+    r"(?P<digest>[0-9a-f]{12,64})"
+    r"(?:\s*`{1,3})?"
+    r"(?:\s*&{1,2})?"
+    r"(?![\w])",
+    re.IGNORECASE,
+)
+
+
 def contains_tool_protocol(text: str) -> bool:
     """判断模型是否把内部工具协议错误地写进了可见正文。"""
     value = str(text or "")
@@ -41,6 +54,31 @@ def contains_tool_protocol(text: str) -> bool:
         re.search(pattern, value, flags=re.IGNORECASE)
         for pattern in TOOL_PROTOCOL_PATTERNS
     )
+
+
+def extract_and_clean_internal_meme_references(text: str) -> tuple[str, list[str]]:
+    """Remove leaked Meme Manager machine references and return normalized IDs.
+
+    The reply model occasionally emits a single ampersand, a bare reference, or
+    a duplicated ``meme:`` prefix instead of the documented wrapped marker.
+    Meme Manager cannot consume those malformed variants, so they must never be
+    allowed to become visible chat text.
+    """
+    references: list[str] = []
+
+    def remove_reference(match: re.Match[str]) -> str:
+        normalized = f"meme:{match.group('digest').lower()}"
+        if normalized not in references:
+            references.append(normalized)
+        return ""
+
+    value = INTERNAL_MEME_REFERENCE_PATTERN.sub(remove_reference, str(text or ""))
+    value = re.sub(r"(?m)^[ \t]*&{1,2}[ \t]*$", "", value)
+    value = re.sub(r"[ \t]+\n", "\n", value)
+    value = re.sub(r"\n[ \t]+", "\n", value)
+    value = re.sub(r"[ \t]{2,}", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip(), references
 
 
 def clean_response(text: str, reply_shape: str = "chat_bubbles") -> str:

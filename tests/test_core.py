@@ -22,6 +22,7 @@ from astrbot_plugin_shio.core.response_guard import (
     TOOL_PROTOCOL_VIOLATION,
     clean_response,
     contains_tool_protocol,
+    extract_and_clean_internal_meme_references,
     find_violations,
     split_chat_bubbles,
 )
@@ -114,6 +115,33 @@ class CoreTests(unittest.TestCase):
 
     def test_normal_technical_tool_calls_word_is_not_protocol_leak(self):
         self.assertFalse(contains_tool_protocol("AstrBot 会读取结构化的 tool_calls 字段。"))
+
+    def test_cleans_malformed_meme_manager_references(self):
+        digest = "37fe0463c12e"
+        variants = (
+            f"正文\n&meme:{digest}",
+            f"正文\n&&meme:{digest}&&",
+            f"正文\n&&meme:meme:{digest}&&",
+            f"正文\nmeme:{digest}",
+            f"正文\n`meme:{digest}`",
+        )
+        for value in variants:
+            with self.subTest(value=value):
+                cleaned, references = extract_and_clean_internal_meme_references(
+                    value
+                )
+                self.assertEqual(cleaned, "正文")
+                self.assertEqual(references, [f"meme:{digest}"])
+
+    def test_meme_reference_cleanup_deduplicates_and_preserves_normal_text(self):
+        cleaned, references = extract_and_clean_internal_meme_references(
+            "第一句 &meme:37FE0463C12E\n"
+            "第二句 &&meme:37fe0463c12e&&\n"
+            "普通的 meme:short 说明"
+        )
+        self.assertEqual(references, ["meme:37fe0463c12e"])
+        self.assertNotIn("37fe0463c12e", cleaned)
+        self.assertIn("普通的 meme:short 说明", cleaned)
 
     def test_owner_task_has_safe_local_fallback(self):
         plan = fallback_plan("主人", True, "帮我运行这个程序并查看服务器日志")

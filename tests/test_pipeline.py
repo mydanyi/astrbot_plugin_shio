@@ -1104,6 +1104,73 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.sent, ["才不是。", "那只是校准误差！"])
         self.assertEqual(event._result.chain[0].text, "已经修好啦。")
 
+    async def test_guard_recovers_malformed_meme_selection_and_hides_reference(self):
+        plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {})
+        event = FakeEvent("guest", "测试")
+        event.set_extra(main.SHIO_ACTIVE, True)
+        event.set_extra(
+            main.SHIO_PAYLOAD,
+            {
+                "reply_shape": "chat_bubbles",
+                "is_owner": False,
+                "chat_soft_chars": 100,
+                "chat_max_bubbles": 3,
+                "chat_type": "private",
+            },
+        )
+        requested = "meme:37fe0463c12e"
+        event.set_extra(
+            "meme_manager_semantic_candidates",
+            {
+                requested: {"id": requested},
+                "meme:9719dcc3ccd9": {"id": "meme:9719dcc3ccd9"},
+            },
+        )
+        event.set_extra(
+            "meme_manager_semantic_selected_ids", ["meme:9719dcc3ccd9"]
+        )
+        response = FakeResponse(f"看到了就收下。\n&{requested}")
+
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(response.completion_text, "看到了就收下。")
+        self.assertEqual(
+            event.get_extra("meme_manager_semantic_selected_ids"), [requested]
+        )
+
+    async def test_dispatch_removes_last_chance_meme_reference_before_bubbles(self):
+        plugin = main.ShioPlugin(
+            FakeContext(FakeProvider([])),
+            {
+                "chat_max_bubbles": 3,
+                "bubble_interval_min_ms": 0,
+                "bubble_interval_max_ms": 0,
+            },
+        )
+        event = FakeEvent("guest", "测试")
+        event.set_extra(main.SHIO_ACTIVE, True)
+        event.set_extra(main.SHIO_PLAN, {"reply_shape": "chat_bubbles"})
+        image = types.SimpleNamespace(image="meme.png")
+
+        class Result:
+            def __init__(self):
+                self.chain = [
+                    types.SimpleNamespace(
+                        text="第一句。第二句。\n&meme:37fe0463c12e"
+                    ),
+                    image,
+                ]
+
+            def is_llm_result(self):
+                return True
+
+        event._result = Result()
+        await plugin.dispatch_chat_bubbles(event)
+
+        self.assertTrue(all("meme:" not in item for item in event.sent))
+        self.assertNotIn("meme:", event._result.chain[0].text)
+        self.assertIs(event._result.chain[1], image)
+
     async def test_dispatch_blocks_dsml_before_sending_any_bubble(self):
         plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {})
         event = FakeEvent("guest", "测试")
