@@ -6,7 +6,7 @@
 
 星汐是一条面向 AstrBot 的群聊心智编排链，负责身份识别、说话规划、表达检索、自然回复与 Agent 权限裁决；内置亚托莉示例，但不限定角色。
 
-> 当前版本：`0.4.1` 公开测试版。已在 AstrBot `4.27.2`、QQ（aiocqhttp）场景完成 133 项自动化测试；群聊组合很多，尤其主动参与与故障补答功能仍需按群调试，欢迎通过 Issue 提交脱敏日志。
+> 当前版本：`0.4.2` 公开测试版。已在 AstrBot `4.27.2`、QQ（aiocqhttp）场景完成 136 项自动化测试；群聊组合很多，尤其主动参与与故障补答功能仍需按群调试，欢迎通过 Issue 提交脱敏日志。
 
 ## 它能做什么
 
@@ -65,7 +65,7 @@
 
 ## 安装与升级
 
-1. 下载 Release 中的 `astrbot_plugin_shio_v0.4.1_upload.zip`。
+1. 下载 Release 中的 `astrbot_plugin_shio_v0.4.2_upload.zip`。
 2. 在 AstrBot WebUI 的插件管理页面上传安装包。
 3. 如果安装过独立的 `astrbot_plugin_agent_guard`，先将它停用或卸载。
 4. 重启 AstrBot，进入星汐配置页面。

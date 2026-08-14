@@ -175,6 +175,20 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(cleaned, "正文")
         self.assertEqual(references, [])
 
+    def test_detects_and_cleans_xml_style_meme_tool_call_leak(self):
+        variants = (
+            '才不是呢！\n<search_memes query="委屈，生气，傲娇，鼓起脸，瞪眼" />',
+            "才不是呢！\n<search_memes><query>委屈</query></search_memes>",
+        )
+        for leaked in variants:
+            with self.subTest(leaked=leaked):
+                self.assertTrue(contains_tool_protocol(leaked))
+                cleaned, references = extract_and_clean_internal_meme_references(
+                    leaked
+                )
+                self.assertEqual(cleaned, "才不是呢！")
+                self.assertEqual(references, [])
+
     def test_detects_screenshot_internal_planning_leak(self):
         leaked = (
             "主人发了一张表情包图片过来，画面里的角色表情非常夸张。"

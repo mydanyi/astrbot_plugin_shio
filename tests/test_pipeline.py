@@ -1248,6 +1248,26 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.completion_text, "这里是完整的技术回答。")
         self.assertEqual(len(provider.calls), 1)
 
+    async def test_xml_meme_call_is_removed_without_rewriting_valid_answer(self):
+        planner_json = json.dumps({"mode": "chat"}, ensure_ascii=False)
+        provider = FakeProvider([planner_json])
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("owner", "你怎么还是不怎么聪明的样子")
+        request = FakeRequest(event.message)
+        await plugin.build_persona_reply(event, request)
+
+        response = FakeResponse(
+            "才不是呢！我明明刚才还帮大家解答问题的，哼，你才是笨蛋！\n"
+            '<search_memes query="委屈，生气，傲娇，鼓起脸，瞪眼" />'
+        )
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(
+            response.completion_text,
+            "才不是呢！\n我明明刚才还帮大家解答问题的，哼，你才是笨蛋！",
+        )
+        self.assertEqual(len(provider.calls), 1)
+
     async def test_long_form_summary_connective_does_not_trigger_rewrite(self):
         planner_json = json.dumps(
             {"mode": "chat", "reply_shape": "long_form"},
@@ -2011,6 +2031,31 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(nested_text.text, "这里是完整的技术回答。")
         self.assertNotIn("search_memes", nested_text.text)
         self.assertEqual(event.sent, [])
+
+    async def test_dispatch_cleans_xml_meme_call_inside_node(self):
+        plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {})
+        event = FakeEvent("owner", "你怎么还是不怎么聪明的样子")
+        event.set_extra(main.SHIO_ACTIVE, True)
+        event.set_extra(main.SHIO_PLAN, {"reply_shape": "chat_bubbles"})
+        nested_text = types.SimpleNamespace(
+            text=(
+                "才不是呢！我明明刚才还帮大家解答问题的。\n"
+                '<search_memes query="委屈，生气，傲娇，鼓起脸，瞪眼" />'
+            )
+        )
+
+        class Result:
+            def __init__(self):
+                self.chain = [types.SimpleNamespace(content=[nested_text])]
+
+            def is_llm_result(self):
+                return True
+
+        event._result = Result()
+        await plugin.dispatch_chat_bubbles(event)
+
+        self.assertNotIn("search_memes", nested_text.text)
+        self.assertNotIn("<", nested_text.text)
 
 
 if __name__ == "__main__":
