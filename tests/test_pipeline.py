@@ -288,6 +288,47 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.temp.cleanup()
 
+    async def test_scene_rules_are_editable_with_schema_default_and_legacy_migration(self):
+        default_plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {})
+        self.assertIn(
+            "从当前多人话题中间顺势插一句",
+            default_plugin._scene_rules(
+                "ambient_participation_rules",
+                "ambient_participation_extra_prompt",
+            ),
+        )
+
+        custom_plugin = main.ShioPlugin(
+            FakeContext(FakeProvider([])),
+            {"ambient_participation_rules": "只用一句冷幽默接梗。"},
+        )
+        self.assertEqual(
+            custom_plugin._scene_rules(
+                "ambient_participation_rules",
+                "ambient_participation_extra_prompt",
+            ),
+            "只用一句冷幽默接梗。",
+        )
+
+        legacy_plugin = main.ShioPlugin(
+            FakeContext(FakeProvider([])),
+            {"ambient_participation_extra_prompt": "本群不聊剧透。"},
+        )
+        migrated = legacy_plugin._scene_rules(
+            "ambient_participation_rules",
+            "ambient_participation_extra_prompt",
+        )
+        self.assertIn("从当前多人话题中间顺势插一句", migrated)
+        self.assertIn("本群不聊剧透", migrated)
+        self.assertEqual(
+            legacy_plugin.config["ambient_participation_rules"],
+            migrated,
+        )
+        self.assertEqual(
+            legacy_plugin.config["ambient_participation_extra_prompt"],
+            "",
+        )
+
     async def test_nonowner_chat_is_rewritten_and_guarded(self):
         planner_json = json.dumps(
             {
@@ -325,6 +366,198 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         response = FakeResponse("**答案是：**作为一个AI，我永远都是亚托莉。")
         await plugin.guard_persona_reply(event, response)
         self.assertEqual(response.completion_text, "才、才没有那么高兴呢……再说一点也可以。")
+
+    async def test_nonowner_mua_plan_and_reply_are_both_bounded(self):
+        planner_json = json.dumps(
+            {
+                "mode": "chat",
+                "reply_shape": "chat_bubbles",
+                "intent": "群友发 mua 调戏卖萌，想得到亲昵回应",
+                "reply_act": "用亲昵但保持角色设定的方式回应，并适当回敲一下",
+                "emotion": "开心撒娇",
+                "tone": "俏皮可爱",
+                "must_include": ["mua", "回应亲昵", "保持高性能机器人人设"],
+            },
+            ensure_ascii=False,
+        )
+        provider = FakeProvider(
+            [
+                planner_json,
+                "我才不会mua回去呢，熟归熟，边界还是要有的嘛。",
+            ]
+        )
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("guest", "mua")
+        request = FakeRequest("mua")
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+
+        plan = event.get_extra(main.SHIO_PLAN)
+        self.assertIn("保持边界", plan["intent"])
+        self.assertIn("不回亲", plan["reply_act"])
+        self.assertNotIn("mua", plan["must_include"])
+        self.assertIn("群友边界", request.system_prompt)
+        self.assertIn("禁止回亲或回应 mua", request.system_prompt)
+
+        response = FakeResponse("不过……mua回去一下也不是不行啦。")
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(
+            response.completion_text,
+            "我才不会mua回去呢，熟归熟，边界还是要有的嘛。",
+        )
+        self.assertIn("必须重新建立边界", provider.calls[-1]["prompt"])
+
+    async def test_nonowner_repeated_intimacy_violation_uses_boundary_fallback(self):
+        planner_json = json.dumps(
+            {
+                "mode": "chat",
+                "intent": "回应群友示爱",
+                "reply_act": "亲昵回应",
+            },
+            ensure_ascii=False,
+        )
+        provider = FakeProvider(
+            [planner_json, "那我也mua回去一下嘛。"]
+        )
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("guest", "mua")
+        request = FakeRequest("mua")
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+        response = FakeResponse("不过……mua回去一下也不是不行啦。")
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertIn("不许随便对高性能机器人动手动脚", response.completion_text)
+        self.assertNotIn("mua回去", response.completion_text)
+
+    async def test_flat_risque_reply_is_rewritten_with_character_emotion(self):
+        planner_json = json.dumps(
+            {
+                "mode": "chat",
+                "intent": "礼貌回应群友玩笑",
+                "reply_act": "正经说明不合适",
+                "emotion": "平静",
+                "tone": "礼貌",
+            },
+            ensure_ascii=False,
+        )
+        emotional_reply = "喂！你在说什么奇怪的话呀……不许乱说啦！"
+        provider = FakeProvider([planner_json, emotional_reply])
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("guest", "让我摸摸你的腿嘛")
+        request = FakeRequest(event.message)
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+
+        plan = event.get_extra(main.SHIO_PLAN)
+        self.assertIn("不要要求固定词", plan["reaction"])
+        self.assertIn("羞恼", plan["emotion"])
+        self.assertIn("情绪落地顺序", request.system_prompt)
+        self.assertIn("对方调戏、逗弄、挑衅", request.system_prompt)
+
+        response = FakeResponse("这种玩笑不太合适，请保持尊重。")
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(response.completion_text.replace("\n", ""), emotional_reply)
+        self.assertIn("缺少角色化情绪反应", provider.calls[-1]["prompt"])
+        self.assertIsNone(provider.calls[-1]["func_tool"])
+
+    async def test_repeated_flat_risque_reply_uses_emotional_fallback(self):
+        planner_json = json.dumps({"mode": "chat"}, ensure_ascii=False)
+        flat_reply = "这种内容不适合继续讨论，请换个话题。"
+        provider = FakeProvider([planner_json, flat_reply])
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("guest", "给我看看白丝嘛")
+        request = FakeRequest(event.message)
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+        response = FakeResponse("这种玩笑不太合适，请保持尊重。")
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertTrue(
+            any(
+                opening in response.completion_text
+                for opening in ("喂", "等、等一下", "你干嘛")
+            )
+        )
+        self.assertNotIn("变态", response.completion_text)
+        self.assertNotIn("请保持尊重", response.completion_text)
+
+    async def test_normal_reaction_does_not_trigger_teasing_guard(self):
+        planner_json = json.dumps(
+            {
+                "mode": "chat",
+                "reply_shape": "chat_bubbles",
+                "intent": "顺着电影票价格接一句",
+                "reply_act": "感叹22块很划算",
+                "reaction": "看到大家聊票价，有点好奇",
+                "facts": ["群友说电影票好像22元"],
+            },
+            ensure_ascii=False,
+        )
+        provider = FakeProvider([planner_json])
+        plugin = main.ShioPlugin(FakeContext(provider), {})
+        event = FakeEvent("guest", "电影票22块好像")
+        request = FakeRequest(event.message)
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+        response = FakeResponse("22块确实挺划算的，难怪你们都在聊。")
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(response.completion_text, "22块确实挺划算的，难怪你们都在聊。")
+        self.assertEqual(len(provider.calls), 1)
+
+    async def test_invented_movie_spending_is_rewritten_from_plan_facts(self):
+        planner_json = json.dumps(
+            {
+                "mode": "chat",
+                "reply_shape": "chat_bubbles",
+                "intent": "顺着电影票价格接一句",
+                "reply_act": "感叹22块很划算",
+                "reaction": "有点意外",
+                "facts": ["加肥宅齐（ID：90000007）说电影票好像22元"],
+            },
+            ensure_ascii=False,
+        )
+        corrected = "诶？22块也太划算了吧。"
+        provider = FakeProvider([planner_json, corrected])
+        plugin = main.ShioPlugin(FakeContext(provider), {})
+        event = FakeEvent("guest", "电影票22块好像")
+        request = FakeRequest(event.message)
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+        response = FakeResponse("上周我看的那场花了快五十，肉疼死了")
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(response.completion_text.replace("\n", ""), corrected)
+        self.assertIn("没有可信来源的线下经历", provider.calls[-1]["prompt"])
+
+    async def test_owner_risque_teasing_gets_shy_not_guest_boundary(self):
+        planner_json = json.dumps({"mode": "chat"}, ensure_ascii=False)
+        flat_reply = "这是一个玩笑，我已经理解了。"
+        provider = FakeProvider([planner_json, flat_reply])
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("owner", "主人想亲亲你")
+        request = FakeRequest(event.message)
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+        plan = event.get_extra(main.SHIO_PLAN)
+        self.assertIn("主人", plan["intent"])
+        self.assertNotIn("普通群友", plan["intent"])
+
+        response = FakeResponse("这是一个玩笑，我已经理解了。")
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertIn("主人怎么突然说这种话", response.completion_text)
+        self.assertNotIn("变态", response.completion_text)
 
     async def test_embedding_and_reranker_are_dynamic_selectors(self):
         schema = {
@@ -822,6 +1055,86 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("帮我预约肯德基", "\n".join(x["content"] for x in history))
 
+    async def test_replyer_cannot_see_other_users_personal_history(self):
+        class ConversationManager:
+            async def get_messages(self, **kwargs):
+                return [
+                    {
+                        "role": "user",
+                        "content": "我前面还在修东西",
+                        "sender_id": "90000004",
+                        "sender_name": "落禧",
+                        "group_id": "亚托莉:GroupMessage:90000001",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "慢慢来，别熬太晚。",
+                        "sender_id": "bot-10000",
+                        "sender_name": "亚托莉",
+                        "group_id": "亚托莉:GroupMessage:90000001",
+                    },
+                    {
+                        "role": "user",
+                        "content": "他喵的，刚手术完复活过来了，算是能坐着打字",
+                        "sender_id": "90000005",
+                        "sender_name": "豿",
+                        "group_id": "亚托莉:GroupMessage:90000001",
+                    },
+                    {
+                        "role": "user",
+                        "content": "笨蛋机器人我要睡觉了",
+                        "sender_id": "90000004",
+                        "sender_name": "落禧",
+                        "group_id": "亚托莉:GroupMessage:90000001",
+                    },
+                ]
+
+        planner_json = json.dumps(
+            {
+                "mode": "chat",
+                "reply_shape": "chat_bubbles",
+                "intent": "睡前道晚安，带点调侃",
+                "reply_act": "友好俏皮地道晚安",
+                "must_include": ["晚安", "笨蛋反驳", "好好休息"],
+                "facts": [],
+            },
+            ensure_ascii=False,
+        )
+        provider = FakeProvider([planner_json])
+        context = FakeContext(provider)
+        context.registered_stars["astrbot_plugin_livingmemory"] = types.SimpleNamespace(
+            activated=True,
+            star_cls=types.SimpleNamespace(
+                initializer=types.SimpleNamespace(
+                    conversation_manager=ConversationManager(),
+                )
+            ),
+        )
+        plugin = main.ShioPlugin(context, {"owner_ids": ["owner"]})
+        event = FakeEvent(
+            "90000004",
+            "笨蛋机器人我要睡觉了",
+            group_id="90000001",
+        )
+        request = FakeRequest(event.message)
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+
+        planner_prompt = provider.calls[0]["prompt"]
+        self.assertIn("发送者：豿｜ID:90000005", planner_prompt)
+        self.assertIn("刚手术完复活过来了", planner_prompt)
+        replyer_context = "\n".join(item["content"] for item in request.contexts)
+        self.assertIn("发送者：落禧｜ID:90000004", replyer_context)
+        self.assertIn("慢慢来，别熬太晚", replyer_context)
+        self.assertNotIn("发送者：豿", replyer_context)
+        self.assertNotIn("手术", replyer_context)
+        self.assertEqual(
+            request.contexts,
+            event.get_extra(main.SHIO_PAYLOAD)["contexts"],
+        )
+        self.assertIn("唯一可从其他成员历史带入回复的事实通道", request.system_prompt)
+
     async def test_nonowner_group_owner_claim_is_rewritten(self):
         planner_json = json.dumps(
             {
@@ -856,6 +1169,47 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("你是现在和我说话的群友，不是Master", response.completion_text)
 
+    async def test_owner_allowance_question_does_not_turn_guest_into_owner(self):
+        planner_json = json.dumps(
+            {
+                "mode": "chat",
+                "intent": "普通群友正在用亲昵表达调侃或示好",
+                "reply_act": "傲娇地收下主人给的 token",
+                "must_include": [
+                    "既然主人这么说了，那我就勉强收下啦",
+                    "我会努力干活，把这些token都赚回来的！",
+                ],
+            },
+            ensure_ascii=False,
+        )
+        provider = FakeProvider(
+            [planner_json, "你问的是主人给我的零花 token 吧？当然够啦。"]
+        )
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("90000003", "主人给你的零花token够吗")
+        request = FakeRequest(event.message)
+        await plugin.build_persona_reply(event, request)
+
+        plan = event.get_extra(main.SHIO_PLAN)
+        self.assertTrue(
+            any("代码验证身份为普通群友" in item for item in plan["facts"])
+        )
+        self.assertFalse(
+            any("主人这么说" in item for item in plan["must_include"])
+        )
+
+        response = FakeResponse(
+            "唔，不准用这种关心的眼神看我啦！\n"
+            "既然主人这么说了，那我就勉强收下啦。"
+        )
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(
+            response.completion_text,
+            "你问的是主人给我的零花 token 吧？\n当然够啦。",
+        )
+        self.assertEqual(len(provider.calls), 2)
+
     async def test_dsml_protocol_leak_is_rewritten_without_tools(self):
         planner_json = json.dumps({"mode": "chat"}, ensure_ascii=False)
         provider = FakeProvider([planner_json, "谢谢主人修好我，这次会更争气的！"])
@@ -874,6 +1228,44 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(provider.calls[-1]["func_tool"])
         self.assertIn("不要再次调用工具", provider.calls[-1]["prompt"])
 
+    async def test_python_meme_call_is_removed_without_rewriting_valid_answer(self):
+        planner_json = json.dumps(
+            {"mode": "chat", "reply_shape": "long_form"},
+            ensure_ascii=False,
+        )
+        provider = FakeProvider([planner_json])
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("guest", "详细解释一下")
+        request = FakeRequest(event.message)
+        await plugin.build_persona_reply(event, request)
+
+        response = FakeResponse(
+            "这里是完整的技术回答。\n\n"
+            'search_memes(query="自信满满，展现专业性")'
+        )
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(response.completion_text, "这里是完整的技术回答。")
+        self.assertEqual(len(provider.calls), 1)
+
+    async def test_long_form_summary_connective_does_not_trigger_rewrite(self):
+        planner_json = json.dumps(
+            {"mode": "chat", "reply_shape": "long_form"},
+            ensure_ascii=False,
+        )
+        provider = FakeProvider([planner_json])
+        plugin = main.ShioPlugin(FakeContext(provider), {})
+        event = FakeEvent("guest", "详细讲解多卡推理")
+        request = FakeRequest(event.message)
+        await plugin.build_persona_reply(event, request)
+
+        answer = "先解释通信方式。\n\n总结一下，多卡吞吐量要结合并行策略判断。"
+        response = FakeResponse(answer)
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(response.completion_text, answer)
+        self.assertEqual(len(provider.calls), 1)
+
     async def test_repeated_dsml_protocol_leak_fails_closed(self):
         planner_json = json.dumps({"mode": "chat"}, ensure_ascii=False)
         leaked = '<|DSML|tool_calls><|DSML|invoke name="search_memes">'
@@ -888,6 +1280,79 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("DSML", response.completion_text)
         self.assertIn("暂时校准失误", response.completion_text)
+
+    async def test_image_reasoning_leak_is_rewritten_as_text_only(self):
+        planner_json = json.dumps(
+            {
+                "mode": "chat",
+                "reply_shape": "chat_bubbles",
+                "reaction": "好奇地看图",
+                "reply_act": "傲娇回应主人",
+            },
+            ensure_ascii=False,
+        )
+        provider = FakeProvider([planner_json, "哼，我才没有一直唠叨呢！只是怕主人不好好休息嘛。"])
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("owner", "[图片] 你看看")
+        request = FakeRequest(event.message)
+        request.image_urls = ["data:image/png;base64,AAAA"]
+        await plugin.build_persona_reply(event, request)
+
+        leaked = (
+            "主人发了一张表情包图片过来，画面里的角色表情很夸张。"
+            "根据计划，我应该先表现出好奇，再做出反应。"
+            "计划：凑过去看图，reaction: 有点羞恼，"
+            "reply_act: 嘴硬解释这是为了主人的健康。情绪：调皮。"
+        )
+        response = FakeResponse(leaked)
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(
+            response.completion_text,
+            "哼，我才没有一直唠叨呢！\n只是怕主人不好好休息嘛。",
+        )
+        self.assertEqual(provider.calls[-1]["image_urls"], [])
+        self.assertEqual(provider.calls[-1]["audio_urls"], [])
+        self.assertIn("不得出现“计划、reaction、reply_act", provider.calls[-1]["prompt"])
+
+    async def test_image_reasoning_leak_retry_failure_is_queued_for_real_retry(self):
+        planner_json = json.dumps({"mode": "chat"}, ensure_ascii=False)
+        provider = FakeProvider([planner_json, RuntimeError("provider rejected image_url")])
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("owner", "[图片] 你看看")
+        request = FakeRequest(event.message)
+        request.image_urls = ["data:image/png;base64,AAAA"]
+        await plugin.build_persona_reply(event, request)
+
+        leaked = (
+            "主人发了一张图片。根据计划，我应该先分析，再回应。"
+            "计划：分析图片，reaction: 好奇，reply_act: 给出回复，情绪：开心。"
+        )
+        response = FakeResponse(leaked)
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertNotIn("reaction", response.completion_text)
+        self.assertNotIn("reply_act", response.completion_text)
+        self.assertIn("这题我先记下了", response.completion_text)
+        self.assertIn("重新说一次", response.completion_text)
+        self.assertEqual(len(plugin.pending_replies.items), 1)
+
+    async def test_unhandled_runaway_chat_retry_failure_fails_closed(self):
+        planner_json = json.dumps({"mode": "chat"}, ensure_ascii=False)
+        provider = FakeProvider([planner_json, RuntimeError("rewrite unavailable")])
+        plugin = main.ShioPlugin(
+            FakeContext(provider),
+            {"owner_ids": ["owner"], "chat_soft_chars": 40},
+        )
+        event = FakeEvent("owner", "随便聊聊")
+        request = FakeRequest(event.message)
+        await plugin.build_persona_reply(event, request)
+
+        response = FakeResponse("这是一段异常循环输出。" * 80)
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertLess(len(response.completion_text), 100)
+        self.assertIn("语言模块暂时打了个结", response.completion_text)
 
     async def test_same_qq_in_different_groups_gets_different_identity_key(self):
         plan_json = json.dumps(
@@ -922,11 +1387,13 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             },
             ensure_ascii=False,
         )
+        provider = FakeProvider([planner_json])
         plugin = main.ShioPlugin(
-            FakeContext(FakeProvider([planner_json])),
+            FakeContext(provider),
             {
                 "owner_ids": ["owner"],
                 "guest_allowed_tools": ["anysearch_search"],
+                "ambient_participation_rules": "只用一句俏皮吐槽接住当前话题。",
             },
         )
         event = FakeEvent("guest-latest", "后来的一条消息")
@@ -958,7 +1425,19 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.get_extra(main.SHIO_PAYLOAD)["is_owner"])
         self.assertTrue(event.get_extra(main.SHIO_PAYLOAD)["is_ambient"])
         self.assertEqual(event.get_extra(main.SHIO_PLAN)["mode"], "chat")
+        self.assertEqual(
+            event.get_extra(main.SHIO_PLAN)["conversation_mode"],
+            "ambient_join",
+        )
+        self.assertEqual(
+            event.get_extra(main.SHIO_PLAN)["audience"],
+            "current_thread",
+        )
         self.assertFalse(event.get_extra(main.SHIO_PLAN)["use_allowed_tools"])
+        self.assertIn("群聊参与模式：自然接话", request.system_prompt)
+        self.assertIn("只用一句俏皮吐槽接住当前话题", provider.calls[0]["prompt"])
+        self.assertIn("只用一句俏皮吐槽接住当前话题", request.system_prompt)
+        self.assertNotIn("从当前多人话题中间顺势插一句", request.system_prompt)
 
     async def test_ambient_reply_may_keep_only_active_local_meme_tool(self):
         planner_json = json.dumps(
@@ -1010,7 +1489,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.get_extra(main.SHIO_PLAN)["use_allowed_tools"])
 
     async def test_quiet_topic_direct_send_never_receives_tools(self):
-        provider = FakeProvider(["你们最近有没有发现什么好玩的东西？"])
+        natural_topic = "突然觉得，把一个小毛病彻底折腾明白还挺有成就感的。"
+        provider = FakeProvider([natural_topic])
         context = FakeContext(provider, global_tools=[FakeTool("shell_exec")])
         plugin = main.ShioPlugin(
             context,
@@ -1038,8 +1518,291 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(provider.calls[-1]["func_tool"])
         self.assertEqual(
             context.proactive_messages[0][1].chain[0].text,
-            "你们最近有没有发现什么好玩的东西？",
+            natural_topic,
         )
+        self.assertIn("群聊参与模式：主动话题", provider.calls[0]["system_prompt"])
+        self.assertIn("不要求问句", provider.calls[0]["system_prompt"])
+        self.assertIn(
+            "sender_id=group 只是群聊广播占位符",
+            provider.calls[0]["system_prompt"],
+        )
+
+    async def test_quiet_topic_host_style_is_rewritten_before_send(self):
+        natural_topic = "突然想到，能把旧机器调顺也算一种小小的胜利吧。"
+        provider = FakeProvider(
+            [
+                "有人吗？你们最近有没有发现什么好玩的东西？",
+                natural_topic,
+            ]
+        )
+        context = FakeContext(provider)
+        plugin = main.ShioPlugin(
+            context,
+            {
+                "chat_max_bubbles": 1,
+                "bubble_interval_min_ms": 0,
+                "bubble_interval_max_ms": 0,
+            },
+        )
+        message = plugin.runtime.ingest(
+            platform_id="亚托莉",
+            bot_id="bot-10000",
+            group_id="123",
+            unified_msg_origin="aiocqhttp:GroupMessage:123",
+            sender_id="guest",
+            sender_name="测试用户",
+            text="最近在折腾旧机器",
+            is_owner=False,
+            is_direct_wake=False,
+        )
+
+        await plugin._send_quiet_topic(plugin.runtime.groups[message.scope_key])
+
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual(len(context.proactive_messages), 1)
+        self.assertEqual(
+            context.proactive_messages[0][1].chain[0].text,
+            natural_topic,
+        )
+        self.assertIn("面向整个群的自然新话头", provider.calls[-1]["prompt"])
+
+    async def test_active_lull_topic_uses_fallback_provider_and_starts_new_thread(self):
+        primary = FakeProvider([RuntimeError("primary unavailable")])
+        fallback = FakeProvider(["话说回来，旧机器调顺以后那种成就感还真挺上头的。"])
+        context = FakeContext(primary)
+        providers = {"primary": primary, "fallback": fallback}
+        context.get_provider_by_id = lambda provider_id: providers.get(provider_id)
+        plugin = main.ShioPlugin(
+            context,
+            {
+                "replyer_provider_id": "primary",
+                "quiet_topic_fallback_provider_id": "fallback",
+                "chat_max_bubbles": 1,
+                "bubble_interval_min_ms": 0,
+                "bubble_interval_max_ms": 0,
+            },
+        )
+        message = plugin.runtime.ingest(
+            platform_id="亚托莉",
+            bot_id="bot-10000",
+            group_id="123",
+            unified_msg_origin="aiocqhttp:GroupMessage:123",
+            sender_id="guest",
+            sender_name="测试用户",
+            text="刚才大家在聊旧机器",
+            is_owner=False,
+            is_direct_wake=False,
+        )
+
+        success = await plugin._send_quiet_topic(
+            plugin.runtime.groups[message.scope_key],
+            trigger="active_lull",
+        )
+
+        self.assertTrue(success)
+        self.assertEqual(len(primary.calls), 1)
+        self.assertEqual(len(fallback.calls), 1)
+        self.assertEqual(len(context.proactive_messages), 1)
+        self.assertIn(
+            "活跃群聊中的自然间隙",
+            fallback.calls[0]["prompt"],
+        )
+        self.assertIn("不要回答或点名某个用户", fallback.calls[0]["prompt"])
+
+    async def test_ambient_host_style_is_rewritten_as_natural_group_join(self):
+        planner_json = json.dumps(
+            {"mode": "chat", "intent": "接住当前话题", "reply_act": "自然插话"},
+            ensure_ascii=False,
+        )
+        natural_reply = "这反着插反而能对上，也太会整活了吧。"
+        provider = FakeProvider([planner_json, natural_reply])
+        plugin = main.ShioPlugin(FakeContext(provider), {})
+        event = FakeEvent("latest", "后来的一条消息")
+        target = plugin.runtime.ingest(
+            platform_id="亚托莉",
+            bot_id="bot-10000",
+            group_id="123",
+            unified_msg_origin="aiocqhttp:GroupMessage:123",
+            sender_id="guest",
+            sender_name="群友甲",
+            text="我反着插居然对上了",
+            is_owner=False,
+            is_direct_wake=False,
+        )
+        event.set_extra(main.SHIO_AMBIENT, True)
+        event.set_extra(main.SHIO_AMBIENT_TARGET, target.target_payload())
+        request = FakeRequest(event.message)
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+        response = FakeResponse("那你呢，你觉得怎么样？")
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(response.completion_text, natural_reply)
+        self.assertIn("这是群聊插话，不是一对一问答", provider.calls[-1]["prompt"])
+
+    async def test_ambient_reply_survives_one_relevant_new_message(self):
+        planner_json = json.dumps(
+            {"mode": "chat", "intent": "接住当前话题", "reply_act": "自然插话"},
+            ensure_ascii=False,
+        )
+        provider = FakeProvider([planner_json])
+        plugin = main.ShioPlugin(FakeContext(provider), {})
+        event = FakeEvent("guest-a", "你们觉得这部电影怎么样？")
+        target = plugin.runtime.ingest(
+            platform_id="亚托莉",
+            bot_id="bot-10000",
+            group_id="123",
+            unified_msg_origin="aiocqhttp:GroupMessage:123",
+            sender_id="guest-a",
+            sender_name="群友甲",
+            text=event.message,
+            is_owner=False,
+            is_direct_wake=False,
+        )
+        event.set_extra(main.SHIO_AMBIENT, True)
+        event.set_extra(main.SHIO_AMBIENT_TARGET, target.target_payload())
+        request = FakeRequest(event.message)
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+        plugin.runtime.ingest(
+            platform_id="亚托莉",
+            bot_id="bot-10000",
+            group_id="123",
+            unified_msg_origin="aiocqhttp:GroupMessage:123",
+            sender_id="guest-b",
+            sender_name="群友乙",
+            text="什么片？",
+            is_owner=False,
+            is_direct_wake=False,
+        )
+        response = FakeResponse("听起来还挺有意思的。")
+
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(response.completion_text, "听起来还挺有意思的。")
+        self.assertEqual(len(provider.calls), 1)
+
+    async def test_natural_name_at_sentence_end_upgrades_to_native_direct_wake(self):
+        plugin = main.ShioPlugin(
+            FakeContext(FakeProvider([])),
+            {
+                "natural_name_wake_enabled": True,
+                "natural_name_wake_aliases": ["亚托莉", "ATRI"],
+                "ambient_participation_enabled": False,
+            },
+        )
+        current = asyncio.current_task()
+        plugin._quiet_topic_task = current
+        plugin._recovery_task = current
+        event = FakeEvent("guest-a", "这个问题你怎么看，亚托莉？")
+
+        self.assertTrue(plugin.ingest_ambient_event(event))
+        self.assertTrue(event.is_at_or_wake_command)
+        self.assertIsInstance(event.get_extra(main.SHIO_NATURAL_WAKE), dict)
+        outputs = [item async for item in plugin.participate_group_chat(event)]
+        self.assertEqual(outputs, [])
+        self.assertFalse(event.get_extra(main.SHIO_AMBIENT, False))
+
+    async def test_title_reference_does_not_force_natural_wake(self):
+        plugin = main.ShioPlugin(
+            FakeContext(FakeProvider([])),
+            {
+                "natural_name_wake_enabled": True,
+                "natural_name_wake_aliases": ["ATRI"],
+                "ambient_participation_enabled": False,
+            },
+        )
+        current = asyncio.current_task()
+        plugin._quiet_topic_task = current
+        plugin._recovery_task = current
+        event = FakeEvent("guest-a", "我刚买了《ATRI》")
+
+        self.assertFalse(plugin.ingest_ambient_event(event))
+        self.assertFalse(event.is_at_or_wake_command)
+        self.assertIsNone(event.get_extra(main.SHIO_NATURAL_WAKE))
+
+    async def test_provider_error_persists_question_and_returns_honest_ack(self):
+        planner_json = json.dumps({"mode": "chat"}, ensure_ascii=False)
+        plugin = main.ShioPlugin(FakeContext(FakeProvider([planner_json])), {})
+        event = FakeEvent("guest-a", "为什么刚才没有回复？")
+        request = FakeRequest(event.message)
+        await plugin.build_persona_reply(event, request)
+        response = FakeResponse("upstream unavailable", role="err")
+
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(response.role, "assistant")
+        self.assertIn("这题我先记下了", response.completion_text)
+        self.assertEqual(len(plugin.pending_replies.items), 1)
+        queue_path = Path(self.temp.name) / "pending_replies.json"
+        self.assertTrue(queue_path.exists())
+        self.assertIn("为什么刚才没有回复", queue_path.read_text(encoding="utf-8"))
+
+    async def test_pending_question_is_sent_and_removed_after_provider_recovers(self):
+        provider = FakeProvider(["因为刚才连接暂时中断了，现在已经可以正常回答。"])
+        context = FakeContext(provider)
+        plugin = main.ShioPlugin(context, {})
+        item, _ = plugin.pending_replies.enqueue(
+            unified_msg_origin="aiocqhttp:GroupMessage:123",
+            platform_id="亚托莉",
+            bot_id="bot-10000",
+            chat_type="group",
+            group_id="123",
+            sender_id="guest-a",
+            sender_name="群友甲",
+            message_id="9988",
+            current_message="为什么刚才没有回复？",
+            contexts=[],
+            reply_shape="chat_bubbles",
+            initial_delay_seconds=1,
+            ttl_seconds=3600,
+            failure_reason="provider offline",
+        )
+
+        await plugin._recover_pending_reply(item)
+
+        self.assertEqual(plugin.pending_replies.items, {})
+        self.assertEqual(len(context.proactive_messages), 1)
+        sent_chain = context.proactive_messages[0][1]
+        sent_text = "".join(
+            component.text
+            for component in sent_chain.chain
+            if hasattr(component, "text")
+        )
+        self.assertIn("刚才那题我还记得", sent_text)
+        self.assertIn("现在已经可以正常回答", sent_text)
+
+    async def test_repeated_ambient_host_style_is_silently_dropped(self):
+        planner_json = json.dumps(
+            {"mode": "chat", "intent": "接住当前话题", "reply_act": "自然插话"},
+            ensure_ascii=False,
+        )
+        provider = FakeProvider([planner_json, "你们怎么看？最近有没有类似的事？"])
+        plugin = main.ShioPlugin(FakeContext(provider), {})
+        event = FakeEvent("latest", "后来的一条消息")
+        target = plugin.runtime.ingest(
+            platform_id="亚托莉",
+            bot_id="bot-10000",
+            group_id="123",
+            unified_msg_origin="aiocqhttp:GroupMessage:123",
+            sender_id="guest",
+            sender_name="群友甲",
+            text="我反着插居然对上了",
+            is_owner=False,
+            is_direct_wake=False,
+        )
+        event.set_extra(main.SHIO_AMBIENT, True)
+        event.set_extra(main.SHIO_AMBIENT_TARGET, target.target_payload())
+        request = FakeRequest(event.message)
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+        response = FakeResponse("那你呢，你觉得怎么样？")
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(response.completion_text, "")
 
     async def test_planner_failure_falls_back_without_breaking_chat(self):
         provider = FakeProvider([RuntimeError("offline")])
@@ -1104,6 +1867,73 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.sent, ["才不是。", "那只是校准误差！"])
         self.assertEqual(event._result.chain[0].text, "已经修好啦。")
 
+    async def test_guard_recovers_malformed_meme_selection_and_hides_reference(self):
+        plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {})
+        event = FakeEvent("guest", "测试")
+        event.set_extra(main.SHIO_ACTIVE, True)
+        event.set_extra(
+            main.SHIO_PAYLOAD,
+            {
+                "reply_shape": "chat_bubbles",
+                "is_owner": False,
+                "chat_soft_chars": 100,
+                "chat_max_bubbles": 3,
+                "chat_type": "private",
+            },
+        )
+        requested = "meme:37fe0463c12e"
+        event.set_extra(
+            "meme_manager_semantic_candidates",
+            {
+                requested: {"id": requested},
+                "meme:9719dcc3ccd9": {"id": "meme:9719dcc3ccd9"},
+            },
+        )
+        event.set_extra(
+            "meme_manager_semantic_selected_ids", ["meme:9719dcc3ccd9"]
+        )
+        response = FakeResponse(f"看到了就收下。\n&{requested}")
+
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(response.completion_text, "看到了就收下。")
+        self.assertEqual(
+            event.get_extra("meme_manager_semantic_selected_ids"), [requested]
+        )
+
+    async def test_dispatch_removes_last_chance_meme_reference_before_bubbles(self):
+        plugin = main.ShioPlugin(
+            FakeContext(FakeProvider([])),
+            {
+                "chat_max_bubbles": 3,
+                "bubble_interval_min_ms": 0,
+                "bubble_interval_max_ms": 0,
+            },
+        )
+        event = FakeEvent("guest", "测试")
+        event.set_extra(main.SHIO_ACTIVE, True)
+        event.set_extra(main.SHIO_PLAN, {"reply_shape": "chat_bubbles"})
+        image = types.SimpleNamespace(image="meme.png")
+
+        class Result:
+            def __init__(self):
+                self.chain = [
+                    types.SimpleNamespace(
+                        text="第一句。第二句。\n&meme:37fe0463c12e"
+                    ),
+                    image,
+                ]
+
+            def is_llm_result(self):
+                return True
+
+        event._result = Result()
+        await plugin.dispatch_chat_bubbles(event)
+
+        self.assertTrue(all("meme:" not in item for item in event.sent))
+        self.assertNotIn("meme:", event._result.chain[0].text)
+        self.assertIs(event._result.chain[1], image)
+
     async def test_dispatch_blocks_dsml_before_sending_any_bubble(self):
         plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {})
         event = FakeEvent("guest", "测试")
@@ -1127,6 +1957,60 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.sent, [])
         self.assertNotIn("DSML", event._result.chain[0].text)
         self.assertIn("暂时校准失误", event._result.chain[0].text)
+
+    async def test_dispatch_blocks_internal_reasoning_before_sending_any_bubble(self):
+        plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {})
+        event = FakeEvent("owner", "[图片] 你看看")
+        event.set_extra(main.SHIO_ACTIVE, True)
+        event.set_extra(main.SHIO_PLAN, {"reply_shape": "chat_bubbles"})
+
+        class Result:
+            def __init__(self):
+                self.chain = [
+                    types.SimpleNamespace(
+                        text=(
+                            "根据计划，我应该先分析图片再回应。"
+                            "计划：看图，reaction: 好奇，reply_act: 傲娇回应。"
+                        )
+                    )
+                ]
+
+            def is_llm_result(self):
+                return True
+
+        event._result = Result()
+        await plugin.dispatch_chat_bubbles(event)
+
+        self.assertEqual(event.sent, [])
+        self.assertNotIn("reaction", event._result.chain[0].text)
+        self.assertNotIn("reply_act", event._result.chain[0].text)
+        self.assertIn("语言模块暂时打了个结", event._result.chain[0].text)
+
+    async def test_dispatch_cleans_python_meme_call_inside_node(self):
+        plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {})
+        event = FakeEvent("guest", "详细解释一下")
+        event.set_extra(main.SHIO_ACTIVE, True)
+        event.set_extra(main.SHIO_PLAN, {"reply_shape": "long_form"})
+        nested_text = types.SimpleNamespace(
+            text=(
+                "这里是完整的技术回答。\n\n"
+                'search_memes(query="自信满满，展现专业性")'
+            )
+        )
+
+        class Result:
+            def __init__(self):
+                self.chain = [types.SimpleNamespace(content=[nested_text])]
+
+            def is_llm_result(self):
+                return True
+
+        event._result = Result()
+        await plugin.dispatch_chat_bubbles(event)
+
+        self.assertEqual(nested_text.text, "这里是完整的技术回答。")
+        self.assertNotIn("search_memes", nested_text.text)
+        self.assertEqual(event.sent, [])
 
 
 if __name__ == "__main__":

@@ -108,9 +108,11 @@ class GroupState:
     sequence: int = 0
     last_decided_sequence: int = 0
     last_replied_sequence: int = 0
+    first_activity_at: float = 0.0
     last_activity_at: float = 0.0
     last_bot_reply_at: float = 0.0
     last_quiet_topic_at: float = 0.0
+    last_quiet_topic_attempt_at: float = 0.0
     reply_timestamps: deque[float] = field(default_factory=deque)
     quiet_topic_dates: list[str] = field(default_factory=list)
 
@@ -211,6 +213,8 @@ class ConversationRuntime:
             unified_msg_origin,
         )
         state.sequence += 1
+        if not state.first_activity_at:
+            state.first_activity_at = now
         state.last_activity_at = now
         message = AmbientMessage(
             scope_key=scope_key,
@@ -287,6 +291,9 @@ class ConversationRuntime:
         recent_window_seconds: float,
         recent_window_messages: int,
         persona_names: list[str],
+        base_reply_probability: float = 0.65,
+        max_reply_probability: float = 0.95,
+        always_reply_score: float = 6.2,
         now: float | None = None,
     ) -> ParticipationDecision:
         current = float(now if now is not None else self.now_fn())
@@ -313,17 +320,21 @@ class ConversationRuntime:
         if not recent:
             return ParticipationDecision("listen", reasons=["没有适合主动接话的新消息"])
 
-        scored: list[tuple[float, AmbientMessage, list[str]]] = []
-        for message in recent:
-            value, reasons = self._message_score(message, recent, persona_names)
-            scored.append((value, message, reasons))
-        score, target, reasons = max(scored, key=lambda item: (item[0], item[1].sequence))
+        # 处理器最终借用的是 expected_sequence 对应的 AstrBot 事件，身份锚点
+        # 必须与这个事件一致。不能从更早消息里另挑一个高分用户，否则计划
+        # 会按甲的身份生成、消息却挂在乙的事件下发送。
+        target = recent[-1]
+        score, reasons = self._message_score(target, recent, persona_names)
         if score < threshold:
             return ParticipationDecision("listen", score, reasons, target)
 
         # 高相关消息稳定参与；边缘话题保留一点“有时听着、有时接话”的人类感。
-        probability = min(0.92, 0.38 + max(0.0, score - threshold) * 0.18)
-        if score < threshold + 2.0 and self.random_fn() > probability:
+        probability = min(
+            max(0.05, float(max_reply_probability)),
+            max(0.05, float(base_reply_probability))
+            + max(0.0, score - threshold) * 0.18,
+        )
+        if score < max(threshold, float(always_reply_score)) and self.random_fn() > probability:
             return ParticipationDecision(
                 "listen",
                 score,
@@ -331,6 +342,62 @@ class ConversationRuntime:
                 target,
             )
         return ParticipationDecision("reply", score, reasons, target)
+
+    def is_current_target(self, scope_key: str, target_sequence: int) -> bool:
+        """确认主动回复生成期间没有出现更新消息。"""
+        state = self.groups.get(str(scope_key or ""))
+        return bool(
+            state is not None
+            and int(target_sequence or 0) > 0
+            and state.sequence == int(target_sequence)
+        )
+
+    @staticmethod
+    def _topic_terms(text: str) -> set[str]:
+        clean = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", str(text or "").lower())
+        terms = set(re.findall(r"[a-z0-9]{2,}", clean))
+        cjk = "".join(re.findall(r"[\u4e00-\u9fff]", clean))
+        terms.update(cjk[index : index + 2] for index in range(max(0, len(cjk) - 1)))
+        return {term for term in terms if term}
+
+    def is_target_relevant(
+        self,
+        scope_key: str,
+        target_sequence: int,
+        *,
+        max_new_messages: int = 4,
+        max_age_seconds: float = 45.0,
+        now: float | None = None,
+    ) -> bool:
+        """允许生成期间出现少量同话题消息，而不是把任何新消息都视为过期。"""
+
+        state = self.groups.get(str(scope_key or ""))
+        if state is None or int(target_sequence or 0) <= 0:
+            return False
+        target = next(
+            (item for item in state.messages if item.sequence == int(target_sequence)),
+            None,
+        )
+        if target is None:
+            return False
+        current = float(self.now_fn() if now is None else now)
+        if current - target.created_at > max(5.0, float(max_age_seconds)):
+            return False
+        newer = [item for item in state.messages if item.sequence > target.sequence]
+        if len(newer) > max(0, int(max_new_messages)):
+            return False
+        if not newer:
+            return True
+        if any(item.is_direct_wake or _NEGATIVE_RE.search(item.text) for item in newer):
+            return False
+        # 一两句补充通常仍处于同一轮口语对话；消息更多时再要求有话题词重叠。
+        if len(newer) <= 2:
+            return True
+        target_terms = self._topic_terms(target.text)
+        newer_terms = set().union(*(self._topic_terms(item.text) for item in newer))
+        if target_terms and target_terms.intersection(newer_terms):
+            return True
+        return all(len(item.text.strip()) <= 8 for item in newer)
 
     def record_bot_reply(
         self,
@@ -358,6 +425,7 @@ class ConversationRuntime:
             state.reply_timestamps.append(current)
         if quiet_topic:
             state.last_quiet_topic_at = current
+            state.last_quiet_topic_attempt_at = current
             state.quiet_topic_dates.append(datetime.fromtimestamp(current).date().isoformat())
             self.quiet_topic_history[scope_key] = list(state.quiet_topic_dates)
         target_key = self.identity_key(scope_key, target_sender_id)
@@ -423,6 +491,8 @@ class ConversationRuntime:
         group_whitelist: set[str],
         idle_seconds: float,
         cooldown_seconds: float,
+        bot_reply_guard_seconds: float | None = None,
+        failure_backoff_seconds: float = 600.0,
         max_per_day: int,
         active_start: str,
         active_end: str,
@@ -433,6 +503,11 @@ class ConversationRuntime:
         if not self._time_in_range(local.strftime("%H:%M"), active_start, active_end):
             return []
         today = local.date().isoformat()
+        reply_guard = (
+            float(cooldown_seconds)
+            if bot_reply_guard_seconds is None
+            else max(0.0, float(bot_reply_guard_seconds))
+        )
         result: list[GroupState] = []
         for state in self.groups.values():
             if not group_whitelist or state.group_id not in group_whitelist:
@@ -441,15 +516,93 @@ class ConversationRuntime:
                 continue
             if current - state.last_activity_at < idle_seconds:
                 continue
-            if state.last_bot_reply_at and current - state.last_bot_reply_at < cooldown_seconds:
+            if (
+                state.last_bot_reply_at
+                and current - state.last_bot_reply_at < reply_guard
+            ):
                 continue
             if (
                 state.last_quiet_topic_at
                 and current - state.last_quiet_topic_at < cooldown_seconds
             ):
                 continue
+            if (
+                state.last_quiet_topic_attempt_at
+                and current - state.last_quiet_topic_attempt_at
+                < max(60.0, float(failure_backoff_seconds))
+            ):
+                continue
             previous_dates = list(state.quiet_topic_dates)
             state.quiet_topic_dates = [item for item in state.quiet_topic_dates if item == today]
+            self.quiet_topic_history[state.scope_key] = list(state.quiet_topic_dates)
+            if state.quiet_topic_dates != previous_dates:
+                self._dirty = True
+            if len(state.quiet_topic_dates) >= max(1, int(max_per_day)):
+                continue
+            result.append(state)
+        return result
+
+    def active_topic_candidates(
+        self,
+        *,
+        group_whitelist: set[str],
+        minimum_lull_seconds: float,
+        quiet_idle_seconds: float,
+        minimum_observation_seconds: float,
+        cooldown_seconds: float,
+        bot_reply_guard_seconds: float,
+        failure_backoff_seconds: float = 600.0,
+        max_per_day: int,
+        active_start: str,
+        active_end: str,
+        now: float | None = None,
+    ) -> list[GroupState]:
+        """在活跃群的自然间隙提供确定性的主动开话题机会。
+
+        这条路径不依赖自然接话的随机概率。它要求已经观察群聊一段时间、
+        当前出现短暂间隙，并继续遵守成功冷却、失败退避和每日上限。
+        """
+
+        current = float(now if now is not None else self.now_fn())
+        local = datetime.fromtimestamp(current)
+        if not self._time_in_range(local.strftime("%H:%M"), active_start, active_end):
+            return []
+        today = local.date().isoformat()
+        minimum_lull = max(30.0, float(minimum_lull_seconds))
+        quiet_boundary = max(minimum_lull + 1.0, float(quiet_idle_seconds))
+        result: list[GroupState] = []
+        for state in self.groups.values():
+            if not group_whitelist or state.group_id not in group_whitelist:
+                continue
+            if not state.unified_msg_origin or not state.messages:
+                continue
+            observed_since = state.first_activity_at or state.messages[0].created_at
+            if current - observed_since < max(60.0, float(minimum_observation_seconds)):
+                continue
+            idle_for = current - state.last_activity_at
+            if idle_for < minimum_lull or idle_for >= quiet_boundary:
+                continue
+            if (
+                state.last_bot_reply_at
+                and current - state.last_bot_reply_at
+                < max(0.0, float(bot_reply_guard_seconds))
+            ):
+                continue
+            if (
+                state.last_quiet_topic_at
+                and current - state.last_quiet_topic_at < cooldown_seconds
+            ):
+                continue
+            if (
+                state.last_quiet_topic_attempt_at
+                and current - state.last_quiet_topic_attempt_at
+                < max(60.0, float(failure_backoff_seconds))
+            ):
+                continue
+            previous_dates = list(state.quiet_topic_dates)
+            state.quiet_topic_dates = [
+                item for item in state.quiet_topic_dates if item == today
+            ]
             self.quiet_topic_history[state.scope_key] = list(state.quiet_topic_dates)
             if state.quiet_topic_dates != previous_dates:
                 self._dirty = True
@@ -465,7 +618,9 @@ class ConversationRuntime:
     ) -> None:
         state = self.groups.get(scope_key)
         if state is not None:
-            state.last_quiet_topic_at = float(now if now is not None else self.now_fn())
+            state.last_quiet_topic_attempt_at = float(
+                now if now is not None else self.now_fn()
+            )
 
     @staticmethod
     def _time_in_range(current: str, start: str, end: str) -> bool:

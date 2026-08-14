@@ -10,9 +10,13 @@ class SpeechPlan:
 
     mode: str = "chat"
     reply_shape: str = "chat_bubbles"
+    conversation_mode: str = "direct_reply"
+    audience: str = "current_sender"
+    anchor: str = "当前消息"
     target: str = "当前说话者"
     intent: str = "自然回应当前消息"
     reply_act: str = "直接接话"
+    reaction: str = ""
     emotion: str = "轻松"
     tone: str = "自然、口语化"
     length: str = "1至2句"
@@ -51,6 +55,12 @@ class SpeechPlan:
         reply_shape = text("reply_shape", "chat_bubbles", 24).lower()
         if reply_shape not in {"chat_bubbles", "long_form"}:
             reply_shape = "chat_bubbles"
+        conversation_mode = text("conversation_mode", "direct_reply", 24).lower()
+        if conversation_mode not in {"direct_reply", "ambient_join", "quiet_topic"}:
+            conversation_mode = "direct_reply"
+        audience = text("audience", "current_sender", 24).lower()
+        if audience not in {"current_sender", "current_thread", "whole_group"}:
+            audience = "current_sender"
         raw_use_allowed_tools = value.get("use_allowed_tools", False)
         if isinstance(raw_use_allowed_tools, bool):
             use_allowed_tools = raw_use_allowed_tools
@@ -64,9 +74,13 @@ class SpeechPlan:
         return cls(
             mode=mode,
             reply_shape=reply_shape,
+            conversation_mode=conversation_mode,
+            audience=audience,
+            anchor=text("anchor", "当前消息", 180),
             target=text("target", "当前说话者", 80),
             intent=text("intent", "自然回应当前消息"),
             reply_act=text("reply_act", "直接接话"),
+            reaction=text("reaction", "", 120) if value.get("reaction") else "",
             emotion=text("emotion", "轻松", 80),
             tone=text("tone", "自然、口语化", 120),
             length=text("length", "1至2句", 40),

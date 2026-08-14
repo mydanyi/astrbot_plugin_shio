@@ -4,6 +4,8 @@ import json
 import re
 from typing import Any
 
+from .response_guard import extract_and_clean_internal_meme_references
+
 
 def content_to_text(content: Any) -> str:
     if isinstance(content, str):
@@ -127,6 +129,12 @@ def clean_contexts(
         text = content_to_text(item.get("content", ""))
         if not text:
             continue
+        if role == "assistant":
+            # Never feed a previously leaked Meme Manager marker or pseudo tool
+            # call back to the model as an in-context speaking example.
+            text, _ = extract_and_clean_internal_meme_references(text)
+            if not text:
+                continue
         if role == "user" and not _is_prelabelled_user(text):
             sender_id, sender_name, source_group_id = _sender_fields(item)
             if sender_id or sender_name:
@@ -197,6 +205,47 @@ def contexts_as_transcript(contexts: list[dict[str, str]]) -> str:
             label = "未标注身份的历史用户" if item["role"] == "user" else "角色"
             lines.append(f"{label}：{content}")
     return "\n".join(lines) or "（没有可用的历史聊天）"
+
+
+SENDER_LABEL_PATTERN = re.compile(
+    r"^\[(?:群ID:[^｜\]]+｜)?发送者：.*?｜ID:([^\]]+)\]\s*"
+)
+
+
+def isolate_replyer_contexts(
+    contexts: list[dict[str, str]],
+    *,
+    current_sender_id: str,
+    group_id: str,
+) -> list[dict[str, str]]:
+    """群聊 Replyer 只保留当前发送者自己的历史轮次。
+
+    Planner 仍然读取完整、带身份标签的群聊历史来理解多人话题；最终
+    Replyer 不再直接看到其他成员的第一人称经历，避免把上一人的事实
+    套给当前用户。紧随当前发送者消息的机器人回复视为同一轮保留。
+    """
+    if not normalize_group_id(group_id):
+        return list(contexts)
+
+    sender_id = str(current_sender_id or "").strip()
+    if not sender_id:
+        return []
+
+    result: list[dict[str, str]] = []
+    keep_assistant_turn = False
+    for item in contexts:
+        role = str(item.get("role", "") or "").lower()
+        content = str(item.get("content", "") or "")
+        if role == "user":
+            match = SENDER_LABEL_PATTERN.match(content)
+            keep_assistant_turn = bool(
+                match and match.group(1).strip() == sender_id
+            )
+            if keep_assistant_turn:
+                result.append({"role": "user", "content": content})
+        elif role == "assistant" and keep_assistant_turn:
+            result.append({"role": "assistant", "content": content})
+    return result
 
 
 def collect_supporting_material(request: Any, limit: int = 7000) -> str:

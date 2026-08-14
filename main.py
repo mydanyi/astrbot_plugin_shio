@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import random
 import re
 import sys
@@ -19,6 +20,7 @@ from .core.context_builder import (
     collect_supporting_material,
     contexts_as_transcript,
     get_current_message,
+    isolate_replyer_contexts,
 )
 from .core.conversation_runtime import ConversationRuntime, GroupState
 from .core.models import SpeechPlan
@@ -27,22 +29,38 @@ from .core.participation_filter import (
     bind_participation_plugin,
     unbind_participation_plugin,
 )
-from .core.planner import SpeechPlanner
+from .core.name_wake import NameWakeDecision, classify_name_wake
+from .core.planner import SpeechPlanner, fallback_plan, is_risque_teasing
 from .core.prompts import (
     DEFAULT_ATRI_VOICE_CARD,
     build_replyer_system_prompt,
     build_retry_prompt,
 )
 from .core.response_guard import (
+    EMOTIONAL_REACTION_VIOLATION,
+    FACT_GROUNDING_VIOLATION,
+    GROUP_PARTICIPATION_VIOLATION,
     IDENTITY_VIOLATION,
+    INTERNAL_REASONING_VIOLATION,
+    RELATIONSHIP_VIOLATION,
+    REALITY_GROUNDING_VIOLATION,
     TOOL_PROTOCOL_VIOLATION,
     clean_response,
+    contains_nonowner_identity_confusion,
+    contains_internal_reasoning,
     contains_tool_protocol,
+    emotional_reaction_safe_fallback,
+    extract_and_clean_internal_meme_references,
     find_violations,
     identity_safe_fallback,
     protocol_safe_fallback,
+    reasoning_safe_fallback,
+    reality_safe_fallback,
+    relationship_safe_fallback,
     split_chat_bubbles,
+    strip_unsupported_personal_experiences,
 )
+from .core.recovery_queue import PendingReply, PendingReplyStore
 from .core.style_retriever import StyleRetriever
 
 
@@ -58,10 +76,15 @@ SHIO_AMBIENT = "_shio_ambient_participation"
 SHIO_AMBIENT_META = "_shio_ambient_meta"
 SHIO_AMBIENT_TARGET = "_shio_ambient_target"
 SHIO_REPLY_RECORDED = "_shio_reply_recorded"
+SHIO_NATURAL_WAKE = "_shio_natural_name_wake"
 
 MEME_SEARCH_TOOL = "search_memes"
 MEME_SEMANTIC_PROMPT_START = "<!-- meme_manager_semantic_prompt:start -->"
 MEME_SEMANTIC_PROMPT_END = "<!-- meme_manager_semantic_prompt:end -->"
+RECOVERABLE_QUESTION_RE = re.compile(
+    r"[？?]|(?:怎么|如何|为啥|为什么|是不是|有没有|能不能|可不可以|什么|谁|哪里|多少|"
+    r"帮我|告诉我|解释|讲讲|说说|看看|分析|排查|解决)"
+)
 
 
 class ShioPlugin(Star):
@@ -75,14 +98,69 @@ class ShioPlugin(Star):
         self.planner = SpeechPlanner(logger)
         self.styles = StyleRetriever(data_dir, assets_dir, logger)
         self.runtime = ConversationRuntime(data_dir, logger)
+        self.pending_replies = PendingReplyStore(data_dir, logger)
         self._quiet_topic_task: asyncio.Task[Any] | None = None
+        self._recovery_task: asyncio.Task[Any] | None = None
+        self._recovery_wakeup = asyncio.Event()
         self._stopping = False
+        self._schema_defaults = self._load_schema_defaults()
         bind_participation_plugin(self)
         self._refresh_provider_schema_options()
 
     def _config(self, key: str, default: Any) -> Any:
         value = self.config.get(key, default)
         return default if value is None else value
+
+    @staticmethod
+    def _load_schema_defaults() -> dict[str, Any]:
+        """从配置页定义读取默认值，避免在执行代码里再藏一套场景文案。"""
+        try:
+            schema_path = Path(__file__).resolve().parent / "_conf_schema.json"
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            return {
+                str(key): value.get("default")
+                for key, value in schema.items()
+                if isinstance(value, dict) and "default" in value
+            }
+        except Exception as exc:
+            logger.warning("[星汐/配置] 无法读取配置默认值：%s", exc)
+            return {}
+
+    def _scene_rules(self, key: str, legacy_extra_key: str) -> str:
+        """读取可编辑的完整场景规则，并兼容旧版额外提示词。"""
+        missing = object()
+        configured = self.config.get(key, missing)
+        default_rules = str(self._schema_defaults.get(key, "") or "").strip()
+        legacy_extra = str(self.config.get(legacy_extra_key, "") or "").strip()
+        configured_rules = (
+            "" if configured is missing else str(configured or "").strip()
+        )
+
+        # AstrBot 升级配置时可能先把新字段补成默认值，再保留旧字段。
+        # 只有新字段仍为默认值时才合并旧内容；用户已经主动改过新规则时不打扰。
+        if legacy_extra and (
+            configured is missing or configured_rules == default_rules
+        ):
+            merged = "\n\n".join(
+                part for part in (default_rules, legacy_extra) if part
+            )
+            try:
+                self.config[key] = merged
+                self.config[legacy_extra_key] = ""
+                save_config = getattr(self.config, "save_config", None)
+                if callable(save_config):
+                    try:
+                        save_config()
+                    except TypeError:
+                        save_config(dict(self.config))
+                logger.info("[星汐/配置] 已迁移旧版场景提示词：%s", key)
+            except Exception as exc:
+                logger.warning("[星汐/配置] 旧版场景提示词迁移未能持久化：%s", exc)
+            return merged
+
+        if configured is not missing:
+            return configured_rules
+        return default_rules
 
     def _owner_ids(self) -> set[str]:
         raw = self._config("owner_ids", [])
@@ -103,6 +181,55 @@ class ShioPlugin(Star):
         else:
             values = []
         return {str(item).strip() for item in values if str(item).strip()}
+
+    def _name_wake_aliases(self) -> list[str]:
+        raw = self._config(
+            "natural_name_wake_aliases",
+            ["亚托莉", "ATRI", "アトリ", "萝卜子"],
+        )
+        if isinstance(raw, str):
+            values = re.split(r"[,;，；\n]+", raw)
+        elif isinstance(raw, (list, tuple, set)):
+            values = raw
+        else:
+            values = []
+        aliases: list[str] = []
+        for value in values:
+            alias = str(value or "").strip()
+            if alias and alias.casefold() not in {item.casefold() for item in aliases}:
+                aliases.append(alias)
+        persona_name = str(self._config("persona_name", "亚托莉") or "").strip()
+        if persona_name and persona_name.casefold() not in {
+            item.casefold() for item in aliases
+        }:
+            aliases.insert(0, persona_name)
+        return aliases
+
+    def _classify_natural_name_wake(
+        self,
+        event: AstrMessageEvent,
+        message: str,
+        group_id: str,
+    ) -> NameWakeDecision:
+        if not bool(self._config("natural_name_wake_enabled", True)):
+            return NameWakeDecision("none", reason="功能已关闭")
+        whitelist = self._string_set("natural_name_wake_group_whitelist", [])
+        if whitelist and group_id not in whitelist:
+            return NameWakeDecision("none", reason="当前群不在白名单")
+        try:
+            components = list(event.get_messages() or [])
+        except Exception:
+            components = []
+        # 只有引用段里出现名字不算当前用户直呼；当前纯文本仍会正常参与判断。
+        if not str(message or "").strip() and any(
+            component.__class__.__name__ == "Reply" for component in components
+        ):
+            return NameWakeDecision("none", reason="名字只出现在引用内容中")
+        return classify_name_wake(
+            message,
+            self._name_wake_aliases(),
+            mode=str(self._config("natural_name_wake_mode", "natural")),
+        )
 
     def _ambient_target(self, event: AstrMessageEvent) -> dict[str, Any] | None:
         if not bool(event.get_extra(SHIO_AMBIENT, False)):
@@ -448,6 +575,37 @@ class ShioPlugin(Star):
                     result.add(name)
         return result
 
+    @staticmethod
+    def _collect_text_components(components: Any) -> list[Any]:
+        """Collect mutable text components, including those nested in Node.
+
+        Meme Manager may decorate an LLM reply as a merged-forward ``Node``.
+        Looking only at the top-level chain leaves its nested ``Plain`` text
+        outside the final output guard.
+        """
+        result: list[Any] = []
+        visited: set[int] = set()
+
+        def visit(component: Any) -> None:
+            marker = id(component)
+            if marker in visited:
+                return
+            visited.add(marker)
+            if isinstance(getattr(component, "text", None), str):
+                result.append(component)
+            for attribute in ("content", "chain"):
+                children = getattr(component, attribute, None)
+                if isinstance(children, (list, tuple)):
+                    for child in children:
+                        visit(child)
+
+        if isinstance(components, (list, tuple)):
+            for component in components:
+                visit(component)
+        elif components is not None:
+            visit(components)
+        return result
+
     def _provider(self, provider_id: str, umo: str) -> Any:
         if provider_id.strip():
             provider = self.context.get_provider_by_id(provider_id.strip())
@@ -455,6 +613,54 @@ class ShioPlugin(Star):
                 return provider
             logger.warning("[星汐] 找不到聊天 Provider %s，将使用当前会话模型。", provider_id)
         return self.context.get_using_provider(umo)
+
+    @staticmethod
+    def _provider_label(provider: Any) -> str:
+        try:
+            meta = provider.meta()
+            provider_id = str(getattr(meta, "id", "") or "").strip()
+            model = str(getattr(meta, "model", "") or "").strip()
+            if provider_id:
+                return f"{provider_id}/{model}" if model and model != provider_id else provider_id
+        except Exception:
+            pass
+        config = getattr(provider, "provider_config", {})
+        if isinstance(config, dict):
+            provider_id = str(config.get("id", "") or "").strip()
+            if provider_id:
+                return provider_id
+        return provider.__class__.__name__
+
+    def _initiative_provider_candidates(self, umo: str) -> list[tuple[str, Any]]:
+        """构造主动话题专用的可靠 Provider 链，保持顺序并去重。"""
+
+        configured_ids = [
+            str(self._config("replyer_provider_id", "") or "").strip(),
+            str(self._config("quiet_topic_fallback_provider_id", "") or "").strip(),
+            str(self._config("planner_fallback_provider_id", "") or "").strip(),
+            str(self._config("planner_provider_id", "") or "").strip(),
+        ]
+        result: list[tuple[str, Any]] = []
+        seen: set[int] = set()
+        for provider_id in configured_ids:
+            if not provider_id:
+                continue
+            provider = self.context.get_provider_by_id(provider_id)
+            if provider is None or not hasattr(provider, "text_chat"):
+                logger.warning(
+                    "[星汐/主动话题] 配置的 Provider %s 当前不可用，已跳过。",
+                    provider_id,
+                )
+                continue
+            marker = id(provider)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            result.append((provider_id, provider))
+        current = self.context.get_using_provider(umo)
+        if current is not None and hasattr(current, "text_chat") and id(current) not in seen:
+            result.append((self._provider_label(current), current))
+        return result
 
     def _typed_provider(self, provider_id: str, required_method: str) -> Any:
         if not provider_id.strip():
@@ -559,6 +765,22 @@ class ShioPlugin(Star):
         if not platform_id:
             platform_id = self._event_value(event, "get_platform_name") or "unknown"
         is_direct_wake = bool(getattr(event, "is_at_or_wake_command", False))
+        name_wake = (
+            NameWakeDecision("none")
+            if is_direct_wake
+            else self._classify_natural_name_wake(event, message, group_id)
+        )
+        if name_wake.is_direct:
+            event.is_at_or_wake_command = True
+            event.is_wake = True
+            event.set_extra(
+                SHIO_NATURAL_WAKE,
+                {
+                    "alias": name_wake.alias,
+                    "reason": name_wake.reason,
+                    "message": message,
+                },
+            )
         ingested = self.runtime.ingest(
             platform_id=platform_id,
             bot_id=bot_id,
@@ -568,12 +790,21 @@ class ShioPlugin(Star):
             sender_name=self._event_value(event, "get_sender_name") or sender_id,
             text=message,
             is_owner=sender_id in self._owner_ids(),
-            is_direct_wake=is_direct_wake,
+            is_direct_wake=is_direct_wake or name_wake.is_direct,
             observe_feedback=bool(self._config("social_feedback_enabled", True)),
             created_at=float(getattr(event, "created_at", 0.0) or 0.0) or None,
         )
         if ingested is None:
             return False
+        if name_wake.is_direct:
+            logger.info(
+                "[星汐/自然唤醒] group=%s sender=%s alias=%s reason=%s",
+                group_id,
+                sender_id,
+                name_wake.alias,
+                name_wake.reason,
+            )
+            return True
         if not bool(self._config("ambient_participation_enabled", False)):
             return False
         allowed_groups = self._string_set("ambient_group_whitelist", [])
@@ -597,6 +828,11 @@ class ShioPlugin(Star):
     @filter.custom_filter(AmbientParticipationFilter, False)
     async def participate_group_chat(self, event: AstrMessageEvent):
         """对未点名群消息执行去抖后的听／等／回复门控。"""
+        natural_wake = event.get_extra(SHIO_NATURAL_WAKE, None)
+        if isinstance(natural_wake, dict):
+            # 过滤器只负责把自然称名升级为正式唤醒。这里不另造 ProviderRequest，
+            # 让 ProcessStage 随后走 AstrBot 原生会话、上下文与工具链。
+            return
         meta = event.get_extra(SHIO_AMBIENT_META, None)
         if not isinstance(meta, dict):
             return
@@ -636,6 +872,23 @@ class ShioPlugin(Star):
                 "ATRI",
                 "星汐",
             ],
+            base_reply_probability=max(
+                0.05,
+                min(
+                    1.0,
+                    float(self._config("ambient_base_reply_probability", 0.65)),
+                ),
+            ),
+            max_reply_probability=max(
+                0.05,
+                min(
+                    1.0,
+                    float(self._config("ambient_max_reply_probability", 0.95)),
+                ),
+            ),
+            always_reply_score=float(
+                self._config("ambient_always_reply_score", 6.2)
+            ),
         )
         if bool(self._config("debug_log", False)):
             logger.info(
@@ -661,6 +914,9 @@ class ShioPlugin(Star):
         if self._quiet_topic_task is None or self._quiet_topic_task.done():
             self._stopping = False
             self._quiet_topic_task = asyncio.create_task(self._quiet_topic_loop())
+        if self._recovery_task is None or self._recovery_task.done():
+            self._stopping = False
+            self._recovery_task = asyncio.create_task(self._recovery_loop())
 
     async def _quiet_topic_loop(self) -> None:
         while not self._stopping:
@@ -671,31 +927,85 @@ class ShioPlugin(Star):
                 ):
                     whitelist = self._string_set("quiet_topic_group_whitelist", [])
                     if whitelist:
-                        candidates = self.runtime.quiet_topic_candidates(
-                            group_whitelist=whitelist,
-                            idle_seconds=max(
-                                300.0,
-                                float(self._config("quiet_topic_idle_minutes", 90)) * 60,
-                            ),
-                            cooldown_seconds=max(
-                                900.0,
-                                float(self._config("quiet_topic_cooldown_minutes", 240))
-                                * 60,
-                            ),
-                            max_per_day=max(
+                        idle_seconds = max(
+                            300.0,
+                            float(self._config("quiet_topic_idle_minutes", 90)) * 60,
+                        )
+                        cooldown_seconds = max(
+                            900.0,
+                            float(self._config("quiet_topic_cooldown_minutes", 240))
+                            * 60,
+                        )
+                        failure_backoff_seconds = max(
+                            60.0,
+                            float(
+                                self._config("quiet_topic_failure_backoff_minutes", 10)
+                            )
+                            * 60,
+                        )
+                        bot_reply_guard_seconds = max(
+                            0.0,
+                            float(
+                                self._config("quiet_topic_after_bot_reply_minutes", 10)
+                            )
+                            * 60,
+                        )
+                        common = {
+                            "group_whitelist": whitelist,
+                            "cooldown_seconds": cooldown_seconds,
+                            "bot_reply_guard_seconds": bot_reply_guard_seconds,
+                            "failure_backoff_seconds": failure_backoff_seconds,
+                            "max_per_day": max(
                                 1,
                                 int(self._config("quiet_topic_max_per_day", 2)),
                             ),
-                            active_start=str(
+                            "active_start": str(
                                 self._config("quiet_topic_active_start", "09:00")
                             ),
-                            active_end=str(
+                            "active_end": str(
                                 self._config("quiet_topic_active_end", "23:30")
                             ),
+                        }
+                        quiet_candidates = self.runtime.quiet_topic_candidates(
+                            idle_seconds=idle_seconds,
+                            **common,
                         )
+                        trigger = "quiet_idle"
+                        candidates = quiet_candidates
+                        if not candidates and bool(
+                            self._config("active_topic_enabled", True)
+                        ):
+                            candidates = self.runtime.active_topic_candidates(
+                                minimum_lull_seconds=max(
+                                    30.0,
+                                    float(
+                                        self._config("active_topic_lull_minutes", 3)
+                                    )
+                                    * 60,
+                                ),
+                                quiet_idle_seconds=idle_seconds,
+                                minimum_observation_seconds=max(
+                                    60.0,
+                                    float(
+                                        self._config(
+                                            "active_topic_observation_minutes", 30
+                                        )
+                                    )
+                                    * 60,
+                                ),
+                                **common,
+                            )
+                            trigger = "active_lull"
                         if candidates:
                             state = min(candidates, key=lambda item: item.last_activity_at)
-                            await self._send_quiet_topic(state)
+                            logger.info(
+                                "[星汐/主动话题] group=%s trigger=%s idle=%.1fmin 已进入生成队列。",
+                                state.group_id,
+                                trigger,
+                                max(0.0, self.runtime.now_fn() - state.last_activity_at)
+                                / 60,
+                            )
+                            await self._send_quiet_topic(state, trigger=trigger)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -709,34 +1019,394 @@ class ShioPlugin(Star):
             except asyncio.CancelledError:
                 break
 
-    async def _send_quiet_topic(self, state: GroupState) -> None:
-        # 先占用冷却窗口；即使 Provider 或平台失败，也不会每个检查周期重复烧 Token。
+    @staticmethod
+    def _recovery_contexts(
+        contexts: Any,
+        *,
+        max_messages: int,
+        max_chars: int,
+    ) -> list[dict[str, str]]:
+        result: list[dict[str, str]] = []
+        used = 0
+        for item in list(contexts or [])[-max(1, int(max_messages)) :]:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "user") or "user")
+            content = item.get("content", "")
+            if not isinstance(content, str):
+                try:
+                    content = json.dumps(content, ensure_ascii=False)
+                except Exception:
+                    content = str(content)
+            remaining = max(0, int(max_chars) - used)
+            if remaining <= 0:
+                break
+            clean = content[:remaining]
+            if clean:
+                result.append({"role": role, "content": clean})
+                used += len(clean)
+        return result
+
+    @staticmethod
+    def _event_message_id(event: AstrMessageEvent) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        for source in (message_obj, event):
+            for key in ("message_id", "id"):
+                value = getattr(source, key, "") if source is not None else ""
+                if value not in (None, "", 0, "0"):
+                    return str(value)
+        return ""
+
+    def _enqueue_pending_reply(
+        self,
+        event: AstrMessageEvent,
+        payload: dict[str, Any],
+        reason: str,
+        draft_text: str = "",
+    ) -> str:
+        if not bool(self._config("recovery_queue_enabled", True)):
+            return ""
+        if bool(payload.get("is_ambient", False)) or str(
+            payload.get("conversation_mode", "direct_reply")
+        ) != "direct_reply":
+            return ""
+        current_message = str(payload.get("current_message", "") or "").strip()
+        reply_shape = str(payload.get("reply_shape", "chat_bubbles"))
+        if not current_message:
+            return ""
+        if (
+            (payload.get("image_urls") or payload.get("audio_urls"))
+            and not str(draft_text or "").strip()
+        ):
+            # 临时附件可能在事件结束后被 AstrBot 清理。没有可重写草稿时不作
+            # “稍后一定补答”的承诺，避免恢复任务拿不到原附件却假装看过。
+            return ""
+        if bool(self._config("recovery_require_question", True)) and not (
+            RECOVERABLE_QUESTION_RE.search(current_message)
+            or reply_shape == "long_form"
+        ):
+            return ""
+        ttl_minutes = float(
+            self._config(
+                "recovery_long_form_ttl_minutes"
+                if reply_shape == "long_form"
+                else "recovery_chat_ttl_minutes",
+                360 if reply_shape == "long_form" else 60,
+            )
+        )
+        contexts = self._recovery_contexts(
+            payload.get("contexts", []),
+            max_messages=max(
+                1, int(self._config("recovery_context_messages", 6))
+            ),
+            max_chars=max(500, int(self._config("recovery_context_chars", 4000))),
+        )
+        item, created = self.pending_replies.enqueue(
+            unified_msg_origin=str(getattr(event, "unified_msg_origin", "") or ""),
+            platform_id=str(payload.get("platform_id", "") or ""),
+            bot_id=str(payload.get("bot_id", "") or ""),
+            chat_type=str(payload.get("chat_type", "private") or "private"),
+            group_id=str(payload.get("group_id", "") or ""),
+            sender_id=str(payload.get("sender_id", "") or ""),
+            sender_name=str(payload.get("sender_name", "") or "当前说话者"),
+            message_id=self._event_message_id(event),
+            current_message=current_message,
+            contexts=contexts,
+            reply_shape=reply_shape,
+            initial_delay_seconds=max(
+                5.0, float(self._config("recovery_initial_delay_seconds", 30))
+            ),
+            ttl_seconds=max(60.0, ttl_minutes * 60),
+            failure_reason=reason,
+            failed_draft=str(draft_text or ""),
+            max_items=max(10, int(self._config("recovery_max_pending", 100))),
+        )
+        self._recovery_wakeup.set()
+        logger.info(
+            "[星汐/补答] %s待补答 id=%s group=%s sender=%s，首次重试约 %.0f 秒后。",
+            "已写入" if created else "已合并重复",
+            item.id,
+            item.group_id or "<private>",
+            item.sender_id or "<missing>",
+            max(5.0, float(self._config("recovery_initial_delay_seconds", 30))),
+        )
+        if created:
+            return (
+                "等、等一下，刚才那段不算！这题我先记下了……\n"
+                "等语言模块恢复，我会回来重新说一次嘛。"
+            )
+        return "这题我还记着呢……等语言模块恢复，我会回来补上的。"
+
+    def _signal_provider_recovered(self) -> None:
+        if not self.pending_replies.items:
+            return
+        self.pending_replies.expedite()
+        self._recovery_wakeup.set()
+
+    def _recovery_delays(self) -> list[float]:
+        raw = self._config("recovery_backoff_seconds", [120, 300, 900, 1800])
+        if isinstance(raw, str):
+            values = re.split(r"[,;，；\s]+", raw)
+        elif isinstance(raw, (list, tuple, set)):
+            values = raw
+        else:
+            values = []
+        result: list[float] = []
+        for value in values:
+            try:
+                result.append(max(5.0, float(value)))
+            except (TypeError, ValueError):
+                continue
+        return result or [120.0, 300.0, 900.0, 1800.0]
+
+    async def _recovery_loop(self) -> None:
+        while not self._stopping:
+            self._recovery_wakeup.clear()
+            try:
+                if bool(self._config("enabled", True)) and bool(
+                    self._config("recovery_queue_enabled", True)
+                ):
+                    await self._drain_recovery_queue()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.exception("[星汐/补答] 恢复循环异常，稍后继续：%s", exc)
+            interval = max(
+                10.0,
+                min(300.0, float(self._config("recovery_check_seconds", 30))),
+            )
+            try:
+                await asyncio.wait_for(self._recovery_wakeup.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                break
+
+    async def _drain_recovery_queue(self) -> None:
+        due = self.pending_replies.due(
+            limit=max(1, int(self._config("recovery_max_per_cycle", 1)))
+        )
+        for item in due:
+            try:
+                await self._recover_pending_reply(item)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.pending_replies.mark_failed(
+                    item.id,
+                    reason=str(exc),
+                    delays_seconds=self._recovery_delays(),
+                    max_attempts=max(
+                        1, int(self._config("recovery_max_attempts", 4))
+                    ),
+                )
+                logger.warning(
+                    "[星汐/补答] id=%s 第 %d 次恢复失败：%s",
+                    item.id,
+                    item.attempts + 1,
+                    exc,
+                )
+
+    async def _recover_pending_reply(self, item: PendingReply) -> None:
+        provider = self._provider(
+            str(self._config("replyer_provider_id", "")),
+            item.unified_msg_origin,
+        )
+        if provider is None:
+            raise RuntimeError("没有可用的 Replyer Provider")
+        is_owner = bool(item.sender_id) and item.sender_id in self._owner_ids()
+        plan = fallback_plan(
+            item.sender_name,
+            is_owner,
+            item.current_message,
+            conversation_mode="direct_reply",
+        )
+        plan.mode = "chat"
+        plan.use_allowed_tools = False
+        plan.must_include = list(plan.must_include) + ["直接补答原问题"]
+        plan.avoid = list(plan.avoid) + [
+            "假装调用过联网或其他工具",
+            "解释后台故障细节",
+            "再次承诺稍后回复",
+        ]
+        persona_name = str(self._config("persona_name", "亚托莉") or "亚托莉").strip()
+        voice_card = str(self._config("voice_card", "") or "").strip()
+        if not voice_card:
+            voice_card = DEFAULT_ATRI_VOICE_CARD
+        chat_max_bubbles = min(
+            5, max(1, int(self._config("chat_max_bubbles", 3)))
+        )
+        system_prompt = build_replyer_system_prompt(
+            persona_name=persona_name,
+            voice_card=voice_card,
+            sender_name=item.sender_name,
+            sender_id=item.sender_id,
+            platform_id=item.platform_id,
+            bot_id=item.bot_id,
+            chat_type=item.chat_type,
+            group_id=item.group_id,
+            identity_key=(
+                f"platform:{item.platform_id}|bot:{item.bot_id}|"
+                f"{item.chat_type}:{item.group_id or item.sender_id}|user:{item.sender_id}"
+            ),
+            is_owner=is_owner,
+            plan=plan,
+            expressions=[],
+            chat_soft_chars=max(30, int(self._config("chat_soft_chars", 100))),
+            long_form_soft_chars=max(
+                300, int(self._config("long_form_soft_chars", 1200))
+            ),
+            chat_max_bubbles=chat_max_bubbles,
+            allowed_tool_names=[],
+            conversation_mode_rules="",
+        )
+        draft_material = (
+            "\n\n上次未发送的草稿如下。它只用于保留内容线索，可能包含内部规划、"
+            "工具协议或不合格表达；请重新组织，绝对不要照抄这些异常部分：\n"
+            + item.failed_draft
+            if item.failed_draft
+            else ""
+        )
+        recovery_prompt = (
+            "这是服务恢复后的补答。请现在直接回答下面这条尚未完成的问题；"
+            "不要声称使用了任何工具，不要再说稍后回答，也不要解释内部机制。\n\n"
+            f"原问题：{item.current_message}{draft_material}"
+        )
+        response = await asyncio.wait_for(
+            provider.text_chat(
+                prompt=recovery_prompt,
+                contexts=item.contexts,
+                system_prompt=system_prompt,
+                image_urls=[],
+                audio_urls=[],
+                func_tool=None,
+                request_max_retries=1,
+            ),
+            timeout=max(
+                10.0,
+                min(
+                    120.0,
+                    float(self._config("recovery_request_timeout_seconds", 60)),
+                ),
+            ),
+        )
+        candidate = clean_response(
+            str(response.completion_text or ""), item.reply_shape
+        )
+        if not candidate:
+            raise RuntimeError("Provider 返回空补答")
+        violations = find_violations(
+            candidate,
+            reply_shape=item.reply_shape,
+            soft_chars=(
+                max(300, int(self._config("long_form_soft_chars", 1200)))
+                if item.reply_shape == "long_form"
+                else max(30, int(self._config("chat_soft_chars", 100)))
+            ),
+            max_bubbles=chat_max_bubbles,
+            is_owner=is_owner,
+            conversation_mode="direct_reply",
+            required_reaction=plan.reaction,
+            require_emotional_reaction=is_risque_teasing(item.current_message),
+            grounding_facts=list(plan.facts or []),
+            enforce_group_participation_guard=False,
+        )
+        severe = [
+            reason
+            for reason in violations
+            if reason not in {"闲聊使用 Markdown 或列表", "闲聊气泡过多"}
+        ]
+        if severe:
+            raise RuntimeError("补答输出仍不合格：" + "、".join(severe))
+        candidate = clean_response(candidate, item.reply_shape)
+        if item.reply_shape == "chat_bubbles":
+            candidate = "\n".join(split_chat_bubbles(candidate, chat_max_bubbles))
+        visible = "刚才那题我还记得哦。现在恢复了——\n" + candidate
+        chain = MessageChain()
+        if item.message_id:
+            try:
+                from astrbot.core.message.components import Reply
+
+                chain.chain.append(Reply(id=item.message_id))
+            except Exception as exc:
+                if bool(self._config("debug_log", False)):
+                    logger.warning("[星汐/补答] 无法构造引用消息，改为普通补答：%s", exc)
+        chain.message(visible)
+        success = await self.context.send_message(item.unified_msg_origin, chain)
+        if not success:
+            raise RuntimeError("平台发送补答失败")
+        self.pending_replies.complete(item.id)
+        if item.chat_type == "group" and item.group_id:
+            scope_key = self.runtime.group_scope(
+                item.platform_id, item.bot_id, item.group_id
+            )
+            self.runtime.record_bot_reply(
+                scope_key=scope_key,
+                target_sender_id=item.sender_id,
+                reply_text=visible,
+                ambient_participation=False,
+            )
+            self.runtime.flush()
+        logger.info(
+            "[星汐/补答] id=%s 已恢复并发送 group=%s sender=%s。",
+            item.id,
+            item.group_id or "<private>",
+            item.sender_id,
+        )
+    async def _send_quiet_topic(
+        self,
+        state: GroupState,
+        *,
+        trigger: str = "quiet_idle",
+    ) -> bool:
+        # 失败只进入短退避；完整主动话题冷却仅在真正发送成功后记录。
         self.runtime.mark_quiet_topic_attempt(state.scope_key)
+        started_at = asyncio.get_running_loop().time()
+        start_sequence = state.sequence
         seed = self.runtime.quiet_topic_seed(state.scope_key)
+        scene_rules = self._scene_rules(
+            "quiet_topic_rules",
+            "quiet_topic_extra_prompt",
+        )
         plan = SpeechPlan(
             mode="chat",
             reply_shape="chat_bubbles",
+            conversation_mode="quiet_topic",
+            audience="whole_group",
+            anchor=(
+                f"近期公共话题线索：{seed}"
+                if seed
+                else "当前群聊的整体气氛与适合轻松承接的日常话头"
+            ),
             target="群里的大家",
-            intent="在群聊安静一段时间后，自然开启一个轻松而有回应空间的话题",
-            reply_act="像刚想到一件事那样随口开场，最多提出一个容易回答的问题",
-            emotion="轻松、好奇",
-            tone="自然口语，不报时，不解释为什么突然说话",
-            length="1至2条短消息",
+            intent=(
+                "在活跃群聊的自然间隙主动开启一个新话头"
+                if trigger == "active_lull"
+                else "在群聊安静后主动开启一个新话头"
+            ),
+            reply_act="严格遵循本轮管理员配置的主动话题完整规则",
+            emotion="服从稳定人格与管理员场景规则",
+            tone="由管理员场景规则决定",
+            length="由管理员场景规则决定",
             must_include=[],
             avoid=[
-                "宣布这是主动发言",
-                "说群里太安静或催大家说话",
                 "编造新闻、事实或个人经历",
                 "@全体成员",
                 "使用工具",
+                "把广播占位符当成真实用户或主人",
             ],
             facts=[],
             use_allowed_tools=False,
         )
+        situation = (
+            "现在是活跃群聊中的自然间隙；请主动开一个新话头，不要回答或点名某个用户。"
+            if trigger == "active_lull"
+            else "群聊已经安静了一段时间；请主动开一个新话头。"
+        )
         current_message = (
-            f"围绕最近话题“{seed}”自然开启一句新话头。"
+            f"群聊主动发言任务。{situation}可参考的近期公共话题线索：“{seed}”。"
             if seed
-            else "自然开启一个轻松、日常、容易让群友接话的新话头。"
+            else f"群聊主动发言任务。{situation}当前没有可靠的近期话题线索。"
         )
         expressions = await self.styles.retrieve(
             current_message=current_message,
@@ -779,71 +1449,137 @@ class ShioPlugin(Star):
             ),
             chat_max_bubbles=chat_max_bubbles,
             allowed_tool_names=[],
+            conversation_mode_rules=scene_rules,
         )
-        provider = self._provider(
-            str(self._config("replyer_provider_id", "")),
-            state.unified_msg_origin,
-        )
-        if provider is None:
+        providers = self._initiative_provider_candidates(state.unified_msg_origin)
+        if not providers:
             logger.warning("[星汐/主动话题] group=%s 没有可用聊天模型。", state.group_id)
-            return
-        response = await provider.text_chat(
-            prompt=current_message,
-            contexts=self.runtime.recent_contexts(
-                state.scope_key,
-                max(4, int(self._config("quiet_topic_context_messages", 10))),
+            return False
+        timeout_seconds = max(
+            5.0,
+            min(
+                120.0,
+                float(self._config("quiet_topic_provider_timeout_seconds", 35)),
             ),
-            system_prompt=system_prompt,
-            func_tool=None,
-            request_max_retries=1,
         )
-        candidate = clean_response(str(response.completion_text or ""), "chat_bubbles")
-        if not candidate:
-            return
-        violations = find_violations(
-            candidate,
-            reply_shape="chat_bubbles",
-            soft_chars=max(30, int(self._config("chat_soft_chars", 100))),
-            max_bubbles=chat_max_bubbles,
-            is_owner=False,
+        contexts = self.runtime.recent_contexts(
+            state.scope_key,
+            max(4, int(self._config("quiet_topic_context_messages", 10))),
         )
-        if violations and bool(self._config("retry_on_violation", True)):
-            retry = await provider.text_chat(
-                prompt=build_retry_prompt(
-                    current_message,
-                    candidate,
-                    violations,
+        candidate = ""
+        provider_used = ""
+        for provider_name, provider in providers:
+            provider_started = asyncio.get_running_loop().time()
+            try:
+                response = await asyncio.wait_for(
+                    provider.text_chat(
+                        prompt=current_message,
+                        contexts=contexts,
+                        system_prompt=system_prompt,
+                        func_tool=None,
+                        request_max_retries=1,
+                    ),
+                    timeout=timeout_seconds,
+                )
+                candidate = clean_response(
+                    str(response.completion_text or ""),
                     "chat_bubbles",
-                ),
-                contexts=self.runtime.recent_contexts(
-                    state.scope_key,
-                    max(4, int(self._config("quiet_topic_context_messages", 10))),
-                ),
-                system_prompt=system_prompt,
-                func_tool=None,
-                request_max_retries=1,
-            )
-            candidate = clean_response(
-                str(retry.completion_text or ""),
-                "chat_bubbles",
-            )
-        remaining_violations = find_violations(
-            candidate,
-            reply_shape="chat_bubbles",
-            soft_chars=max(30, int(self._config("chat_soft_chars", 100))),
-            max_bubbles=chat_max_bubbles,
-            is_owner=False,
-        )
-        if remaining_violations:
+                )
+                if not candidate:
+                    raise ValueError("Provider 返回空文本")
+                violations = find_violations(
+                    candidate,
+                    reply_shape="chat_bubbles",
+                    soft_chars=max(30, int(self._config("chat_soft_chars", 100))),
+                    max_bubbles=chat_max_bubbles,
+                    is_owner=False,
+                    conversation_mode="quiet_topic",
+                    enforce_group_participation_guard=bool(
+                        self._config("group_participation_guard_enabled", True)
+                    ),
+                )
+                if violations and bool(self._config("retry_on_violation", True)):
+                    retry = await asyncio.wait_for(
+                        provider.text_chat(
+                            prompt=build_retry_prompt(
+                                current_message,
+                                candidate,
+                                violations,
+                                "chat_bubbles",
+                                conversation_mode="quiet_topic",
+                            ),
+                            contexts=contexts,
+                            system_prompt=system_prompt,
+                            func_tool=None,
+                            request_max_retries=1,
+                        ),
+                        timeout=timeout_seconds,
+                    )
+                    candidate = clean_response(
+                        str(retry.completion_text or ""),
+                        "chat_bubbles",
+                    )
+                remaining_violations = find_violations(
+                    candidate,
+                    reply_shape="chat_bubbles",
+                    soft_chars=max(30, int(self._config("chat_soft_chars", 100))),
+                    max_bubbles=chat_max_bubbles,
+                    is_owner=False,
+                    conversation_mode="quiet_topic",
+                    enforce_group_participation_guard=bool(
+                        self._config("group_participation_guard_enabled", True)
+                    ),
+                )
+                if remaining_violations:
+                    raise ValueError(
+                        "输出仍不合格：" + "、".join(remaining_violations)
+                    )
+                provider_used = provider_name
+                logger.info(
+                    "[星汐/主动话题] group=%s trigger=%s Provider=%s 生成成功，耗时=%.1fs。",
+                    state.group_id,
+                    trigger,
+                    provider_name,
+                    asyncio.get_running_loop().time() - provider_started,
+                )
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                candidate = ""
+                logger.warning(
+                    "[星汐/主动话题] group=%s trigger=%s Provider=%s 失败（%.1fs）：%s",
+                    state.group_id,
+                    trigger,
+                    provider_name,
+                    asyncio.get_running_loop().time() - provider_started,
+                    exc,
+                )
+        if not candidate:
             logger.warning(
-                "[星汐/主动话题] group=%s 输出仍不合格，已放弃本次发送：%s",
+                "[星汐/主动话题] group=%s trigger=%s Provider 链全部失败，本次不发送。",
                 state.group_id,
-                "、".join(remaining_violations),
+                trigger,
             )
-            return
+            return False
+        newer_messages = [
+            item for item in state.messages if item.sequence > start_sequence
+        ]
+        grace_messages = max(
+            0,
+            int(self._config("quiet_topic_generation_grace_messages", 3)),
+        )
+        if any(item.is_direct_wake for item in newer_messages) or len(newer_messages) > grace_messages:
+            logger.info(
+                "[星汐/主动话题] group=%s trigger=%s 生成期间新增 %d 条消息，已让位给当前对话。",
+                state.group_id,
+                trigger,
+                len(newer_messages),
+            )
+            return False
         bubbles = split_chat_bubbles(candidate, chat_max_bubbles)
         if not bubbles:
-            return
+            return False
         sent: list[str] = []
         for index, bubble in enumerate(bubbles):
             success = await self.context.send_message(
@@ -881,9 +1617,19 @@ class ShioPlugin(Star):
             )
             self.runtime.flush()
             logger.info(
-                "[星汐/主动话题] 已在 group=%s 发起轻量话题，工具=none。",
+                "[星汐/主动话题] 已在 group=%s 发起轻量话题，trigger=%s Provider=%s total=%.1fs tools=none。",
                 state.group_id,
+                trigger,
+                provider_used,
+                asyncio.get_running_loop().time() - started_at,
             )
+            return True
+        logger.warning(
+            "[星汐/主动话题] group=%s trigger=%s 平台没有确认任何消息发送成功。",
+            state.group_id,
+            trigger,
+        )
+        return False
 
     @filter.on_astrbot_loaded()
     async def refresh_provider_selectors(self) -> None:
@@ -974,6 +1720,8 @@ class ShioPlugin(Star):
                 verified_values["initiative"] = "ambient_reply"
                 verified_values["tools"] = "disabled"
                 verified_values["external_actions"] = "disabled"
+            elif isinstance(event.get_extra(SHIO_NATURAL_WAKE, None), dict):
+                verified_values["wake_reason"] = "natural_name"
             if allowed_tool_names and not is_owner:
                 verified_values["allowed_tools"] = ",".join(allowed_tool_names)
                 verified_values["external_writes"] = "disabled"
@@ -1023,6 +1771,7 @@ class ShioPlugin(Star):
 
         sender_id, sender_name, ambient_target = self._effective_sender(event)
         is_ambient = ambient_target is not None
+        conversation_mode = "ambient_join" if is_ambient else "direct_reply"
         is_owner = bool(sender_id) and sender_id in self._owner_ids()
         source_system_prompt = str(req.system_prompt or "")
         identity_scope = event.get_extra(SHIO_IDENTITY_SCOPE, None)
@@ -1064,6 +1813,11 @@ class ShioPlugin(Star):
             max_context_chars,
         )
         transcript = contexts_as_transcript(clean_history)
+        replyer_history = isolate_replyer_contexts(
+            clean_history,
+            current_sender_id=sender_id,
+            group_id=str(identity_scope.get("group_id", "")),
+        )
         supporting_material = collect_supporting_material(
             req,
             max(2000, int(self._config("planner_material_chars", 9000))),
@@ -1115,6 +1869,15 @@ class ShioPlugin(Star):
                 group_id=str(identity_scope.get("group_id", "")),
                 identity_key=str(identity_scope.get("identity_key", "")),
                 is_owner=is_owner,
+                conversation_mode=conversation_mode,
+                conversation_mode_rules=(
+                    self._scene_rules(
+                        "ambient_participation_rules",
+                        "ambient_participation_extra_prompt",
+                    )
+                    if is_ambient
+                    else ""
+                ),
                 current_message=current_message,
                 transcript=transcript,
                 supporting_material=supporting_material,
@@ -1216,6 +1979,14 @@ class ShioPlugin(Star):
                 long_form_soft_chars=long_form_soft_chars,
                 chat_max_bubbles=chat_max_bubbles,
                 allowed_tool_names=factual_tool_names if use_allowed_tools else [],
+                conversation_mode_rules=(
+                    self._scene_rules(
+                        "ambient_participation_rules",
+                        "ambient_participation_extra_prompt",
+                    )
+                    if is_ambient
+                    else ""
+                ),
             )
             if presentation_prompt:
                 replyer_system = replyer_system.rstrip() + "\n\n" + presentation_prompt
@@ -1225,7 +1996,7 @@ class ShioPlugin(Star):
 
         # 所有可能失败的准备步骤结束后才原子式改写请求。
         req.system_prompt = replyer_system
-        req.contexts = clean_history
+        req.contexts = replyer_history
         req.prompt = current_message or "请自然回应刚才的图片或消息。"
         req.extra_user_content_parts = []
         final_tool_names = set(presentation_tool_names)
@@ -1262,7 +2033,7 @@ class ShioPlugin(Star):
             SHIO_PAYLOAD,
             {
                 "system_prompt": replyer_system,
-                "contexts": clean_history,
+                "contexts": replyer_history,
                 "prompt": req.prompt,
                 "current_message": current_message,
                 "sender_id": sender_id,
@@ -1274,6 +2045,10 @@ class ShioPlugin(Star):
                 "identity_key": str(identity_scope.get("identity_key", "")),
                 "is_owner": is_owner,
                 "is_ambient": is_ambient,
+                "is_natural_name_wake": isinstance(
+                    event.get_extra(SHIO_NATURAL_WAKE, None), dict
+                ),
+                "conversation_mode": conversation_mode,
                 "scope_key": scope_key,
                 "target_sequence": int((ambient_target or {}).get("sequence", 0) or 0),
                 "history_source": history_source,
@@ -1288,13 +2063,15 @@ class ShioPlugin(Star):
         )
         if bool(self._config("debug_log", False)):
             logger.info(
-                "[星汐] 已接管回复 group=%s sender=%s owner=%s history=%d "
+                "[星汐] 已接管回复 group=%s sender=%s owner=%s planner_history=%d "
+                "replyer_history=%d "
                 "history_source=%s expressions=%d readonly_tools=%s "
                 "presentation_tools=%s plan=%s",
                 str(identity_scope.get("group_id", "")) or "<private>",
                 sender_id,
                 is_owner,
                 len(clean_history),
+                len(replyer_history),
                 history_source,
                 len(expressions),
                 ",".join(factual_tool_names) if use_allowed_tools else "none",
@@ -1312,7 +2089,38 @@ class ShioPlugin(Star):
         if not event.get_extra(SHIO_ACTIVE, False):
             return
         payload = event.get_extra(SHIO_PAYLOAD, None)
-        if not isinstance(payload, dict) or response.role == "err":
+        if not isinstance(payload, dict):
+            return
+        if response.role == "err":
+            acknowledgement = self._enqueue_pending_reply(
+                event,
+                payload,
+                str(response.completion_text or "LLM Provider 请求失败"),
+            )
+            if acknowledgement:
+                response.role = "assistant"
+                response.completion_text = acknowledgement
+                event.set_extra("meme_manager_semantic_selected_ids", [])
+            return
+        self._signal_provider_recovered()
+        if bool(payload.get("is_ambient", False)) and not self.runtime.is_target_relevant(
+            str(payload.get("scope_key", "")),
+            int(payload.get("target_sequence", 0) or 0),
+            max_new_messages=max(
+                0,
+                int(self._config("ambient_generation_grace_messages", 4)),
+            ),
+            max_age_seconds=max(
+                5.0,
+                float(self._config("ambient_generation_max_seconds", 45)),
+            ),
+        ):
+            response.completion_text = ""
+            event.set_extra("meme_manager_semantic_selected_ids", [])
+            logger.info(
+                "[星汐/群聊参与] target_sequence=%s 已超出相关消息或时间窗口，已放弃本次主动回复。",
+                int(payload.get("target_sequence", 0) or 0),
+            )
             return
         plan = event.get_extra(SHIO_PLAN, {})
         tool_request = event.get_extra(SHIO_TOOL_REQUEST, None)
@@ -1342,8 +2150,55 @@ class ShioPlugin(Star):
             )
             return
         original = str(response.completion_text or "")
+        had_visible_tool_artifact = contains_tool_protocol(original)
+        original, leaked_meme_references = (
+            extract_and_clean_internal_meme_references(original)
+        )
+        if had_visible_tool_artifact and not contains_tool_protocol(original):
+            logger.warning(
+                "[星汐/表达守卫] 已从回复正文移除伪造的 search_memes 文本调用。"
+            )
+        if leaked_meme_references:
+            candidate_map = event.get_extra(
+                "meme_manager_semantic_candidates", None
+            )
+            selected_reference = next(
+                (
+                    reference
+                    for reference in leaked_meme_references
+                    if isinstance(candidate_map, dict) and reference in candidate_map
+                ),
+                "",
+            )
+            if selected_reference:
+                event.set_extra(
+                    "meme_manager_semantic_selected_ids", [selected_reference]
+                )
+                logger.info(
+                    "[星汐/表达守卫] 已清理畸形表情引用并恢复模型选图：%s",
+                    selected_reference,
+                )
+            else:
+                logger.warning(
+                    "[星汐/表达守卫] 已清理无法验证的畸形表情引用：%s",
+                    ",".join(leaked_meme_references),
+                )
         reply_shape = str(payload.get("reply_shape", "chat_bubbles"))
         is_owner = bool(payload.get("is_owner", False))
+        conversation_mode = str(
+            payload.get("conversation_mode", "direct_reply") or "direct_reply"
+        )
+        require_emotional_reaction = is_risque_teasing(
+            str(payload.get("current_message", ""))
+        )
+        required_reaction = (
+            str(plan.get("reaction", "") or "")
+            if isinstance(plan, dict) and require_emotional_reaction
+            else ""
+        )
+        grounding_facts = (
+            list(plan.get("facts", []) or []) if isinstance(plan, dict) else []
+        )
         chat_max_bubbles = max(1, int(payload.get("chat_max_bubbles", 3)))
         soft_chars = int(
             payload.get(
@@ -1357,6 +2212,13 @@ class ShioPlugin(Star):
             soft_chars=soft_chars,
             max_bubbles=chat_max_bubbles,
             is_owner=is_owner,
+            conversation_mode=conversation_mode,
+            required_reaction=required_reaction,
+            require_emotional_reaction=require_emotional_reaction,
+            grounding_facts=grounding_facts,
+            enforce_group_participation_guard=bool(
+                self._config("group_participation_guard_enabled", True)
+            ),
         )
         candidate = clean_response(original, reply_shape)
 
@@ -1377,11 +2239,15 @@ class ShioPlugin(Star):
                             original,
                             violations,
                             reply_shape,
+                            conversation_mode=conversation_mode,
                         ),
                         contexts=list(payload.get("contexts", [])),
                         system_prompt=str(payload.get("system_prompt", "")),
-                        image_urls=list(payload.get("image_urls", [])),
-                        audio_urls=list(payload.get("audio_urls", [])),
+                        # 重写只需要当前文本、被拒绝正文和纯文本历史。
+                        # 原请求的多模态附件可能被 AstrBot 自动切到不支持
+                        # image_url/audio_url 的备用 Provider，导致重写直接 400。
+                        image_urls=[],
+                        audio_urls=[],
                         func_tool=None,
                         request_max_retries=1,
                     )
@@ -1396,17 +2262,113 @@ class ShioPlugin(Star):
             soft_chars=soft_chars,
             max_bubbles=chat_max_bubbles,
             is_owner=is_owner,
+            conversation_mode=conversation_mode,
+            required_reaction=required_reaction,
+            require_emotional_reaction=require_emotional_reaction,
+            grounding_facts=grounding_facts,
+            enforce_group_participation_guard=bool(
+                self._config("group_participation_guard_enabled", True)
+            ),
         )
         if TOOL_PROTOCOL_VIOLATION in post_violations:
-            candidate = protocol_safe_fallback()
+            candidate = self._enqueue_pending_reply(
+                event,
+                payload,
+                "模型连续输出内部工具协议",
+                original,
+            ) or protocol_safe_fallback()
+            event.set_extra("meme_manager_semantic_selected_ids", [])
             logger.warning(
                 "[星汐/协议守卫] 模型连续输出内部工具协议，已阻断并使用安全回复。"
+            )
+        elif INTERNAL_REASONING_VIOLATION in post_violations:
+            event.set_extra("meme_manager_semantic_selected_ids", [])
+            if conversation_mode in {"ambient_join", "quiet_topic"}:
+                response.completion_text = ""
+                logger.warning(
+                    "[星汐/规划守卫] 主动发言连续泄露内部规划，已放弃本次发送。"
+                )
+                return
+            candidate = self._enqueue_pending_reply(
+                event,
+                payload,
+                "模型连续泄露内部规划或推理",
+                original,
+            ) or reasoning_safe_fallback()
+            logger.warning(
+                "[星汐/规划守卫] 模型连续泄露内部规划或推理，已阻断并使用安全回复。"
             )
         elif IDENTITY_VIOLATION in post_violations:
             candidate = identity_safe_fallback()
             logger.warning(
                 "[星汐/身份守卫] sender=%s owner=false 的回复连续违反身份边界，已使用安全校准回复。",
                 str(payload.get("sender_id", "")) or "<missing>",
+            )
+        elif RELATIONSHIP_VIOLATION in post_violations:
+            candidate = relationship_safe_fallback()
+            logger.warning(
+                "[星汐/关系守卫] sender=%s owner=false 的回复连续越过主人专属亲密边界，已使用自然边界回复。",
+                str(payload.get("sender_id", "")) or "<missing>",
+            )
+        elif (
+            REALITY_GROUNDING_VIOLATION in post_violations
+            or FACT_GROUNDING_VIOLATION in post_violations
+        ):
+            candidate = strip_unsupported_personal_experiences(
+                candidate,
+                grounding_facts,
+            ) or reality_safe_fallback(conversation_mode)
+            if not candidate:
+                response.completion_text = ""
+                event.set_extra("meme_manager_semantic_selected_ids", [])
+                logger.warning(
+                    "[星汐/事实守卫] 主动发言连续编造无来源线下经历，已放弃本次发送。"
+                )
+                return
+            logger.warning(
+                "[星汐/事实守卫] 回复连续编造无来源线下经历，已移除相关内容。"
+            )
+        elif EMOTIONAL_REACTION_VIOLATION in post_violations:
+            candidate = emotional_reaction_safe_fallback(
+                is_owner,
+                str(payload.get("current_message", "")),
+            )
+            logger.warning(
+                "[星汐/情绪守卫] sender=%s owner=%s 连续把情绪场景答成平静说明，已使用角色化短回复。",
+                str(payload.get("sender_id", "")) or "<missing>",
+                is_owner,
+            )
+        elif GROUP_PARTICIPATION_VIOLATION in post_violations:
+            # 主动发言没有必须回复的用户；连续生成主持/采访腔时宁可安静，
+            # 也不要把生硬兜底发到群里。
+            response.completion_text = ""
+            event.set_extra("meme_manager_semantic_selected_ids", [])
+            logger.warning(
+                "[星汐/群聊语用守卫] mode=%s 连续退化成一对一采访或主持，已放弃本次主动发言。",
+                conversation_mode,
+            )
+            return
+        elif post_violations:
+            # 违规重写失败后不得把异常长回复、后台式说明或其他未分类
+            # 内容继续交给气泡拆分。主动发言宁可不说，直接回复则给出
+            # 一条不可泄漏后台信息的自然兜底。
+            event.set_extra("meme_manager_semantic_selected_ids", [])
+            if conversation_mode in {"ambient_join", "quiet_topic"}:
+                response.completion_text = ""
+                logger.warning(
+                    "[星汐/输出守卫] 主动发言重写后仍不合格，已放弃发送：%s",
+                    "、".join(post_violations),
+                )
+                return
+            candidate = self._enqueue_pending_reply(
+                event,
+                payload,
+                "违规重写后仍不合格：" + "、".join(post_violations),
+                original,
+            ) or reasoning_safe_fallback()
+            logger.warning(
+                "[星汐/输出守卫] 违规重写失败后仍有残留，已闭锁为安全回复：%s",
+                "、".join(post_violations),
             )
 
         if reply_shape == "chat_bubbles":
@@ -1437,6 +2399,10 @@ class ShioPlugin(Star):
                     ),
                 )
                 event.set_extra(SHIO_REPLY_RECORDED, True)
+        elif leaked_meme_references:
+            # Marker-only replies are valid when Meme Manager attaches an image.
+            # Leaving the original text here would expose the machine reference.
+            response.completion_text = ""
         if violations and bool(self._config("debug_log", False)):
             logger.info("[星汐] 输出守卫命中：%s", "、".join(violations))
 
@@ -1454,13 +2420,35 @@ class ShioPlugin(Star):
         except Exception:
             return
 
-        text_components = [
-            comp
-            for comp in result.chain
-            if isinstance(getattr(comp, "text", None), str)
-        ]
+        text_components = self._collect_text_components(result.chain)
         if not text_components:
             return
+        final_meme_references: list[str] = []
+        removed_visible_tool_artifact = False
+        for component in text_components:
+            original_component_text = component.text
+            cleaned_text, references = extract_and_clean_internal_meme_references(
+                original_component_text
+            )
+            component.text = cleaned_text
+            if (
+                cleaned_text != original_component_text.strip()
+                and contains_tool_protocol(original_component_text)
+                and not contains_tool_protocol(cleaned_text)
+            ):
+                removed_visible_tool_artifact = True
+            for reference in references:
+                if reference not in final_meme_references:
+                    final_meme_references.append(reference)
+        if removed_visible_tool_artifact:
+            logger.warning(
+                "[星汐/表达守卫] 发送前已从消息节点移除伪造的 search_memes 文本调用。"
+            )
+        if final_meme_references:
+            logger.warning(
+                "[星汐/表达守卫] 发送前拦截残留表情引用：%s",
+                ",".join(final_meme_references),
+            )
         visible_text = "".join(comp.text for comp in text_components).strip()
         if contains_tool_protocol(visible_text):
             text_components[0].text = protocol_safe_fallback()
@@ -1468,6 +2456,29 @@ class ShioPlugin(Star):
                 comp.text = ""
             logger.warning(
                 "[星汐/协议守卫] 发送前再次发现内部工具协议，已阻断。"
+            )
+            return
+        if contains_internal_reasoning(visible_text):
+            text_components[0].text = reasoning_safe_fallback()
+            for comp in text_components[1:]:
+                comp.text = ""
+            event.set_extra("meme_manager_semantic_selected_ids", [])
+            logger.warning(
+                "[星汐/规划守卫] 发送前再次发现内部规划或推理，已阻断。"
+            )
+            return
+        payload = event.get_extra(SHIO_PAYLOAD, {})
+        if (
+            isinstance(payload, dict)
+            and not bool(payload.get("is_owner", False))
+            and contains_nonowner_identity_confusion(visible_text)
+        ):
+            text_components[0].text = identity_safe_fallback()
+            for comp in text_components[1:]:
+                comp.text = ""
+            event.set_extra("meme_manager_semantic_selected_ids", [])
+            logger.warning(
+                "[星汐/身份守卫] 发送前再次发现普通群友被归因为主人，已阻断。"
             )
             return
 
@@ -1509,11 +2520,12 @@ class ShioPlugin(Star):
     async def terminate(self) -> None:
         self._stopping = True
         unbind_participation_plugin(self)
-        task = self._quiet_topic_task
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._quiet_topic_task, self._recovery_task):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         self.runtime.flush()
+        self.pending_replies.flush()
