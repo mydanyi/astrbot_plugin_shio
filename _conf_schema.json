@@ -5,6 +5,32 @@
     "hint": "控制 Planner、表达检索和角色回复。关闭它不会关闭下方的内置权限守卫；普通群友仍然只能使用明确加入白名单的只读工具。",
     "default": true
   },
+  "natural_name_wake_enabled": {
+    "description": "启用自然称名唤醒",
+    "type": "bool",
+    "hint": "允许角色名字出现在句中或句尾时唤醒。星汐只负责把明确直呼升级为 AstrBot 正常对话，记忆、权限、工具和 Provider 仍走原生链路。",
+    "default": true
+  },
+  "natural_name_wake_aliases": {
+    "description": "角色称呼与别名",
+    "type": "list",
+    "hint": "用于自然称名识别。名字在 URL、代码或明确作品名语境中不会强制唤醒；当前人格名称会自动补入。",
+    "default": ["亚托莉", "ATRI", "アトリ", "萝卜子"]
+  },
+  "natural_name_wake_group_whitelist": {
+    "description": "自然称名唤醒群白名单",
+    "type": "list",
+    "hint": "填写群 ID；留空表示所有群可用。私聊本来就由 AstrBot 自动唤醒，不受这里影响。",
+    "default": []
+  },
+  "natural_name_wake_mode": {
+    "description": "自然称名匹配模式",
+    "type": "string",
+    "options": ["natural", "contains"],
+    "labels": ["自然直呼（推荐）", "名字出现即唤醒"],
+    "hint": "自然直呼会区分叫机器人和谈论角色；名字出现即唤醒更灵敏，但更容易在作品讨论中误触。",
+    "default": "natural"
+  },
   "ambient_participation_enabled": {
     "description": "允许未被点名时自然接话",
     "type": "bool",
@@ -28,6 +54,24 @@
     "type": "float",
     "hint": "越高越安静。疑问、邀请观点、提到角色以及多人活跃话题会加分；短反应、指令、纯链接和明确拒绝参与会减分。推荐先用 4.2。",
     "default": 4.2
+  },
+  "ambient_base_reply_probability": {
+    "description": "达到阈值后的基础接话概率",
+    "type": "float",
+    "hint": "0～1。边缘话题达到阈值后按此概率参与；相关度越高还会继续增加。推荐 0.60～0.75。",
+    "default": 0.65
+  },
+  "ambient_max_reply_probability": {
+    "description": "自然接话最高概率",
+    "type": "float",
+    "hint": "限制随机参与的最高概率；高于下方必回分数时不再抽样。",
+    "default": 0.95
+  },
+  "ambient_always_reply_score": {
+    "description": "自然接话稳定参与分数",
+    "type": "float",
+    "hint": "达到该分数后跳过随机抽样，但仍受冷却、每小时上限和生成相关性检查约束。",
+    "default": 6.2
   },
   "ambient_reply_cooldown_seconds": {
     "description": "自然接话冷却（秒）",
@@ -53,16 +97,34 @@
     "hint": "限制每次门控查看的近期消息数量，避免长群聊拖慢处理。",
     "default": 12
   },
+  "ambient_generation_grace_messages": {
+    "description": "生成期间允许的新消息数",
+    "type": "int",
+    "hint": "不再因为群里多来一条消息就丢弃成品。超过数量、出现新的直接点名或话题明显变化时仍会放弃。推荐 3～5。",
+    "default": 4
+  },
+  "ambient_generation_max_seconds": {
+    "description": "主动接话生成有效期（秒）",
+    "type": "int",
+    "hint": "从目标消息发送起计算；超过该时间的主动接话不再发送，避免过时内容突然出现。",
+    "default": 45
+  },
   "ambient_ignore_prefixes": {
     "description": "自然接话忽略前缀",
     "type": "list",
     "hint": "以这些前缀开头的未点名消息只记录上下文，不主动参与，避免抢其他机器人或群命令。",
     "default": ["/", "!", "！", "."]
   },
+  "ambient_participation_rules": {
+    "description": "自然接话完整规则",
+    "type": "text",
+    "hint": "会同时交给 Planner 和 Replyer，只控制未被点名时怎样参与正在进行的群聊。可直接改写或整体替换；不要在这里写主人身份、用户识别或工具权限，这些安全边界仍由代码锁定。",
+    "default": "像已经在群里的普通成员一样，从当前多人话题中间顺势插一句。\n直接接最想回应的一点，可用接梗、短吐槽、补充、附和或轻微反驳。\n不要打招呼、复述题目、逐条总结或变成客服。\n不要强行追问某个人，不要把多人话题收束成一对一私聊。\n通常说一至两条短消息，让其他群友都能继续接话。"
+  },
   "quiet_topic_enabled": {
-    "description": "长时间安静后主动发起话题",
+    "description": "启用主动发起话题",
     "type": "bool",
-    "hint": "完全静默也可主动说话。此功能会产生额外模型调用，只对下方明确列出的群生效，并且永远不携带工具。默认关闭。",
+    "hint": "在长时间安静或活跃群聊的自然间隙主动开新话头。此功能会产生额外模型调用，只对下方明确列出的群生效，并且永远不携带工具。默认关闭。",
     "default": false
   },
   "quiet_topic_group_whitelist": {
@@ -70,6 +132,24 @@
     "type": "list",
     "hint": "必须填写群 ID；留空时即使上方开关已开启也不会发送，防止误触所有群。",
     "default": []
+  },
+  "active_topic_enabled": {
+    "description": "活跃群聊间隙也可开新话题",
+    "type": "bool",
+    "hint": "推荐开启。不再必须等群里安静 90 分钟；观察群聊一段时间后，遇到自然停顿即可按每日上限主动开启新话头。这条路径不使用自然接话概率。",
+    "default": true
+  },
+  "active_topic_lull_minutes": {
+    "description": "活跃群聊自然间隙（分钟）",
+    "type": "float",
+    "hint": "群聊暂时停顿多久后可考虑主动开新话头。推荐 2～5 分钟；仍受普通回复避让、主动话题冷却和每日上限约束。",
+    "default": 3
+  },
+  "active_topic_observation_minutes": {
+    "description": "启动后观察群聊时长（分钟）",
+    "type": "int",
+    "hint": "插件启动或首次看见该群后，至少先观察这么久再主动开话题，避免刚重启就突然发言。",
+    "default": 30
   },
   "quiet_topic_idle_minutes": {
     "description": "群聊安静多久后可开话题（分钟）",
@@ -82,6 +162,18 @@
     "type": "int",
     "hint": "机器人任意回复后至少等待这么久再主动开新话题，推荐不低于 180 分钟。",
     "default": 240
+  },
+  "quiet_topic_after_bot_reply_minutes": {
+    "description": "普通回复后避让时间（分钟）",
+    "type": "float",
+    "hint": "机器人被点名正常回答后，只短暂避让这么久；不会再错误套用上方完整主动话题冷却。推荐 5～15 分钟。",
+    "default": 10
+  },
+  "quiet_topic_failure_backoff_minutes": {
+    "description": "主动话题失败退避（分钟）",
+    "type": "int",
+    "hint": "模型或平台失败后只短暂退避；完整主动话题冷却只在消息真正发送成功后开始。",
+    "default": 10
   },
   "quiet_topic_max_per_day": {
     "description": "每群每日主动话题上限",
@@ -112,6 +204,115 @@
     "type": "int",
     "hint": "只从内存中的该群近期消息寻找自然话题线索；不会调用搜索或其他工具。",
     "default": 10
+  },
+  "quiet_topic_fallback_provider_id": {
+    "description": "主动话题备用聊天模型",
+    "type": "string",
+    "hint": "首选模型超时、报错或输出不合格时自动接管。留空时仍会依次尝试 Planner 备用模型、Planner 模型和当前会话模型。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "quiet_topic_provider_timeout_seconds": {
+    "description": "主动话题单模型超时（秒）",
+    "type": "float",
+    "hint": "每个候选 Provider 的实际等待上限，超时后立即换下一个，不让一次请求卡死整轮调度。推荐 25～45 秒。",
+    "default": 35
+  },
+  "quiet_topic_generation_grace_messages": {
+    "description": "主动话题生成期间允许的新消息数",
+    "type": "int",
+    "hint": "生成期间群聊恢复后，少量消息仍可自然插入；超过此数量或出现新的直接点名时自动让位，避免突兀打断。",
+    "default": 3
+  },
+  "quiet_topic_rules": {
+    "description": "主动话题完整规则",
+    "type": "text",
+    "hint": "控制群聊安静后怎样面向全群开话头，可直接改写或整体替换。不会开放工具，也不能改变主人身份、群 ID、用户隔离或权限规则。",
+    "default": "面向整个群自然开一个轻话头，不主持、不采访、不用客服式暖场。\n优先延续近期公共话题；没有合适线索时，说短感想、联想、吐槽或轻量分享。\n不要求问句；确实自然时最多带一个容易接的问题。\n不要用“大家好”“有人吗”“你们怎么看”“今天过得怎么样”“有什么想聊的吗”。\n不要解释为什么突然说话、群安静多久或后台机制。\n通常说一至两条短消息。"
+  },
+  "recovery_queue_enabled": {
+    "description": "启用故障恢复补答",
+    "type": "bool",
+    "hint": "直接提问在最终 Provider 失败或输出守卫无法修复时，会持久化到待补答队列；恢复后引用原消息补答。主动接话和主动话题不会延迟诈尸。",
+    "default": true
+  },
+  "recovery_require_question": {
+    "description": "只记住明确问题",
+    "type": "bool",
+    "hint": "推荐开启。普通招呼、随口表情和无明确问题的闲聊失败后不会在很久以后突然补发。",
+    "default": true
+  },
+  "recovery_initial_delay_seconds": {
+    "description": "首次补答等待（秒）",
+    "type": "int",
+    "hint": "写入队列后首次尝试恢复的等待时间；正常对话一旦成功也会提前唤醒队列。",
+    "default": 30
+  },
+  "recovery_backoff_seconds": {
+    "description": "后续补答退避序列（秒）",
+    "type": "list",
+    "hint": "每次恢复仍失败时依次使用；最后一个间隔会重复使用，直到达到尝试次数或过期。",
+    "default": [120, 300, 900, 1800]
+  },
+  "recovery_check_seconds": {
+    "description": "补答队列检查间隔（秒）",
+    "type": "int",
+    "hint": "后台轻量检查间隔。正常 Provider 请求成功时会立即额外唤醒，不必等待完整间隔。",
+    "default": 30
+  },
+  "recovery_request_timeout_seconds": {
+    "description": "单次补答请求超时（秒）",
+    "type": "int",
+    "hint": "仅限制后台恢复请求；不会修改普通主对话的 Provider 超时。",
+    "default": 60
+  },
+  "recovery_max_attempts": {
+    "description": "每条问题最大补答次数",
+    "type": "int",
+    "hint": "超过后静默移出队列，避免长期消耗 API。",
+    "default": 4
+  },
+  "recovery_max_per_cycle": {
+    "description": "每轮最多恢复条数",
+    "type": "int",
+    "hint": "限制服务恢复后的群消息洪峰，推荐 1。",
+    "default": 1
+  },
+  "recovery_max_pending": {
+    "description": "待补答队列容量",
+    "type": "int",
+    "hint": "超过容量时移除最旧记录，防止故障期间无限增长。",
+    "default": 100
+  },
+  "recovery_chat_ttl_minutes": {
+    "description": "普通问题补答有效期（分钟）",
+    "type": "int",
+    "hint": "超过后不再补发，避免日常聊天过时回复。",
+    "default": 60
+  },
+  "recovery_long_form_ttl_minutes": {
+    "description": "内容型问题补答有效期（分钟）",
+    "type": "int",
+    "hint": "教程、排错和详细解释等内容型问题可以保留更久。",
+    "default": 360
+  },
+  "recovery_context_messages": {
+    "description": "补答保存的上下文条数",
+    "type": "int",
+    "hint": "只保存经过用户和群隔离后的少量纯文本上下文，不保存工具、密钥、图片或音频。",
+    "default": 6
+  },
+  "recovery_context_chars": {
+    "description": "补答上下文字符上限",
+    "type": "int",
+    "hint": "控制 pending_replies.json 的体积和恢复请求 Token。",
+    "default": 4000
+  },
+  "group_participation_guard_enabled": {
+    "description": "启用主动群聊语用守卫",
+    "type": "bool",
+    "hint": "默认开启，用于拦截“大家好、有人吗、你们怎么看、那你呢”等常见主持／采访腔。若你的完整场景规则有意允许这些说法，可以关闭；身份、关系和工具安全守卫不会随之关闭。",
+    "default": true
   },
   "social_profile_enabled": {
     "description": "使用轻量互动画像",
