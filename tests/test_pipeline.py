@@ -1288,6 +1288,26 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(provider.calls[-1]["func_tool"])
         self.assertNotIn("search_memes", response.completion_text)
 
+    async def test_orphaned_query_arguments_only_reply_is_rewritten_without_tools(self):
+        planner_json = json.dumps({"mode": "chat"}, ensure_ascii=False)
+        provider = FakeProvider([planner_json, "才不是没用！我会重新校准好的。"])
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("guest", "你还会失误")
+        request = FakeRequest(event.message)
+        await plugin.build_persona_reply(event, request)
+
+        response = FakeResponse(
+            '{，"query": "气鼓鼓地反驳对方，羞恼又傲娇，高性能机器人不服气"\n}'
+        )
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(
+            response.completion_text.replace("\n", ""),
+            "才不是没用！我会重新校准好的。",
+        )
+        self.assertIsNone(provider.calls[-1]["func_tool"])
+        self.assertNotIn("query", response.completion_text)
+
     async def test_xml_meme_call_is_removed_without_rewriting_valid_answer(self):
         planner_json = json.dumps({"mode": "chat"}, ensure_ascii=False)
         provider = FakeProvider([planner_json])
@@ -2152,6 +2172,41 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("search_memes", visible)
         self.assertNotIn('"}', visible)
         self.assertTrue(visible.strip())
+
+    async def test_dispatch_blocks_split_orphaned_query_arguments_after_image(self):
+        plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {})
+        event = FakeEvent("guest", "测试")
+        event.set_extra(main.SHIO_ACTIVE, True)
+        event.set_extra(main.SHIO_PLAN, {"reply_shape": "chat_bubbles"})
+        event.set_extra(
+            main.SHIO_PAYLOAD,
+            {"tool_names": ["search_memes"], "is_owner": False},
+        )
+        reply = types.SimpleNamespace(
+            text="刚才那是意外啦！真的只是暂时的校准失误而已！\n下次一定可以的。"
+        )
+        image = types.SimpleNamespace(url="meme.gif")
+        arguments = types.SimpleNamespace(
+            text='{，"query": "气鼓鼓地反驳对方，羞恼又傲娇，\n'
+        )
+        closer = types.SimpleNamespace(text='高性能机器人不服气想要证明自己"\n}')
+
+        class Result:
+            def __init__(self):
+                self.chain = [reply, image, arguments, closer]
+
+            def is_llm_result(self):
+                return True
+
+        event._result = Result()
+        await plugin.dispatch_chat_bubbles(event)
+
+        visible = "".join(event.sent) + reply.text + arguments.text + closer.text
+        self.assertIn("暂时的校准失误", visible)
+        self.assertNotIn("query", visible)
+        self.assertNotIn("高性能机器人不服气想要证明自己", visible)
+        self.assertNotIn("}", visible)
+        self.assertIs(event._result.chain[1], image)
 
     async def test_dispatch_blocks_dynamic_factual_tool_call(self):
         plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {})

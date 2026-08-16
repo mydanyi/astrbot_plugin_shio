@@ -285,6 +285,29 @@ _TOOL_CALL_SUFFIX_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# llama.cpp/Gemma 偶尔会先完成真实的 ``search_memes`` 调用，随后又把仅含
+# ``query`` 的 arguments 对象作为普通文本节点返回。此时工具名已经丢失，
+# 甚至会出现 ``{，"query": ...}`` 这种畸形开头；按工具名扫描无法命中。
+# 这里只识别独占一段的单参数对象，避免误伤正文中内联讲解的 JSON 示例。
+_ORPHANED_QUERY_ARGUMENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?ms)^[ \t]*\{[ \t]*[,，]?[ \t]*"
+        r"(?:\"query\"|'query'|query)[ \t]*[:：][ \t]*"
+        r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+        r"\s*[,，]?\s*\}[ \t]*[。.]?[ \t]*$"
+    ),
+    # 有些 Provider 还会把开头的 ``{`` 吃掉，只留下带引号的 key 和结尾。
+    re.compile(
+        r"(?ms)^[ \t]*[,，]?[ \t]*(?:\"query\"|'query')"
+        r"[ \t]*[:：][ \t]*"
+        r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+        r"\s*[,，]?\s*\}[ \t]*[。.]?[ \t]*$"
+    ),
+)
+_ORPHANED_PROTOCOL_CLOSER_PATTERN = re.compile(
+    r"^\s*[\"']?\}\s*[。.]?\s*$"
+)
+
 
 def _normalized_tool_names(tool_names: Iterable[str] | None = None) -> tuple[str, ...]:
     names = {"search_memes"}
@@ -362,6 +385,44 @@ def _strip_structured_tool_calls(
     return value, removed
 
 
+def _meme_argument_guard_enabled(tool_names: Iterable[str] | None) -> bool:
+    if tool_names is None:
+        # Context history cleanup does not carry the original request's tool set.
+        return True
+    return any(
+        str(name or "").strip().lower() == "search_memes"
+        for name in tool_names
+    )
+
+
+def _strip_orphaned_tool_argument_fragments(
+    text: str,
+    tool_names: Iterable[str] | None = None,
+) -> tuple[str, bool]:
+    """Remove name-less tool arguments and delimiter-only tail nodes."""
+    value = str(text or "")
+    if not _meme_argument_guard_enabled(tool_names):
+        return value, False
+    removed = False
+    for pattern in _ORPHANED_QUERY_ARGUMENT_PATTERNS:
+        value, count = pattern.subn("", value)
+        removed = bool(count) or removed
+
+    # A removed arguments block may be followed by another delimiter-only text
+    # component. Also fail closed when the entire outgoing value is just that
+    # orphaned closer, which is what AstrBot logged immediately before sending.
+    if removed:
+        value, count = re.subn(
+            r"(?m)^[ \t]*[\"']?\}[ \t]*[。.]?[ \t]*$",
+            "",
+            value,
+        )
+        removed = bool(count) or removed
+    if _ORPHANED_PROTOCOL_CLOSER_PATTERN.fullmatch(value):
+        return "", True
+    return value, removed
+
+
 def contains_tool_protocol(
     text: str,
     tool_names: Iterable[str] | None = None,
@@ -373,7 +434,14 @@ def contains_tool_protocol(
         for pattern in TOOL_PROTOCOL_PATTERNS
     ):
         return True
-    return _structured_tool_call_start_pattern(tool_names).search(value) is not None
+    if _structured_tool_call_start_pattern(tool_names).search(value) is not None:
+        return True
+    if _meme_argument_guard_enabled(tool_names):
+        if any(pattern.search(value) for pattern in _ORPHANED_QUERY_ARGUMENT_PATTERNS):
+            return True
+        if _ORPHANED_PROTOCOL_CLOSER_PATTERN.fullmatch(value) is not None:
+            return True
+    return False
 
 
 def contains_internal_reasoning(text: str) -> bool:
@@ -478,6 +546,7 @@ def extract_and_clean_internal_meme_references(
     value = INTERNAL_MEME_XML_CALL_PATTERN.sub("", value)
     value = INTERNAL_MEME_CALL_PATTERN.sub("", value)
     value, _ = _strip_structured_tool_calls(value, tool_names)
+    value, _ = _strip_orphaned_tool_argument_fragments(value, tool_names)
     value = re.sub(r"(?m)^[ \t]*&{1,2}[ \t]*$", "", value)
     value = re.sub(r"[ \t]+\n", "\n", value)
     value = re.sub(r"\n[ \t]+", "\n", value)

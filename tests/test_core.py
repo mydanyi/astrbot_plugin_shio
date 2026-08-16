@@ -224,6 +224,33 @@ class CoreTests(unittest.TestCase):
         normal = "这个接口内部可能调用 anysearch_search，但正文不展示参数。"
         self.assertFalse(contains_tool_protocol(normal, {"anysearch_search"}))
 
+    def test_detects_and_cleans_orphaned_query_argument_fragments(self):
+        variants = (
+            '{，"query": "气鼓鼓地反驳对方，羞恼又傲娇"\n}',
+            '{"query": "高性能机器人不服气想要证明自己"}',
+            '"query": "委屈又嘴硬"\n}',
+            '}',
+            '"}',
+        )
+        for leaked in variants:
+            with self.subTest(leaked=leaked):
+                self.assertTrue(contains_tool_protocol(leaked, {"search_memes"}))
+                cleaned, references = extract_and_clean_internal_meme_references(
+                    leaked,
+                    {"search_memes"},
+                )
+                self.assertEqual(cleaned, "")
+                self.assertEqual(references, [])
+
+        normal = '查询参数示例是 {"query":"关键词"}，这里只是在解释接口。'
+        self.assertFalse(contains_tool_protocol(normal, {"search_memes"}))
+        cleaned, _ = extract_and_clean_internal_meme_references(
+            normal,
+            {"search_memes"},
+        )
+        self.assertEqual(cleaned, normal)
+        self.assertFalse(contains_tool_protocol("}", {"anysearch_search"}))
+
     def test_detects_and_cleans_xml_style_meme_tool_call_leak(self):
         variants = (
             '才不是呢！\n<search_memes query="委屈，生气，傲娇，鼓起脸，瞪眼" />',
@@ -328,7 +355,11 @@ class CoreTests(unittest.TestCase):
             {
                 "role": "assistant",
                 "content": 'search_memes{"query":"我才不屑于跟你玩这种游戏呢！\n"}',
-            }
+            },
+            {
+                "role": "assistant",
+                "content": '{，"query": "气鼓鼓地反驳对方，羞恼又傲娇"\n}',
+            },
         ]
         result = clean_contexts(Event(), contexts, "当前问题", 10, 2000)
         self.assertEqual(result, [])
