@@ -23,6 +23,13 @@ from .core.context_builder import (
     isolate_replyer_contexts,
 )
 from .core.conversation_runtime import ConversationRuntime, GroupState
+from .core.dialogue_quality import (
+    CATCHPHRASE_REPETITION_VIOLATION,
+    REPETITION_VIOLATION,
+    recent_assistant_replies,
+    repetition_safe_fallback,
+    sanitize_plan_requirements,
+)
 from .core.models import SpeechPlan
 from .core.participation_filter import (
     AmbientParticipationFilter,
@@ -1818,6 +1825,7 @@ class ShioPlugin(Star):
             current_sender_id=sender_id,
             group_id=str(identity_scope.get("group_id", "")),
         )
+        recent_replies = recent_assistant_replies(replyer_history)
         supporting_material = collect_supporting_material(
             req,
             max(2000, int(self._config("planner_material_chars", 9000))),
@@ -1883,6 +1891,16 @@ class ShioPlugin(Star):
                 supporting_material=supporting_material,
                 enabled=bool(self._config("planner_enabled", True)),
             )
+            removed_plan_lines = sanitize_plan_requirements(
+                plan,
+                recent_replies,
+                current_message=current_message,
+            )
+            if removed_plan_lines and bool(self._config("debug_log", False)):
+                logger.info(
+                    "[星汐/表达质量] 已从 Planner must_include 移除 %d 条近期台词或完整台词模板。",
+                    len(removed_plan_lines),
+                )
 
             presentation_tools, presentation_prompt = self._meme_presentation_tools(
                 event,
@@ -2034,6 +2052,7 @@ class ShioPlugin(Star):
             {
                 "system_prompt": replyer_system,
                 "contexts": replyer_history,
+                "recent_assistant_replies": recent_replies,
                 "prompt": req.prompt,
                 "current_message": current_message,
                 "sender_id": sender_id,
@@ -2216,6 +2235,11 @@ class ShioPlugin(Star):
         grounding_facts = (
             list(plan.get("facts", []) or []) if isinstance(plan, dict) else []
         )
+        recent_replies = [
+            str(value or "")
+            for value in list(payload.get("recent_assistant_replies", []) or [])[-6:]
+            if str(value or "").strip()
+        ]
         chat_max_bubbles = max(1, int(payload.get("chat_max_bubbles", 3)))
         soft_chars = int(
             payload.get(
@@ -2236,6 +2260,8 @@ class ShioPlugin(Star):
             enforce_group_participation_guard=bool(
                 self._config("group_participation_guard_enabled", True)
             ),
+            recent_assistant_replies=recent_replies,
+            current_message=str(payload.get("current_message", "")),
         )
         candidate = clean_response(original, reply_shape)
 
@@ -2257,6 +2283,7 @@ class ShioPlugin(Star):
                             violations,
                             reply_shape,
                             conversation_mode=conversation_mode,
+                            recent_assistant_replies=recent_replies,
                         ),
                         contexts=list(payload.get("contexts", [])),
                         system_prompt=str(payload.get("system_prompt", "")),
@@ -2290,6 +2317,8 @@ class ShioPlugin(Star):
             enforce_group_participation_guard=bool(
                 self._config("group_participation_guard_enabled", True)
             ),
+            recent_assistant_replies=recent_replies,
+            current_message=str(payload.get("current_message", "")),
         )
         if TOOL_PROTOCOL_VIOLATION in post_violations:
             candidate = self._enqueue_pending_reply(
@@ -2369,6 +2398,24 @@ class ShioPlugin(Star):
                 conversation_mode,
             )
             return
+        elif (
+            REPETITION_VIOLATION in post_violations
+            or CATCHPHRASE_REPETITION_VIOLATION in post_violations
+        ):
+            if conversation_mode in {"ambient_join", "quiet_topic"}:
+                response.completion_text = ""
+                event.set_extra("meme_manager_semantic_selected_ids", [])
+                logger.warning(
+                    "[星汐/表达质量] 主动发言连续复用近期台词，已放弃本次发送。"
+                )
+                return
+            candidate = repetition_safe_fallback(
+                str(payload.get("current_message", "")),
+                recent_replies,
+            )
+            logger.warning(
+                "[星汐/表达质量] 回复重写后仍与近期台词重复，已使用非模板化角色回复。"
+            )
         elif post_violations:
             # 违规重写失败后不得把异常长回复、后台式说明或其他未分类
             # 内容继续交给气泡拆分。主动发言宁可不说，直接回复则给出

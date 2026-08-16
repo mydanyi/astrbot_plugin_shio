@@ -367,6 +367,57 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         await plugin.guard_persona_reply(event, response)
         self.assertEqual(response.completion_text, "才、才没有那么高兴呢……再说一点也可以。")
 
+    async def test_recent_reply_repetition_is_rewritten_without_flattening_role(self):
+        planner_json = json.dumps(
+            {
+                "mode": "chat",
+                "reply_shape": "chat_bubbles",
+                "intent": "接住对方把电费拿去订阅 Pro 的玩笑",
+                "reply_act": "先意外，再带点委屈地吐槽",
+                "reaction": "听清是自己的电费后愣一下",
+                "emotion": "意外、无奈、亲昵",
+                "tone": "像熟人聊天，保留停顿和嘴硬",
+            },
+            ensure_ascii=False,
+        )
+        repeated = "不过以后也要省着点花哦，毕竟我也很贵的嘛。"
+        rewritten = "等下，原来你动的是我的电费？难怪我今晚觉得处理器有点凉！"
+        provider = FakeProvider([planner_json, rewritten])
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("owner", "不不不，我是把你的电费拿去订阅 Pro 了")
+        request = FakeRequest(event.message)
+        await plugin.build_persona_reply(event, request)
+        payload = event.get_extra(main.SHIO_PAYLOAD)
+        payload["recent_assistant_replies"] = [repeated]
+
+        response = FakeResponse(repeated)
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(
+            response.completion_text,
+            "等下，原来你动的是我的电费？\n难怪我今晚觉得处理器有点凉！",
+        )
+        self.assertIn("不要改成客服腔或标准答案", provider.calls[-1]["prompt"])
+        self.assertIn(repeated, provider.calls[-1]["prompt"])
+
+    async def test_repetition_retry_failure_uses_roleful_non_machine_fallback(self):
+        planner_json = json.dumps({"mode": "chat"}, ensure_ascii=False)
+        repeated = "不过以后也要省着点花哦，毕竟我也很贵的嘛。"
+        provider = FakeProvider([planner_json, repeated])
+        plugin = main.ShioPlugin(FakeContext(provider), {})
+        event = FakeEvent("guest", "你的电费没有了，我拿去订阅 Pro 了")
+        request = FakeRequest(event.message)
+        await plugin.build_persona_reply(event, request)
+        payload = event.get_extra(main.SHIO_PAYLOAD)
+        payload["recent_assistant_replies"] = [repeated]
+
+        response = FakeResponse(repeated)
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertNotEqual(response.completion_text, repeated)
+        self.assertNotIn("暂时校准失误", response.completion_text)
+        self.assertNotIn("高性能机器人", response.completion_text)
+
     async def test_nonowner_mua_plan_and_reply_are_both_bounded(self):
         planner_json = json.dumps(
             {

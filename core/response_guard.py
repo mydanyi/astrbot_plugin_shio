@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
+from .dialogue_quality import find_dialogue_repetition
+
 
 META_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"作为(?:一个|一名)?(?:AI|人工智能|语言模型|聊天机器人)", "出现后台式自我说明"),
@@ -595,6 +597,8 @@ def find_violations(
     require_emotional_reaction: bool = False,
     grounding_facts: list[str] | tuple[str, ...] | None = None,
     enforce_group_participation_guard: bool = True,
+    recent_assistant_replies: list[str] | tuple[str, ...] | None = None,
+    current_message: str = "",
 ) -> list[str]:
     """寻找需要重写的输出问题；软篇幅本身不会触发截断。"""
     value = str(text or "").strip()
@@ -606,6 +610,17 @@ def find_violations(
         violations.append(TOOL_PROTOCOL_VIOLATION)
     if contains_internal_reasoning(value):
         violations.append(INTERNAL_REASONING_VIOLATION)
+    repetition_violation = (
+        find_dialogue_repetition(
+            value,
+            recent_assistant_replies,
+            current_message=current_message,
+        )
+        if reply_shape != "long_form"
+        else ""
+    )
+    if repetition_violation:
+        violations.append(repetition_violation)
 
     if reply_shape == "long_form":
         runaway_limit = max(3600, soft_chars * 3)

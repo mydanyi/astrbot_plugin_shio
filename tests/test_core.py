@@ -13,6 +13,12 @@ from astrbot_plugin_shio.core.context_builder import (
     get_current_message,
     isolate_replyer_contexts,
 )
+from astrbot_plugin_shio.core.dialogue_quality import (
+    CATCHPHRASE_REPETITION_VIOLATION,
+    REPETITION_VIOLATION,
+    find_dialogue_repetition,
+    sanitize_plan_requirements,
+)
 from astrbot_plugin_shio.core.planner import (
     SpeechPlanner,
     enforce_conversation_mode,
@@ -1025,6 +1031,95 @@ class CoreTests(unittest.TestCase):
                 True,
                 "你是不是没分清我和刚刚那个人是两个不同的人？",
             ).use_allowed_tools
+        )
+
+    def test_dialogue_quality_blocks_exact_recent_reply(self):
+        recent = ["不过以后也要省着点花哦，毕竟我也很贵的嘛。"]
+
+        self.assertEqual(
+            find_dialogue_repetition(
+                "不过以后也要省着点花哦，毕竟我也很贵的嘛。",
+                recent,
+                current_message="你的电费被我拿去订阅 Pro 了",
+            ),
+            REPETITION_VIOLATION,
+        )
+
+    def test_dialogue_quality_keeps_roleful_new_reaction(self):
+        recent = ["不过以后也要省着点花哦，毕竟我也很贵的嘛。"]
+
+        self.assertEqual(
+            find_dialogue_repetition(
+                "等下，原来你动的是我的电费？难怪我今晚觉得处理器有点凉！",
+                recent,
+                current_message="不不不，我是把你的电费拿去订阅 Pro 了",
+            ),
+            "",
+        )
+
+    def test_dialogue_quality_allows_explicit_repeat_request(self):
+        recent = ["我可是高性能机器人！"]
+
+        self.assertEqual(
+            find_dialogue_repetition(
+                "我可是高性能机器人！",
+                recent,
+                current_message="把刚才那句原样再说一遍",
+            ),
+            "",
+        )
+
+    def test_dialogue_quality_cools_down_role_catchphrase(self):
+        self.assertEqual(
+            find_dialogue_repetition(
+                "这次当然也难不倒高性能机器人啦。",
+                ["哼哼，我可是高性能机器人！"],
+                current_message="再来一次",
+            ),
+            CATCHPHRASE_REPETITION_VIOLATION,
+        )
+
+    def test_plan_requirements_drop_recent_lines_but_keep_semantic_beats(self):
+        plan = SpeechPlan(
+            must_include=[
+                "不过以后也要省着点花哦",
+                "毕竟我也很贵的嘛",
+                "回应对方拿电费开玩笑",
+            ]
+        )
+
+        removed = sanitize_plan_requirements(
+            plan,
+            ["不过以后也要省着点花哦，毕竟我也很贵的嘛。"],
+        )
+
+        self.assertEqual(plan.must_include, ["回应对方拿电费开玩笑"])
+        self.assertEqual(len(removed), 2)
+
+    def test_explicit_repeat_request_keeps_requested_plan_line(self):
+        plan = SpeechPlan(must_include=["我可是高性能机器人！"])
+
+        removed = sanitize_plan_requirements(
+            plan,
+            ["我可是高性能机器人！"],
+            current_message="把刚才那句原样再说一遍",
+        )
+
+        self.assertEqual(removed, [])
+        self.assertEqual(plan.must_include, ["我可是高性能机器人！"])
+
+    def test_long_form_does_not_apply_chat_repetition_guard(self):
+        answer = "同一个配置键仍然需要保留，因为这是排错结论。"
+
+        self.assertNotIn(
+            REPETITION_VIOLATION,
+            find_violations(
+                answer,
+                reply_shape="long_form",
+                soft_chars=1200,
+                recent_assistant_replies=[answer],
+                current_message="继续详细解释这个配置键",
+            ),
         )
 
 
