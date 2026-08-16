@@ -3,7 +3,7 @@ display_name: 星汐
 desc: 为 AstrBot 构筑数字仿生人格的群聊心智回路：主动参与、身份与群聊理解、说话规划、表达检索、多用户隔离及分级 Agent 权限。
 short_desc: 让数字仿生人格从群聊的星潮中醒来。
 help: 首次使用必须填写主人 ID；普通用户仅保留精确白名单中的只读资料工具。请勿同时启用独立的 astrbot_plugin_agent_guard。
-version: 0.4.3
+version: 0.4.6
 author: "Danyi"
 repo: "https://github.com/mydanyi/astrbot_plugin_shio"
 astrbot_version: ">=4.26.7,<5"

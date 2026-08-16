@@ -23,6 +23,13 @@ from .core.context_builder import (
     isolate_replyer_contexts,
 )
 from .core.conversation_runtime import ConversationRuntime, GroupState
+from .core.dialogue_quality import (
+    CATCHPHRASE_REPETITION_VIOLATION,
+    REPETITION_VIOLATION,
+    recent_assistant_replies,
+    repetition_safe_fallback,
+    sanitize_plan_requirements,
+)
 from .core.models import SpeechPlan
 from .core.participation_filter import (
     AmbientParticipationFilter,
@@ -1818,6 +1825,7 @@ class ShioPlugin(Star):
             current_sender_id=sender_id,
             group_id=str(identity_scope.get("group_id", "")),
         )
+        recent_replies = recent_assistant_replies(replyer_history)
         supporting_material = collect_supporting_material(
             req,
             max(2000, int(self._config("planner_material_chars", 9000))),
@@ -1883,6 +1891,16 @@ class ShioPlugin(Star):
                 supporting_material=supporting_material,
                 enabled=bool(self._config("planner_enabled", True)),
             )
+            removed_plan_lines = sanitize_plan_requirements(
+                plan,
+                recent_replies,
+                current_message=current_message,
+            )
+            if removed_plan_lines and bool(self._config("debug_log", False)):
+                logger.info(
+                    "[星汐/表达质量] 已从 Planner must_include 移除 %d 条近期台词或完整台词模板。",
+                    len(removed_plan_lines),
+                )
 
             presentation_tools, presentation_prompt = self._meme_presentation_tools(
                 event,
@@ -2034,6 +2052,7 @@ class ShioPlugin(Star):
             {
                 "system_prompt": replyer_system,
                 "contexts": replyer_history,
+                "recent_assistant_replies": recent_replies,
                 "prompt": req.prompt,
                 "current_message": current_message,
                 "sender_id": sender_id,
@@ -2055,6 +2074,7 @@ class ShioPlugin(Star):
                 "expression_ids": [item.id for item in expressions],
                 "image_urls": list(req.image_urls or []),
                 "audio_urls": list(req.audio_urls or []),
+                "tool_names": sorted(final_tool_names),
                 "reply_shape": plan.reply_shape,
                 "chat_soft_chars": chat_soft_chars,
                 "long_form_soft_chars": long_form_soft_chars,
@@ -2134,6 +2154,13 @@ class ShioPlugin(Star):
             if tool_request is not None
             else None
         )
+        active_tool_names = {
+            str(name)
+            for name in list(payload.get("tool_names", []) or [])
+            if str(name)
+        }
+        active_tool_names.update(called_tool_names)
+        active_tool_names.update(required_fact_tools)
         if (
             isinstance(plan, dict)
             and bool(plan.get("use_allowed_tools", False))
@@ -2150,13 +2177,22 @@ class ShioPlugin(Star):
             )
             return
         original = str(response.completion_text or "")
-        had_visible_tool_artifact = contains_tool_protocol(original)
-        original, leaked_meme_references = (
-            extract_and_clean_internal_meme_references(original)
+        had_visible_tool_artifact = contains_tool_protocol(
+            original,
+            active_tool_names,
         )
-        if had_visible_tool_artifact and not contains_tool_protocol(original):
+        original, leaked_meme_references = (
+            extract_and_clean_internal_meme_references(
+                original,
+                active_tool_names,
+            )
+        )
+        if had_visible_tool_artifact and not contains_tool_protocol(
+            original,
+            active_tool_names,
+        ):
             logger.warning(
-                "[星汐/表达守卫] 已从回复正文移除伪造的 search_memes 文本调用。"
+                "[星汐/表达守卫] 已从回复正文移除伪造的工具文本调用。"
             )
         if leaked_meme_references:
             candidate_map = event.get_extra(
@@ -2199,6 +2235,11 @@ class ShioPlugin(Star):
         grounding_facts = (
             list(plan.get("facts", []) or []) if isinstance(plan, dict) else []
         )
+        recent_replies = [
+            str(value or "")
+            for value in list(payload.get("recent_assistant_replies", []) or [])[-6:]
+            if str(value or "").strip()
+        ]
         chat_max_bubbles = max(1, int(payload.get("chat_max_bubbles", 3)))
         soft_chars = int(
             payload.get(
@@ -2219,6 +2260,8 @@ class ShioPlugin(Star):
             enforce_group_participation_guard=bool(
                 self._config("group_participation_guard_enabled", True)
             ),
+            recent_assistant_replies=recent_replies,
+            current_message=str(payload.get("current_message", "")),
         )
         candidate = clean_response(original, reply_shape)
 
@@ -2240,6 +2283,7 @@ class ShioPlugin(Star):
                             violations,
                             reply_shape,
                             conversation_mode=conversation_mode,
+                            recent_assistant_replies=recent_replies,
                         ),
                         contexts=list(payload.get("contexts", [])),
                         system_prompt=str(payload.get("system_prompt", "")),
@@ -2252,7 +2296,11 @@ class ShioPlugin(Star):
                         request_max_retries=1,
                     )
                     if str(retry.completion_text or "").strip():
-                        candidate = clean_response(retry.completion_text, reply_shape)
+                        retry_text, _ = extract_and_clean_internal_meme_references(
+                            retry.completion_text,
+                            active_tool_names,
+                        )
+                        candidate = clean_response(retry_text, reply_shape)
             except Exception as exc:
                 logger.warning("[星汐] 违规回复重写失败，使用本地清理结果：%s", exc)
 
@@ -2269,6 +2317,8 @@ class ShioPlugin(Star):
             enforce_group_participation_guard=bool(
                 self._config("group_participation_guard_enabled", True)
             ),
+            recent_assistant_replies=recent_replies,
+            current_message=str(payload.get("current_message", "")),
         )
         if TOOL_PROTOCOL_VIOLATION in post_violations:
             candidate = self._enqueue_pending_reply(
@@ -2348,6 +2398,24 @@ class ShioPlugin(Star):
                 conversation_mode,
             )
             return
+        elif (
+            REPETITION_VIOLATION in post_violations
+            or CATCHPHRASE_REPETITION_VIOLATION in post_violations
+        ):
+            if conversation_mode in {"ambient_join", "quiet_topic"}:
+                response.completion_text = ""
+                event.set_extra("meme_manager_semantic_selected_ids", [])
+                logger.warning(
+                    "[星汐/表达质量] 主动发言连续复用近期台词，已放弃本次发送。"
+                )
+                return
+            candidate = repetition_safe_fallback(
+                str(payload.get("current_message", "")),
+                recent_replies,
+            )
+            logger.warning(
+                "[星汐/表达质量] 回复重写后仍与近期台词重复，已使用非模板化角色回复。"
+            )
         elif post_violations:
             # 违规重写失败后不得把异常长回复、后台式说明或其他未分类
             # 内容继续交给气泡拆分。主动发言宁可不说，直接回复则给出
@@ -2423,26 +2491,62 @@ class ShioPlugin(Star):
         text_components = self._collect_text_components(result.chain)
         if not text_components:
             return
+        payload = event.get_extra(SHIO_PAYLOAD, {})
+        active_tool_names = (
+            {
+                str(name)
+                for name in list(payload.get("tool_names", []) or [])
+                if str(name)
+            }
+            if isinstance(payload, dict)
+            else set()
+        )
         final_meme_references: list[str] = []
         removed_visible_tool_artifact = False
-        for component in text_components:
-            original_component_text = component.text
-            cleaned_text, references = extract_and_clean_internal_meme_references(
-                original_component_text
+        aggregate_source = "\n".join(component.text for component in text_components)
+        aggregate_had_protocol = contains_tool_protocol(
+            aggregate_source,
+            active_tool_names,
+        )
+        aggregate_cleaned, aggregate_references = (
+            extract_and_clean_internal_meme_references(
+                aggregate_source,
+                active_tool_names,
             )
-            component.text = cleaned_text
-            if (
-                cleaned_text != original_component_text.strip()
-                and contains_tool_protocol(original_component_text)
-                and not contains_tool_protocol(cleaned_text)
-            ):
-                removed_visible_tool_artifact = True
-            for reference in references:
-                if reference not in final_meme_references:
-                    final_meme_references.append(reference)
+        )
+        if (
+            aggregate_had_protocol
+            and aggregate_cleaned != aggregate_source.strip()
+            and not contains_tool_protocol(aggregate_cleaned, active_tool_names)
+        ):
+            text_components[0].text = aggregate_cleaned
+            for component in text_components[1:]:
+                component.text = ""
+            removed_visible_tool_artifact = True
+            final_meme_references.extend(aggregate_references)
+        else:
+            for component in text_components:
+                original_component_text = component.text
+                cleaned_text, references = extract_and_clean_internal_meme_references(
+                    original_component_text,
+                    active_tool_names,
+                )
+                component.text = cleaned_text
+                if (
+                    cleaned_text != original_component_text.strip()
+                    and contains_tool_protocol(
+                        original_component_text,
+                        active_tool_names,
+                    )
+                    and not contains_tool_protocol(cleaned_text, active_tool_names)
+                ):
+                    removed_visible_tool_artifact = True
+                for reference in references:
+                    if reference not in final_meme_references:
+                        final_meme_references.append(reference)
         if removed_visible_tool_artifact:
             logger.warning(
-                "[星汐/表达守卫] 发送前已从消息节点移除伪造的 search_memes 文本调用。"
+                "[星汐/表达守卫] 发送前已从消息节点移除伪造的工具文本调用。"
             )
         if final_meme_references:
             logger.warning(
@@ -2450,7 +2554,13 @@ class ShioPlugin(Star):
                 ",".join(final_meme_references),
             )
         visible_text = "".join(comp.text for comp in text_components).strip()
-        if contains_tool_protocol(visible_text):
+        if removed_visible_tool_artifact and not visible_text:
+            text_components[0].text = protocol_safe_fallback()
+            for comp in text_components[1:]:
+                comp.text = ""
+            event.set_extra("meme_manager_semantic_selected_ids", [])
+            visible_text = text_components[0].text
+        if contains_tool_protocol(visible_text, active_tool_names):
             text_components[0].text = protocol_safe_fallback()
             for comp in text_components[1:]:
                 comp.text = ""
@@ -2467,7 +2577,6 @@ class ShioPlugin(Star):
                 "[星汐/规划守卫] 发送前再次发现内部规划或推理，已阻断。"
             )
             return
-        payload = event.get_extra(SHIO_PAYLOAD, {})
         if (
             isinstance(payload, dict)
             and not bool(payload.get("is_owner", False))

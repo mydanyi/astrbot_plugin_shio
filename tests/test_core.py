@@ -13,6 +13,12 @@ from astrbot_plugin_shio.core.context_builder import (
     get_current_message,
     isolate_replyer_contexts,
 )
+from astrbot_plugin_shio.core.dialogue_quality import (
+    CATCHPHRASE_REPETITION_VIOLATION,
+    REPETITION_VIOLATION,
+    find_dialogue_repetition,
+    sanitize_plan_requirements,
+)
 from astrbot_plugin_shio.core.planner import (
     SpeechPlanner,
     enforce_conversation_mode,
@@ -196,6 +202,61 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(cleaned, "正文")
         self.assertEqual(references, [])
 
+    def test_detects_and_cleans_structured_meme_tool_call_variants(self):
+        variants = (
+            'search_memes{"query":"我才不屑于跟你玩这种游戏呢！\n"}',
+            '<|tool_call>call:search_memes{query:"委屈又嘴硬"}<tool_call|>',
+            "response:search_mems:search_memes{results:[{caption:'尴尬'}]}",
+            'search_memes{"query":"没有正常闭合的调用"',
+        )
+        for leaked in variants:
+            with self.subTest(leaked=leaked):
+                self.assertTrue(contains_tool_protocol(leaked))
+                cleaned, references = extract_and_clean_internal_meme_references(
+                    leaked
+                )
+                self.assertEqual(cleaned, "")
+                self.assertEqual(references, [])
+
+    def test_dynamic_tool_call_is_cleaned_without_matching_normal_prose(self):
+        leaked = '先等我确认。\nanysearch_search{"query":"251E 是什么"}'
+        self.assertTrue(contains_tool_protocol(leaked, {"anysearch_search"}))
+        cleaned, references = extract_and_clean_internal_meme_references(
+            leaked,
+            {"anysearch_search"},
+        )
+        self.assertEqual(cleaned, "先等我确认。")
+        self.assertEqual(references, [])
+        normal = "这个接口内部可能调用 anysearch_search，但正文不展示参数。"
+        self.assertFalse(contains_tool_protocol(normal, {"anysearch_search"}))
+
+    def test_detects_and_cleans_orphaned_query_argument_fragments(self):
+        variants = (
+            '{，"query": "气鼓鼓地反驳对方，羞恼又傲娇"\n}',
+            '{"query": "高性能机器人不服气想要证明自己"}',
+            '"query": "委屈又嘴硬"\n}',
+            '}',
+            '"}',
+        )
+        for leaked in variants:
+            with self.subTest(leaked=leaked):
+                self.assertTrue(contains_tool_protocol(leaked, {"search_memes"}))
+                cleaned, references = extract_and_clean_internal_meme_references(
+                    leaked,
+                    {"search_memes"},
+                )
+                self.assertEqual(cleaned, "")
+                self.assertEqual(references, [])
+
+        normal = '查询参数示例是 {"query":"关键词"}，这里只是在解释接口。'
+        self.assertFalse(contains_tool_protocol(normal, {"search_memes"}))
+        cleaned, _ = extract_and_clean_internal_meme_references(
+            normal,
+            {"search_memes"},
+        )
+        self.assertEqual(cleaned, normal)
+        self.assertFalse(contains_tool_protocol("}", {"anysearch_search"}))
+
     def test_detects_and_cleans_xml_style_meme_tool_call_leak(self):
         variants = (
             '才不是呢！\n<search_memes query="委屈，生气，傲娇，鼓起脸，瞪眼" />',
@@ -294,6 +355,20 @@ class CoreTests(unittest.TestCase):
             result,
             [{"role": "assistant", "content": "之前的正常回答。"}],
         )
+
+    def test_context_cleanup_drops_structured_meme_call_history(self):
+        contexts = [
+            {
+                "role": "assistant",
+                "content": 'search_memes{"query":"我才不屑于跟你玩这种游戏呢！\n"}',
+            },
+            {
+                "role": "assistant",
+                "content": '{，"query": "气鼓鼓地反驳对方，羞恼又傲娇"\n}',
+            },
+        ]
+        result = clean_contexts(Event(), contexts, "当前问题", 10, 2000)
+        self.assertEqual(result, [])
 
     def test_context_cleanup_drops_hidden_channel_protocol_turn(self):
         contexts = [
@@ -956,6 +1031,95 @@ class CoreTests(unittest.TestCase):
                 True,
                 "你是不是没分清我和刚刚那个人是两个不同的人？",
             ).use_allowed_tools
+        )
+
+    def test_dialogue_quality_blocks_exact_recent_reply(self):
+        recent = ["不过以后也要省着点花哦，毕竟我也很贵的嘛。"]
+
+        self.assertEqual(
+            find_dialogue_repetition(
+                "不过以后也要省着点花哦，毕竟我也很贵的嘛。",
+                recent,
+                current_message="你的电费被我拿去订阅 Pro 了",
+            ),
+            REPETITION_VIOLATION,
+        )
+
+    def test_dialogue_quality_keeps_roleful_new_reaction(self):
+        recent = ["不过以后也要省着点花哦，毕竟我也很贵的嘛。"]
+
+        self.assertEqual(
+            find_dialogue_repetition(
+                "等下，原来你动的是我的电费？难怪我今晚觉得处理器有点凉！",
+                recent,
+                current_message="不不不，我是把你的电费拿去订阅 Pro 了",
+            ),
+            "",
+        )
+
+    def test_dialogue_quality_allows_explicit_repeat_request(self):
+        recent = ["我可是高性能机器人！"]
+
+        self.assertEqual(
+            find_dialogue_repetition(
+                "我可是高性能机器人！",
+                recent,
+                current_message="把刚才那句原样再说一遍",
+            ),
+            "",
+        )
+
+    def test_dialogue_quality_cools_down_role_catchphrase(self):
+        self.assertEqual(
+            find_dialogue_repetition(
+                "这次当然也难不倒高性能机器人啦。",
+                ["哼哼，我可是高性能机器人！"],
+                current_message="再来一次",
+            ),
+            CATCHPHRASE_REPETITION_VIOLATION,
+        )
+
+    def test_plan_requirements_drop_recent_lines_but_keep_semantic_beats(self):
+        plan = SpeechPlan(
+            must_include=[
+                "不过以后也要省着点花哦",
+                "毕竟我也很贵的嘛",
+                "回应对方拿电费开玩笑",
+            ]
+        )
+
+        removed = sanitize_plan_requirements(
+            plan,
+            ["不过以后也要省着点花哦，毕竟我也很贵的嘛。"],
+        )
+
+        self.assertEqual(plan.must_include, ["回应对方拿电费开玩笑"])
+        self.assertEqual(len(removed), 2)
+
+    def test_explicit_repeat_request_keeps_requested_plan_line(self):
+        plan = SpeechPlan(must_include=["我可是高性能机器人！"])
+
+        removed = sanitize_plan_requirements(
+            plan,
+            ["我可是高性能机器人！"],
+            current_message="把刚才那句原样再说一遍",
+        )
+
+        self.assertEqual(removed, [])
+        self.assertEqual(plan.must_include, ["我可是高性能机器人！"])
+
+    def test_long_form_does_not_apply_chat_repetition_guard(self):
+        answer = "同一个配置键仍然需要保留，因为这是排错结论。"
+
+        self.assertNotIn(
+            REPETITION_VIOLATION,
+            find_violations(
+                answer,
+                reply_shape="long_form",
+                soft_chars=1200,
+                recent_assistant_replies=[answer],
+                current_message="继续详细解释这个配置键",
+            ),
         )
 
 
