@@ -202,10 +202,19 @@ def strip_unsupported_personal_experiences(
 
 
 TOOL_PROTOCOL_PATTERNS: tuple[str, ...] = (
+    # llama.cpp 等 OpenAI 兼容端点可能把聊天模板的隐藏通道标记写进正文。
+    # 同时兼容标准 ``<|channel|>`` 与 Gemma 偶发生成的单边竖线变体
+    # ``<|channel>`` / ``<channel|>``；要求至少一侧有竖线，避免误伤
+    # 正常技术讨论中的普通 ``<channel>`` XML 示例。
+    r"<\s*(?:[|｜]\s*(?:channel|message|start|end)\s*[|｜]?|"
+    r"(?:channel|message|start|end)\s*[|｜])\s*>",
     # DeepSeek V4 的 DSML 原始工具标签，兼容半角/全角竖线及单双竖线。
     r"<\s*/?\s*[|｜]{1,2}\s*DSML\s*[|｜]{1,2}\s*(?:tool_calls|invoke|parameter)\b",
     # 某些兼容端点会漏掉 DSML 前缀，只剩 XML 风格工具标签。
     r"<\s*/?\s*(?:tool_calls|invoke|parameter)\b[^>]*>",
+    # 另一些模型会把工具名本身当作 XML 标签输出，例如
+    # ``<search_memes query="开心" />``，而不是返回结构化 tool_calls。
+    r"<\s*/?\s*search_memes\b[^>]{0,2000}>",
     # Some local OpenAI-compatible models print a Python-style pseudo call as
     # ordinary assistant text instead of returning a structured tool_calls item.
     # Anchor it to a complete line so normal technical prose is not affected.
@@ -255,6 +264,11 @@ INTERNAL_MEME_REFERENCE_PATTERN = re.compile(
 INTERNAL_MEME_CALL_PATTERN = re.compile(
     r"(?im)^[ \t]*(?:await[ \t]+)?search_memes[ \t]*"
     r"\([^\r\n]{0,2000}\)[ \t]*[。.]?[ \t]*$"
+)
+INTERNAL_MEME_XML_CALL_PATTERN = re.compile(
+    r"<\s*search_memes\b[^>]{0,2000}"
+    r"(?:/\s*>|>\s*.*?\s*</\s*search_memes\s*>)[ \t]*[。.]?",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -360,8 +374,10 @@ def extract_and_clean_internal_meme_references(text: str) -> tuple[str, list[str
         return ""
 
     value = INTERNAL_MEME_REFERENCE_PATTERN.sub(remove_reference, str(text or ""))
-    # A failed or malformed tool round can leave ``search_memes(query=...)`` in
-    # otherwise valid prose. It is an internal instruction, never visible chat.
+    # A failed or malformed tool round can leave Python-like or XML-like
+    # ``search_memes`` calls in otherwise valid prose. They are internal
+    # instructions, never visible chat.
+    value = INTERNAL_MEME_XML_CALL_PATTERN.sub("", value)
     value = INTERNAL_MEME_CALL_PATTERN.sub("", value)
     value = re.sub(r"(?m)^[ \t]*&{1,2}[ \t]*$", "", value)
     value = re.sub(r"[ \t]+\n", "\n", value)

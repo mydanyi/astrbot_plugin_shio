@@ -1228,6 +1228,27 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(provider.calls[-1]["func_tool"])
         self.assertIn("不要再次调用工具", provider.calls[-1]["prompt"])
 
+    async def test_hidden_channel_protocol_leak_is_rewritten_without_tools(self):
+        planner_json = json.dumps({"mode": "chat"}, ensure_ascii=False)
+        provider = FakeProvider([planner_json, "呜呜呜，这也太扎心了……\nPro 的价格确实很贵。"])
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("owner", "一个月的 Pro 大概能抵你半年电费吧")
+        request = FakeRequest(event.message)
+        await plugin.build_persona_reply(event, request)
+
+        response = FakeResponse(
+            "<|channel>thought<channel|><channel|>呜呜呜，这也太扎心了……\n"
+            "Pro 的价格真的贵得离谱。"
+        )
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(
+            response.completion_text,
+            "呜呜呜，这也太扎心了……\nPro 的价格确实很贵。",
+        )
+        self.assertIsNone(provider.calls[-1]["func_tool"])
+        self.assertIn("不要再次调用工具", provider.calls[-1]["prompt"])
+
     async def test_python_meme_call_is_removed_without_rewriting_valid_answer(self):
         planner_json = json.dumps(
             {"mode": "chat", "reply_shape": "long_form"},
@@ -1246,6 +1267,26 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         await plugin.guard_persona_reply(event, response)
 
         self.assertEqual(response.completion_text, "这里是完整的技术回答。")
+        self.assertEqual(len(provider.calls), 1)
+
+    async def test_xml_meme_call_is_removed_without_rewriting_valid_answer(self):
+        planner_json = json.dumps({"mode": "chat"}, ensure_ascii=False)
+        provider = FakeProvider([planner_json])
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("owner", "你怎么还是不怎么聪明的样子")
+        request = FakeRequest(event.message)
+        await plugin.build_persona_reply(event, request)
+
+        response = FakeResponse(
+            "才不是呢！我明明刚才还帮大家解答问题的，哼，你才是笨蛋！\n"
+            '<search_memes query="委屈，生气，傲娇，鼓起脸，瞪眼" />'
+        )
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(
+            response.completion_text,
+            "才不是呢！\n我明明刚才还帮大家解答问题的，哼，你才是笨蛋！",
+        )
         self.assertEqual(len(provider.calls), 1)
 
     async def test_long_form_summary_connective_does_not_trigger_rewrite(self):
@@ -1958,6 +1999,33 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("DSML", event._result.chain[0].text)
         self.assertIn("暂时校准失误", event._result.chain[0].text)
 
+    async def test_dispatch_blocks_hidden_channel_protocol_before_sending_any_bubble(self):
+        plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {})
+        event = FakeEvent("guest", "测试")
+        event.set_extra(main.SHIO_ACTIVE, True)
+        event.set_extra(main.SHIO_PLAN, {"reply_shape": "chat_bubbles"})
+
+        class Result:
+            def __init__(self):
+                self.chain = [
+                    types.SimpleNamespace(
+                        text=(
+                            "<|channel>thought<channel|><channel|>呜呜呜，这也太扎心了……\n"
+                            "Pro 的价格真的贵得离谱。"
+                        )
+                    )
+                ]
+
+            def is_llm_result(self):
+                return True
+
+        event._result = Result()
+        await plugin.dispatch_chat_bubbles(event)
+
+        self.assertEqual(event.sent, [])
+        self.assertNotIn("channel", event._result.chain[0].text)
+        self.assertIn("暂时校准失误", event._result.chain[0].text)
+
     async def test_dispatch_blocks_internal_reasoning_before_sending_any_bubble(self):
         plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {})
         event = FakeEvent("owner", "[图片] 你看看")
@@ -2011,6 +2079,31 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(nested_text.text, "这里是完整的技术回答。")
         self.assertNotIn("search_memes", nested_text.text)
         self.assertEqual(event.sent, [])
+
+    async def test_dispatch_cleans_xml_meme_call_inside_node(self):
+        plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {})
+        event = FakeEvent("owner", "你怎么还是不怎么聪明的样子")
+        event.set_extra(main.SHIO_ACTIVE, True)
+        event.set_extra(main.SHIO_PLAN, {"reply_shape": "chat_bubbles"})
+        nested_text = types.SimpleNamespace(
+            text=(
+                "才不是呢！我明明刚才还帮大家解答问题的。\n"
+                '<search_memes query="委屈，生气，傲娇，鼓起脸，瞪眼" />'
+            )
+        )
+
+        class Result:
+            def __init__(self):
+                self.chain = [types.SimpleNamespace(content=[nested_text])]
+
+            def is_llm_result(self):
+                return True
+
+        event._result = Result()
+        await plugin.dispatch_chat_bubbles(event)
+
+        self.assertNotIn("search_memes", nested_text.text)
+        self.assertNotIn("<", nested_text.text)
 
 
 if __name__ == "__main__":

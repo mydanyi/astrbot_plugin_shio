@@ -168,12 +168,47 @@ class CoreTests(unittest.TestCase):
     def test_normal_technical_tool_calls_word_is_not_protocol_leak(self):
         self.assertFalse(contains_tool_protocol("AstrBot 会读取结构化的 tool_calls 字段。"))
 
+    def test_detects_llamacpp_hidden_channel_protocol_variants(self):
+        variants = (
+            "<|channel>thought<channel|><channel|>呜呜呜，这也太扎心了……\n"
+            "Pro 的价格真的贵得离谱。",
+            "<|channel|>analysis<|message|>内部推理",
+            "<｜channel｜>final<｜message｜>最终台词",
+        )
+        for leaked in variants:
+            with self.subTest(leaked=leaked):
+                self.assertTrue(contains_tool_protocol(leaked))
+                self.assertIn(
+                    TOOL_PROTOCOL_VIOLATION,
+                    find_violations(
+                        leaked,
+                        reply_shape="chat_bubbles",
+                        soft_chars=100,
+                        max_bubbles=3,
+                    ),
+                )
+        self.assertFalse(contains_tool_protocol("文档里的 <channel> 只是普通 XML 示例。"))
+
     def test_detects_python_style_meme_tool_call_leak(self):
         leaked = '正文\n\nsearch_memes(query="自信满满，展现专业性")'
         self.assertTrue(contains_tool_protocol(leaked))
         cleaned, references = extract_and_clean_internal_meme_references(leaked)
         self.assertEqual(cleaned, "正文")
         self.assertEqual(references, [])
+
+    def test_detects_and_cleans_xml_style_meme_tool_call_leak(self):
+        variants = (
+            '才不是呢！\n<search_memes query="委屈，生气，傲娇，鼓起脸，瞪眼" />',
+            "才不是呢！\n<search_memes><query>委屈</query></search_memes>",
+        )
+        for leaked in variants:
+            with self.subTest(leaked=leaked):
+                self.assertTrue(contains_tool_protocol(leaked))
+                cleaned, references = extract_and_clean_internal_meme_references(
+                    leaked
+                )
+                self.assertEqual(cleaned, "才不是呢！")
+                self.assertEqual(references, [])
 
     def test_detects_screenshot_internal_planning_leak(self):
         leaked = (
@@ -258,6 +293,27 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(
             result,
             [{"role": "assistant", "content": "之前的正常回答。"}],
+        )
+
+    def test_context_cleanup_drops_hidden_channel_protocol_turn(self):
+        contexts = [
+            {"role": "user", "content": "一个月的 Pro 大概能抵你半年电费吧"},
+            {
+                "role": "assistant",
+                "content": (
+                    "<|channel>thought<channel|><channel|>呜呜呜，这也太扎心了……\n"
+                    "Pro 的价格真的贵得离谱。"
+                ),
+            },
+            {"role": "user", "content": "继续聊"},
+        ]
+        result = clean_contexts(Event(), contexts, "当前问题", 10, 2000)
+        self.assertEqual(
+            result,
+            [
+                {"role": "user", "content": "一个月的 Pro 大概能抵你半年电费吧"},
+                {"role": "user", "content": "继续聊"},
+            ],
         )
 
     def test_context_only_keeps_real_chat_and_deduplicates_current(self):
