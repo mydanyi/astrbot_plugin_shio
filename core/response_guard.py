@@ -202,6 +202,12 @@ def strip_unsupported_personal_experiences(
 
 
 TOOL_PROTOCOL_PATTERNS: tuple[str, ...] = (
+    # llama.cpp 等 OpenAI 兼容端点可能把聊天模板的隐藏通道标记写进正文。
+    # 同时兼容标准 ``<|channel|>`` 与 Gemma 偶发生成的单边竖线变体
+    # ``<|channel>`` / ``<channel|>``；要求至少一侧有竖线，避免误伤
+    # 正常技术讨论中的普通 ``<channel>`` XML 示例。
+    r"<\s*(?:[|｜]\s*(?:channel|message|start|end)\s*[|｜]?|"
+    r"(?:channel|message|start|end)\s*[|｜])\s*>",
     # DeepSeek V4 的 DSML 原始工具标签，兼容半角/全角竖线及单双竖线。
     r"<\s*/?\s*[|｜]{1,2}\s*DSML\s*[|｜]{1,2}\s*(?:tool_calls|invoke|parameter)\b",
     # 某些兼容端点会漏掉 DSML 前缀，只剩 XML 风格工具标签。

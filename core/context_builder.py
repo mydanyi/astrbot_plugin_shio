@@ -4,7 +4,10 @@ import json
 import re
 from typing import Any
 
-from .response_guard import extract_and_clean_internal_meme_references
+from .response_guard import (
+    contains_tool_protocol,
+    extract_and_clean_internal_meme_references,
+)
 
 
 def content_to_text(content: Any) -> str:
@@ -131,9 +134,11 @@ def clean_contexts(
             continue
         if role == "assistant":
             # Never feed a previously leaked Meme Manager marker or pseudo tool
-            # call back to the model as an in-context speaking example.
+            # call back to the model as an in-context speaking example. Other
+            # hidden protocols (for example llama.cpp channel markers) cannot
+            # be losslessly separated from private reasoning, so drop that turn.
             text, _ = extract_and_clean_internal_meme_references(text)
-            if not text:
+            if not text or contains_tool_protocol(text):
                 continue
         if role == "user" and not _is_prelabelled_user(text):
             sender_id, sender_name, source_group_id = _sender_fields(item)

@@ -1228,6 +1228,27 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(provider.calls[-1]["func_tool"])
         self.assertIn("不要再次调用工具", provider.calls[-1]["prompt"])
 
+    async def test_hidden_channel_protocol_leak_is_rewritten_without_tools(self):
+        planner_json = json.dumps({"mode": "chat"}, ensure_ascii=False)
+        provider = FakeProvider([planner_json, "呜呜呜，这也太扎心了……\nPro 的价格确实很贵。"])
+        plugin = main.ShioPlugin(FakeContext(provider), {"owner_ids": ["owner"]})
+        event = FakeEvent("owner", "一个月的 Pro 大概能抵你半年电费吧")
+        request = FakeRequest(event.message)
+        await plugin.build_persona_reply(event, request)
+
+        response = FakeResponse(
+            "<|channel>thought<channel|><channel|>呜呜呜，这也太扎心了……\n"
+            "Pro 的价格真的贵得离谱。"
+        )
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(
+            response.completion_text,
+            "呜呜呜，这也太扎心了……\nPro 的价格确实很贵。",
+        )
+        self.assertIsNone(provider.calls[-1]["func_tool"])
+        self.assertIn("不要再次调用工具", provider.calls[-1]["prompt"])
+
     async def test_python_meme_call_is_removed_without_rewriting_valid_answer(self):
         planner_json = json.dumps(
             {"mode": "chat", "reply_shape": "long_form"},
@@ -1976,6 +1997,33 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(event.sent, [])
         self.assertNotIn("DSML", event._result.chain[0].text)
+        self.assertIn("暂时校准失误", event._result.chain[0].text)
+
+    async def test_dispatch_blocks_hidden_channel_protocol_before_sending_any_bubble(self):
+        plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {})
+        event = FakeEvent("guest", "测试")
+        event.set_extra(main.SHIO_ACTIVE, True)
+        event.set_extra(main.SHIO_PLAN, {"reply_shape": "chat_bubbles"})
+
+        class Result:
+            def __init__(self):
+                self.chain = [
+                    types.SimpleNamespace(
+                        text=(
+                            "<|channel>thought<channel|><channel|>呜呜呜，这也太扎心了……\n"
+                            "Pro 的价格真的贵得离谱。"
+                        )
+                    )
+                ]
+
+            def is_llm_result(self):
+                return True
+
+        event._result = Result()
+        await plugin.dispatch_chat_bubbles(event)
+
+        self.assertEqual(event.sent, [])
+        self.assertNotIn("channel", event._result.chain[0].text)
         self.assertIn("暂时校准失误", event._result.chain[0].text)
 
     async def test_dispatch_blocks_internal_reasoning_before_sending_any_bubble(self):
