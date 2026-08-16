@@ -2055,6 +2055,7 @@ class ShioPlugin(Star):
                 "expression_ids": [item.id for item in expressions],
                 "image_urls": list(req.image_urls or []),
                 "audio_urls": list(req.audio_urls or []),
+                "tool_names": sorted(final_tool_names),
                 "reply_shape": plan.reply_shape,
                 "chat_soft_chars": chat_soft_chars,
                 "long_form_soft_chars": long_form_soft_chars,
@@ -2134,6 +2135,13 @@ class ShioPlugin(Star):
             if tool_request is not None
             else None
         )
+        active_tool_names = {
+            str(name)
+            for name in list(payload.get("tool_names", []) or [])
+            if str(name)
+        }
+        active_tool_names.update(called_tool_names)
+        active_tool_names.update(required_fact_tools)
         if (
             isinstance(plan, dict)
             and bool(plan.get("use_allowed_tools", False))
@@ -2150,13 +2158,22 @@ class ShioPlugin(Star):
             )
             return
         original = str(response.completion_text or "")
-        had_visible_tool_artifact = contains_tool_protocol(original)
-        original, leaked_meme_references = (
-            extract_and_clean_internal_meme_references(original)
+        had_visible_tool_artifact = contains_tool_protocol(
+            original,
+            active_tool_names,
         )
-        if had_visible_tool_artifact and not contains_tool_protocol(original):
+        original, leaked_meme_references = (
+            extract_and_clean_internal_meme_references(
+                original,
+                active_tool_names,
+            )
+        )
+        if had_visible_tool_artifact and not contains_tool_protocol(
+            original,
+            active_tool_names,
+        ):
             logger.warning(
-                "[星汐/表达守卫] 已从回复正文移除伪造的 search_memes 文本调用。"
+                "[星汐/表达守卫] 已从回复正文移除伪造的工具文本调用。"
             )
         if leaked_meme_references:
             candidate_map = event.get_extra(
@@ -2252,7 +2269,11 @@ class ShioPlugin(Star):
                         request_max_retries=1,
                     )
                     if str(retry.completion_text or "").strip():
-                        candidate = clean_response(retry.completion_text, reply_shape)
+                        retry_text, _ = extract_and_clean_internal_meme_references(
+                            retry.completion_text,
+                            active_tool_names,
+                        )
+                        candidate = clean_response(retry_text, reply_shape)
             except Exception as exc:
                 logger.warning("[星汐] 违规回复重写失败，使用本地清理结果：%s", exc)
 
@@ -2423,26 +2444,62 @@ class ShioPlugin(Star):
         text_components = self._collect_text_components(result.chain)
         if not text_components:
             return
+        payload = event.get_extra(SHIO_PAYLOAD, {})
+        active_tool_names = (
+            {
+                str(name)
+                for name in list(payload.get("tool_names", []) or [])
+                if str(name)
+            }
+            if isinstance(payload, dict)
+            else set()
+        )
         final_meme_references: list[str] = []
         removed_visible_tool_artifact = False
-        for component in text_components:
-            original_component_text = component.text
-            cleaned_text, references = extract_and_clean_internal_meme_references(
-                original_component_text
+        aggregate_source = "\n".join(component.text for component in text_components)
+        aggregate_had_protocol = contains_tool_protocol(
+            aggregate_source,
+            active_tool_names,
+        )
+        aggregate_cleaned, aggregate_references = (
+            extract_and_clean_internal_meme_references(
+                aggregate_source,
+                active_tool_names,
             )
-            component.text = cleaned_text
-            if (
-                cleaned_text != original_component_text.strip()
-                and contains_tool_protocol(original_component_text)
-                and not contains_tool_protocol(cleaned_text)
-            ):
-                removed_visible_tool_artifact = True
-            for reference in references:
-                if reference not in final_meme_references:
-                    final_meme_references.append(reference)
+        )
+        if (
+            aggregate_had_protocol
+            and aggregate_cleaned != aggregate_source.strip()
+            and not contains_tool_protocol(aggregate_cleaned, active_tool_names)
+        ):
+            text_components[0].text = aggregate_cleaned
+            for component in text_components[1:]:
+                component.text = ""
+            removed_visible_tool_artifact = True
+            final_meme_references.extend(aggregate_references)
+        else:
+            for component in text_components:
+                original_component_text = component.text
+                cleaned_text, references = extract_and_clean_internal_meme_references(
+                    original_component_text,
+                    active_tool_names,
+                )
+                component.text = cleaned_text
+                if (
+                    cleaned_text != original_component_text.strip()
+                    and contains_tool_protocol(
+                        original_component_text,
+                        active_tool_names,
+                    )
+                    and not contains_tool_protocol(cleaned_text, active_tool_names)
+                ):
+                    removed_visible_tool_artifact = True
+                for reference in references:
+                    if reference not in final_meme_references:
+                        final_meme_references.append(reference)
         if removed_visible_tool_artifact:
             logger.warning(
-                "[星汐/表达守卫] 发送前已从消息节点移除伪造的 search_memes 文本调用。"
+                "[星汐/表达守卫] 发送前已从消息节点移除伪造的工具文本调用。"
             )
         if final_meme_references:
             logger.warning(
@@ -2450,7 +2507,13 @@ class ShioPlugin(Star):
                 ",".join(final_meme_references),
             )
         visible_text = "".join(comp.text for comp in text_components).strip()
-        if contains_tool_protocol(visible_text):
+        if removed_visible_tool_artifact and not visible_text:
+            text_components[0].text = protocol_safe_fallback()
+            for comp in text_components[1:]:
+                comp.text = ""
+            event.set_extra("meme_manager_semantic_selected_ids", [])
+            visible_text = text_components[0].text
+        if contains_tool_protocol(visible_text, active_tool_names):
             text_components[0].text = protocol_safe_fallback()
             for comp in text_components[1:]:
                 comp.text = ""
@@ -2467,7 +2530,6 @@ class ShioPlugin(Star):
                 "[星汐/规划守卫] 发送前再次发现内部规划或推理，已阻断。"
             )
             return
-        payload = event.get_extra(SHIO_PAYLOAD, {})
         if (
             isinstance(payload, dict)
             and not bool(payload.get("is_owner", False))

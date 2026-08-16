@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 
 
 META_PATTERNS: tuple[tuple[str, str], ...] = (
@@ -202,6 +203,10 @@ def strip_unsupported_personal_experiences(
 
 
 TOOL_PROTOCOL_PATTERNS: tuple[str, ...] = (
+    # llama.cpp 原生工具模板包装。模型偶尔只吐出开头或结尾的一半，
+    # 即使内部函数名已经丢失，也不能把模板控制标记交给聊天气泡。
+    r"<\s*(?:[|｜]\s*(?:tool_call|tool_response)\s*[|｜]?|"
+    r"(?:tool_call|tool_response)\s*[|｜])\s*>",
     # llama.cpp 等 OpenAI 兼容端点可能把聊天模板的隐藏通道标记写进正文。
     # 同时兼容标准 ``<|channel|>`` 与 Gemma 偶发生成的单边竖线变体
     # ``<|channel>`` / ``<channel|>``；要求至少一侧有竖线，避免误伤
@@ -271,14 +276,104 @@ INTERNAL_MEME_XML_CALL_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+_SAFE_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
+_TOOL_CALL_SUFFIX_PATTERN = re.compile(
+    r"[ \t]*(?:"
+    r"<\s*(?:[|｜]\s*tool_call\s*[|｜]?|tool_call\s*[|｜])\s*>|"
+    r"<\s*/\s*tool_call\s*>"
+    r")?[ \t]*[。.]?",
+    re.IGNORECASE,
+)
 
-def contains_tool_protocol(text: str) -> bool:
+
+def _normalized_tool_names(tool_names: Iterable[str] | None = None) -> tuple[str, ...]:
+    names = {"search_memes"}
+    for raw_name in tool_names or ():
+        name = str(raw_name or "").strip()
+        if _SAFE_TOOL_NAME_PATTERN.fullmatch(name):
+            names.add(name)
+    return tuple(sorted(names, key=lambda item: (-len(item), item)))
+
+
+def _structured_tool_call_start_pattern(
+    tool_names: Iterable[str] | None = None,
+) -> re.Pattern[str]:
+    alternatives = "|".join(
+        re.escape(name) for name in _normalized_tool_names(tool_names)
+    )
+    return re.compile(
+        r"^[ \t]*"
+        r"(?:<\s*(?:[|｜]\s*tool_call\s*[|｜]?|tool_call\s*[|｜])\s*>[ \t]*)?"
+        r"(?:(?:call|response)[ \t]*:[ \t]*"
+        r"(?:[A-Za-z_][A-Za-z0-9_.-]*[ \t]*:[ \t]*)*)?"
+        rf"(?P<tool>{alternatives})[ \t]*(?P<opener>[{{(])",
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+
+def _balanced_tool_call_end(value: str, opener_at: int, opener: str) -> int:
+    """Return the end of a JSON/Python-like call, or fail closed to EOF."""
+    closer = "}" if opener == "{" else ")"
+    depth = 0
+    quote = ""
+    escaped = False
+    for index in range(opener_at, len(value)):
+        char = value[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                suffix = _TOOL_CALL_SUFFIX_PATTERN.match(value, index + 1)
+                return suffix.end() if suffix is not None else index + 1
+    # A line that starts like a real tool call but never closes is more dangerous
+    # than losing its trailing fragment. Do not let a partial call reach users.
+    return len(value)
+
+
+def _strip_structured_tool_calls(
+    text: str,
+    tool_names: Iterable[str] | None = None,
+) -> tuple[str, bool]:
+    value = str(text or "")
+    pattern = _structured_tool_call_start_pattern(tool_names)
+    removed = False
+    while True:
+        match = pattern.search(value)
+        if match is None:
+            break
+        end = _balanced_tool_call_end(
+            value,
+            match.start("opener"),
+            match.group("opener"),
+        )
+        value = value[: match.start()] + value[end:]
+        removed = True
+    return value, removed
+
+
+def contains_tool_protocol(
+    text: str,
+    tool_names: Iterable[str] | None = None,
+) -> bool:
     """判断模型是否把内部工具协议错误地写进了可见正文。"""
     value = str(text or "")
-    return any(
+    if any(
         re.search(pattern, value, flags=re.IGNORECASE)
         for pattern in TOOL_PROTOCOL_PATTERNS
-    )
+    ):
+        return True
+    return _structured_tool_call_start_pattern(tool_names).search(value) is not None
 
 
 def contains_internal_reasoning(text: str) -> bool:
@@ -357,7 +452,10 @@ def contains_emotional_reaction(text: str) -> bool:
     )
 
 
-def extract_and_clean_internal_meme_references(text: str) -> tuple[str, list[str]]:
+def extract_and_clean_internal_meme_references(
+    text: str,
+    tool_names: Iterable[str] | None = None,
+) -> tuple[str, list[str]]:
     """Remove leaked Meme Manager artifacts and return normalized image IDs.
 
     The reply model occasionally emits a single ampersand, a bare reference, or
@@ -379,6 +477,7 @@ def extract_and_clean_internal_meme_references(text: str) -> tuple[str, list[str
     # instructions, never visible chat.
     value = INTERNAL_MEME_XML_CALL_PATTERN.sub("", value)
     value = INTERNAL_MEME_CALL_PATTERN.sub("", value)
+    value, _ = _strip_structured_tool_calls(value, tool_names)
     value = re.sub(r"(?m)^[ \t]*&{1,2}[ \t]*$", "", value)
     value = re.sub(r"[ \t]+\n", "\n", value)
     value = re.sub(r"\n[ \t]+", "\n", value)

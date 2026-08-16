@@ -196,6 +196,34 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(cleaned, "正文")
         self.assertEqual(references, [])
 
+    def test_detects_and_cleans_structured_meme_tool_call_variants(self):
+        variants = (
+            'search_memes{"query":"我才不屑于跟你玩这种游戏呢！\n"}',
+            '<|tool_call>call:search_memes{query:"委屈又嘴硬"}<tool_call|>',
+            "response:search_mems:search_memes{results:[{caption:'尴尬'}]}",
+            'search_memes{"query":"没有正常闭合的调用"',
+        )
+        for leaked in variants:
+            with self.subTest(leaked=leaked):
+                self.assertTrue(contains_tool_protocol(leaked))
+                cleaned, references = extract_and_clean_internal_meme_references(
+                    leaked
+                )
+                self.assertEqual(cleaned, "")
+                self.assertEqual(references, [])
+
+    def test_dynamic_tool_call_is_cleaned_without_matching_normal_prose(self):
+        leaked = '先等我确认。\nanysearch_search{"query":"251E 是什么"}'
+        self.assertTrue(contains_tool_protocol(leaked, {"anysearch_search"}))
+        cleaned, references = extract_and_clean_internal_meme_references(
+            leaked,
+            {"anysearch_search"},
+        )
+        self.assertEqual(cleaned, "先等我确认。")
+        self.assertEqual(references, [])
+        normal = "这个接口内部可能调用 anysearch_search，但正文不展示参数。"
+        self.assertFalse(contains_tool_protocol(normal, {"anysearch_search"}))
+
     def test_detects_and_cleans_xml_style_meme_tool_call_leak(self):
         variants = (
             '才不是呢！\n<search_memes query="委屈，生气，傲娇，鼓起脸，瞪眼" />',
@@ -294,6 +322,16 @@ class CoreTests(unittest.TestCase):
             result,
             [{"role": "assistant", "content": "之前的正常回答。"}],
         )
+
+    def test_context_cleanup_drops_structured_meme_call_history(self):
+        contexts = [
+            {
+                "role": "assistant",
+                "content": 'search_memes{"query":"我才不屑于跟你玩这种游戏呢！\n"}',
+            }
+        ]
+        result = clean_contexts(Event(), contexts, "当前问题", 10, 2000)
+        self.assertEqual(result, [])
 
     def test_context_cleanup_drops_hidden_channel_protocol_turn(self):
         contexts = [

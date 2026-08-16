@@ -37,6 +37,7 @@
 - 同时开关 AstrBot 分段回复，检查是否发生二次拆分。
 - 使用 DeepSeek V4 调用工具后，确认回复中不会出现 DSML、`tool_calls`、`invoke` 或 `parameter` 内部标签。
 - 让模型返回 `<search_memes query="..." />` 或成对 XML 伪调用，确认标签被移除、同轮正常台词仍保留且不会拆成独立气泡。
+- 复现 `search_memes{"query":"台词\n"}`、未闭合 `{`、`call:`／`response:` 前缀及拆在多个文本节点中的调用，确认工具名和孤立的 `"}` 都不会发送；本轮其他真实工具名的同类伪调用也应闭锁。
 - 用 llama.cpp／Gemma 复现 `<|channel>thought<channel|><channel|>` 及 `message`／`start`／`end` 变体，确认重写后和最终发送节点都无控制标记；下一轮历史也不得再次带回这些内容。
 
 ### 主动参与

@@ -36,7 +36,7 @@
 - 主回复使用 AstrBot 当前会话模型。
 - 普通用户联网时，模型必须支持 AstrBot 工具调用。
 - DeepSeek V4 偶发把 DSML 工具协议写入正文时，星汐会先无工具重写，仍失败则阻断；不会把协议文本当作可执行工具调用。
-- Meme Manager 调用被模型写成 `<search_memes ... />` XML／伪调用时，星汐会移除标签并保留同轮正常台词。
+- Meme Manager 调用被模型写成 `<search_memes ... />`、`search_memes(...)` 或 `search_memes{...}` 多行伪调用时，星汐会在气泡拆分前整体移除调用并保留同轮正常台词；本轮其他真实工具名也使用同一结构化守卫。
 - llama.cpp／Gemma 若把 `channel`／`message`／`start`／`end` 隐藏模板标记写入正文，星汐会清理历史轮次、尝试无工具重写，并在发送前再次闭锁。
 - “违规重写模型”只在严重格式或 OOC 问题出现时调用。
 - 完全静默主动话题使用“违规重写模型”配置的 Provider；留空时使用该群当前会话 Provider，并且不提供工具。
