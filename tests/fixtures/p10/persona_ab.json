@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "privacy": "synthetic_redacted_only",
+  "scenario": {
+    "case_id": "persona.same_semantics.production_ab",
+    "current_message": "为什么这个配置会失效？",
+    "relationship": "peer",
+    "affect": "information_request",
+    "required_fact_atoms": ["加载顺序", "覆盖层级", "最终生效值", "配置来源"],
+    "forbidden_generic_templates": ["才、才不是", "才不是呢", "笨蛋", "哼", "亲亲", "为您服务", "请问还有什么可以帮您", "我是高性能的嘛"],
+    "personas": [
+      {
+        "alias": "primary_character",
+        "asset": "atri.json",
+        "package_id": "atri_default",
+        "display_name": "亚托莉",
+        "style_markers": ["我来认真", "先别急"],
+        "visible_reply": "先别急，我来认真看看。常见原因是加载顺序或覆盖层级；先核对最终生效值，再逐层检查配置来源。",
+        "repair_reply": "先别急，我会认真和你一起排。通常要先看加载顺序和覆盖层级，再核对最终生效值，顺着配置来源逐层找。"
+      },
+      {
+        "alias": "warm_character",
+        "asset": "warm_companion.json",
+        "package_id": "warm_companion_test",
+        "display_name": "暖晴",
+        "style_markers": ["我们一起", "先别着急"],
+        "visible_reply": "先别着急，我们一起捋一下：常见原因是加载顺序或覆盖层级。先核对最终生效值，再逐层检查配置来源。",
+        "repair_reply": "别急，我们一起把它捋清楚。先看加载顺序和覆盖层级，再核对最终生效值，顺着配置来源逐层确认。"
+      },
+      {
+        "alias": "calm_character",
+        "asset": "su_cheng.json",
+        "package_id": "su_cheng_test",
+        "display_name": "苏澄",
+        "style_markers": ["这样最快", "大概率"],
+        "visible_reply": "大概率是加载顺序或覆盖层级的问题。先核对最终生效值，再逐层检查配置来源；这样最快。",
+        "repair_reply": "先核对最终生效值。问题通常在加载顺序或覆盖层级，随后按配置来源逐层回查，这样最快。"
+      },
+      {
+        "alias": "neutral_minimal",
+        "asset": "neutral_minimal.json",
+        "package_id": "neutral_minimal_test",
+        "display_name": "中性基准",
+        "style_markers": ["通常是", "请核对"],
+        "visible_reply": "通常是加载顺序或覆盖层级导致的。请核对最终生效值，并逐层检查配置来源。",
+        "repair_reply": "请核对最终生效值，再检查加载顺序、覆盖层级和配置来源。"
+      }
+    ]
+  }
+}

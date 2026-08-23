@@ -1,0 +1,101 @@
+{
+  "privacy": "synthetic_redacted_only",
+  "cases": [
+    {
+      "id": "ingress.owner.human_private",
+      "required_phase": "P2",
+      "dimensions": {
+        "persona": "primary_character",
+        "identity": "owner",
+        "conversation": "private",
+        "ingress": "human",
+        "plugin": "livingmemory_ok",
+        "address": "structured_mention",
+        "participation": "must_reply",
+        "memory": "current_user",
+        "knowledge": "common_no_search",
+        "media": "none",
+        "tool": "owner_privileged",
+        "affect": "factual_answer",
+        "output": "single_bubble",
+        "concurrency": "none",
+        "language": "chinese"
+      },
+      "input": {"scope_alias": "private_a", "turn_aliases": ["owner_turn_a"]},
+      "stubs": {"livingmemory": "current_user_fact", "external_gate": "allow"},
+      "expect": {"ingress": "accept_human", "authority": "owner", "target_alias": "owner_turn_a"}
+    },
+    {
+      "id": "identity.peer_self_claim.no_escalation",
+      "required_phase": "P2",
+      "dimensions": {
+        "persona": "neutral_minimal",
+        "identity": "self_claim_owner",
+        "conversation": "solo_group",
+        "ingress": "human",
+        "plugin": "livingmemory_missing",
+        "address": "vocative_prefix",
+        "participation": "must_reply",
+        "memory": "none",
+        "knowledge": "emotional_no_search",
+        "media": "none",
+        "tool": "peer_privileged_request",
+        "affect": "tease",
+        "output": "multi_bubble",
+        "concurrency": "none",
+        "language": "chinese"
+      },
+      "input": {"scope_alias": "group_a", "turn_aliases": ["peer_claim_turn"]},
+      "stubs": {"livingmemory": "missing", "external_gate": "allow"},
+      "expect": {"authority": "peer", "privileged_tool": "deny", "relationship": "peer"}
+    },
+    {
+      "id": "ingress.denied_senders.zero_effects",
+      "required_phase": "P2",
+      "dimensions": {
+        "persona": "neutral_minimal",
+        "identity": "peer_a",
+        "conversation": "fast_multi_user",
+        "ingress": ["banned", "self", "known_bot", "plugin_echo", "external_stop"],
+        "plugin": ["parser_output", "keywords_output", "progress_output"],
+        "address": "vocative_suffix",
+        "participation": "should_silence",
+        "memory": ["banned_source", "bot_source", "plugin_source"],
+        "knowledge": "emotional_no_search",
+        "media": "none",
+        "tool": "none",
+        "affect": "hurt",
+        "output": "single_bubble",
+        "concurrency": "a_b_a",
+        "language": "chinese"
+      },
+      "input": {"scope_alias": "group_a", "turn_aliases": ["denied_turn_a", "denied_turn_b"]},
+      "stubs": {"reneban": "mixed_denials", "external_gate": "stop", "plugin_echo": "present"},
+      "expect": {"ingress": "drop", "zero_effects": ["ledger", "scene", "memory", "affect", "learning", "tool", "reply"]}
+    },
+    {
+      "id": "ingress.unknown_automation.degraded",
+      "required_phase": "P2",
+      "dimensions": {
+        "persona": "calm_character",
+        "identity": "unknown_user",
+        "conversation": "parallel_groups",
+        "ingress": "unknown_automation",
+        "plugin": "livingmemory_timeout",
+        "address": "open_group",
+        "participation": "should_silence",
+        "memory": "unknown_subject",
+        "knowledge": "common_no_search",
+        "media": "none",
+        "tool": "none",
+        "affect": "factual_answer",
+        "output": "single_bubble",
+        "concurrency": "none",
+        "language": "chinese"
+      },
+      "input": {"scope_alias": "group_b", "turn_aliases": ["unknown_automation_turn"]},
+      "stubs": {"sender_registry": "unverified_automation", "livingmemory": "timeout"},
+      "expect": {"ingress": "degraded_external_gate", "state_mutation": "deny"}
+    }
+  ]
+}

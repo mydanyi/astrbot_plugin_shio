@@ -1,0 +1,53 @@
+{
+  "privacy": "synthetic_redacted_only",
+  "cases": [
+    {
+      "id": "concurrency.slow_tool.stale_drop",
+      "required_phase": "P9",
+      "dimensions": {
+        "persona": "neutral_minimal",
+        "identity": "peer_a",
+        "conversation": "parallel_groups",
+        "ingress": "human",
+        "plugin": "anysearch_timeout",
+        "address": "structured_mention",
+        "participation": "must_reply",
+        "memory": "current_user",
+        "knowledge": "current_fact",
+        "media": "none",
+        "tool": "tool_timeout",
+        "affect": "factual_answer",
+        "output": "single_bubble",
+        "concurrency": "slow_tool_result",
+        "language": "english_proper_noun"
+      },
+      "input": {"scope_alias": "group_a", "turn_aliases": ["fact_question_old", "fact_question_new"]},
+      "stubs": {"anysearch": "late_result_after_revision", "clock": "deterministic_events"},
+      "expect": {"late_result_consumed": false, "stale_send_count": 0, "new_revision_preserved": true}
+    },
+    {
+      "id": "concurrency.restart.recovery",
+      "required_phase": "P9",
+      "dimensions": {
+        "persona": "primary_character",
+        "identity": "owner",
+        "conversation": "parallel_groups",
+        "ingress": "human",
+        "plugin": "progress_output",
+        "address": "open_group",
+        "participation": "quiet_initiate",
+        "memory": "public_group",
+        "knowledge": "common_no_search",
+        "media": "none",
+        "tool": "owner_privileged",
+        "affect": "care",
+        "output": "multi_bubble",
+        "concurrency": "restart_recovery",
+        "language": "chinese"
+      },
+      "input": {"scope_alias": "group_b", "turn_aliases": ["pending_before_restart", "resume_after_restart"]},
+      "stubs": {"scheduler": "restart_between_decision_and_send", "receipt_store": "explicit_success_only"},
+      "expect": {"duplicate_send_count": 0, "orphan_pending_count": 0, "recovered_scope_alias": "group_b"}
+    }
+  ]
+}

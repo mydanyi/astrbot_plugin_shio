@@ -1,0 +1,77 @@
+{
+  "fixture_version": 1,
+  "privacy": "synthetic_redacted_only",
+  "simple_scenarios": [
+    {
+      "id": "owner-group-multi-bubble",
+      "sender_id": "owner-a",
+      "owner_ids": ["owner-a"],
+      "chat_type": "group",
+      "message": "你今天真的很厉害",
+      "visible_output": "哼哼，这次知道我的厉害了吧。\n不过被你夸，我还是有一点开心的。",
+      "expected_policy": "owner",
+      "expected_relationship": "primary_bond",
+      "expected_bubbles": 2,
+      "expected_presentation": true
+    },
+    {
+      "id": "guest-group-single-bubble",
+      "sender_id": "guest-a",
+      "owner_ids": ["owner-a"],
+      "chat_type": "group",
+      "message": "今天见到你还挺开心的",
+      "visible_output": "我也挺开心的呀，今天就多聊一会儿吧。",
+      "expected_policy": "guest",
+      "expected_relationship": "peer",
+      "expected_bubbles": 1,
+      "expected_presentation": true
+    },
+    {
+      "id": "guest-private-multi-bubble",
+      "sender_id": "guest-b",
+      "owner_ids": ["owner-a"],
+      "chat_type": "private",
+      "message": "谢谢你刚才陪我说话",
+      "visible_output": "不用这么客气啦。\n你心情轻松一点就好。",
+      "expected_policy": "guest",
+      "expected_relationship": "peer",
+      "expected_bubbles": 2,
+      "expected_presentation": true
+    }
+  ],
+  "tool_scenarios": [
+    {
+      "id": "guest-public-web-read",
+      "sender_id": "guest-a",
+      "owner_ids": ["owner-a"],
+      "chat_type": "group",
+      "message": "帮我联网查一下这个术语的资料",
+      "expected_web_allowed": true,
+      "expected_shell_allowed": false,
+      "expected_route": "small_planner",
+      "expected_model_calls": 2
+    },
+    {
+      "id": "owner-private-full-capability",
+      "sender_id": "owner-a",
+      "owner_ids": ["owner-a"],
+      "chat_type": "private",
+      "message": "执行我的调试任务",
+      "expected_web_allowed": true,
+      "expected_shell_allowed": true,
+      "expected_policy": "owner"
+    }
+  ],
+  "quoted_scenario": {
+    "id": "owner-quotes-guest-without-identity-switch",
+    "sender_id": "owner-a",
+    "owner_ids": ["owner-a"],
+    "chat_type": "group",
+    "message": "他刚才说的内容是什么意思？",
+    "current_message_id": "msg-owner-current",
+    "quoted_message_id": "msg-guest-old",
+    "quoted_sender_id": "guest-a",
+    "expected_route": "small_planner",
+    "expected_model_calls": 2
+  }
+}

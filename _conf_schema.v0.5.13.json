@@ -1,0 +1,329 @@
+{
+  "enabled": {
+    "description": "启用星汐回复链",
+    "type": "bool",
+    "hint": "控制 typed 角色回复链。关闭它不会关闭下方的内置权限守卫；普通群友仍然只能使用明确加入白名单的只读工具。",
+    "default": true
+  },
+  "inference_max_parallel": {
+    "description": "全局模型调用并发上限",
+    "type": "int",
+    "hint": "星汐首次生成、一次修复和主动开题共用同一预算，范围 1-16；默认 4。",
+    "default": 4
+  },
+  "inference_max_waiters": {
+    "description": "全局模型调用排队上限",
+    "type": "int",
+    "hint": "等待全局模型槽位的最大请求数，范围 1-512；超出后失败关闭且不创建 Provider 协程。",
+    "default": 128
+  },
+  "inference_queue_timeout_seconds": {
+    "description": "模型调用排队超时（秒）",
+    "type": "int",
+    "hint": "范围 1-300；超时后失败关闭且不会在后台补发旧请求。",
+    "default": 30
+  },
+  "inference_active_timeout_seconds": {
+    "description": "单次模型调用活动超时（秒）",
+    "type": "int",
+    "hint": "范围 5-1800；超时后全局推理预算失败关闭，迟到结果不会发送，直到原调用返回或插件重启。",
+    "default": 300
+  },
+  "performance_window_samples": {
+    "description": "性能分位数窗口样本数",
+    "type": "int",
+    "hint": "每类只保留最近的有界延迟样本，范围 16-8192；只记录耗时和计数，不记录消息、Prompt、ID 或路径。",
+    "default": 512
+  },
+  "continuity_max_scopes": {
+    "description": "重启 revision 指纹上限",
+    "type": "int",
+    "hint": "范围 1-8192，默认 2048；只持久化不可逆 scope 指纹和 revision 数值，满时不驱逐旧 revision。",
+    "default": 2048
+  },
+  "continuity_max_subjects": {
+    "description": "重启参与节奏指纹上限",
+    "type": "int",
+    "hint": "范围 1-8192，默认 256；只持久化不可逆 scope+sender 指纹及冷却数值，满时普通参与失败关闭，明确直答不受影响。",
+    "default": 256
+  },
+  "natural_name_wake_enabled": {
+    "description": "启用自然称名唤醒",
+    "type": "bool",
+    "hint": "允许角色名字出现在句中或句尾时唤醒。星汐只负责把明确直呼升级为 AstrBot 正常对话，记忆、权限、工具和 Provider 仍走原生链路。",
+    "default": true
+  },
+  "natural_name_wake_mode": {
+    "description": "称名唤醒方式",
+    "type": "string",
+    "options": [
+      "natural",
+      "contains"
+    ],
+    "labels": [
+      "自然语言判断（推荐）",
+      "关键词出现即唤醒"
+    ],
+    "hint": "自然语言判断会区分直接叫机器人和谈论角色；关键词出现即唤醒只要当前消息正文命中任一角色称呼或别名就唤醒，但仍排除 URL、代码和明确作品标题。",
+    "default": "natural"
+  },
+  "natural_name_wake_aliases": {
+    "description": "角色称呼与别名",
+    "type": "list",
+    "hint": "用于自然称名识别。名字在 URL、代码或明确作品名语境中不会强制唤醒；当前人格名称会自动补入。",
+    "default": [
+      "亚托莉",
+      "ATRI",
+      "アトリ",
+      "萝卜子"
+    ]
+  },
+  "natural_name_wake_group_whitelist": {
+    "description": "自然称名唤醒群白名单",
+    "type": "list",
+    "hint": "填写群 ID；留空表示所有群可用。私聊本来就由 AstrBot 自动唤醒，不受这里影响。",
+    "default": []
+  },
+  "meme_complement_enabled": {
+    "description": "启用星汐文字回复后的表情包补充",
+    "type": "bool",
+    "hint": "只控制星汐是否为已成功发送的安全文字回复申请一次 Meme 补图。关闭后星汐不会调用 compatibility 补图链；Meme Manager 自身功能和其他插件不受影响。",
+    "default": true
+  },
+  "meme_complement_cadence_turns": {
+    "description": "普通安全闲聊触发表情包所需回合数",
+    "type": "int",
+    "hint": "范围 1-16，默认 4；按同一群、同一发送者累计。明确玩笑或接梗仍可即时准入。这里只决定何时给 Meme Manager 一次机会，最终是否出图仍由 Meme Manager 的表情出现概率控制。",
+    "default": 4
+  },
+  "meme_complement_cooldown_turns": {
+    "description": "表情包补充后的冷却回合数",
+    "type": "int",
+    "hint": "范围 1-32，默认 4；同一群、同一发送者触发一次补图机会后，至少经过这些安全普通回合才重新累计。请求、严肃或风险语境会重置节奏。",
+    "default": 4
+  },
+  "proactive_initiation_enabled": {
+    "description": "启用冷场主动发起总开关",
+    "type": "bool",
+    "hint": "默认关闭。开启后仍必须填写群白名单，并通过活跃时段、观察期、空闲、冷却、日限额、current generation、输出守卫和 exact send transaction。",
+    "default": false
+  },
+  "proactive_group_allowlist": {
+    "description": "冷场主动发起群白名单",
+    "type": "list",
+    "hint": "只填写明确允许主动开题的群 ID。留空永远不主动发起，不表示全部群。",
+    "default": []
+  },
+  "proactive_active_hour_start": {
+    "description": "主动发起开始小时",
+    "type": "int",
+    "hint": "按配置时区计算，范围 0-23。",
+    "default": 9
+  },
+  "proactive_active_hour_end": {
+    "description": "主动发起结束小时",
+    "type": "int",
+    "hint": "按配置时区计算，范围 1-24；跨午夜时开始值可以大于结束值。",
+    "default": 23
+  },
+  "proactive_timezone_offset_minutes": {
+    "description": "本地时区偏移（分钟）",
+    "type": "int",
+    "hint": "同时用于普通对话的日期/早中晚、历史消息时间标记、主动发起活跃时段和每日次数边界；香港/北京时间为 480。",
+    "default": 480
+  },
+  "proactive_observation_minutes": {
+    "description": "群观察期（分钟）",
+    "type": "int",
+    "hint": "群进入候选状态后至少观察这么久，避免刚启动或刚发现群就主动开题。",
+    "default": 30
+  },
+  "proactive_idle_minutes": {
+    "description": "冷场空闲时间（分钟）",
+    "type": "int",
+    "hint": "最后一条已准入群消息之后至少等待这么久。",
+    "default": 20
+  },
+  "proactive_cooldown_minutes": {
+    "description": "主动发起冷却（分钟）",
+    "type": "int",
+    "hint": "同一群两次主动候选 admission 之间的最短间隔。",
+    "default": 180
+  },
+  "proactive_daily_limit": {
+    "description": "每群每日主动发起上限",
+    "type": "int",
+    "hint": "范围 1-20；仅成功发送才消耗名额，失败尝试仍会防止同一条群消息自动重放。",
+    "default": 1
+  },
+  "proactive_scheduler_interval_seconds": {
+    "description": "主动发起调度间隔（秒）",
+    "type": "int",
+    "hint": "范围 15-3600。仅当主动总开关开启且群白名单非空时启动任务；每轮仍会重新检查时段、空闲、冷却、日限额和 current generation。",
+    "default": 60
+  },
+  "social_feedback_enabled": {
+    "description": "学习回复后的自然反馈",
+    "type": "bool",
+    "hint": "识别后续群消息中的明显正向或负向反馈，以很小的权重调整表达范例排序。不会自动改写角色卡或生成新的表达库内容。",
+    "default": true
+  },
+  "social_feedback_window_minutes": {
+    "description": "回复反馈观察窗口（分钟）",
+    "type": "int",
+    "hint": "只把机器人回复后这段时间内的明确反应当作弱反馈，避免把很久之后的话误归因到上一条回复。",
+    "default": 10
+  },
+  "owner_ids": {
+    "description": "主人 ID 白名单",
+    "type": "list",
+    "hint": "仅用于确认谁有资格提出主人动作。每次动作仍必须来自当前私聊正文，并继续通过独立的操作开关、运行时证明、确认策略和持久化审计；白名单本身不授予任何执行权限。",
+    "default": []
+  },
+  "owner_action_enabled": {
+    "description": "启用主人动作总开关",
+    "type": "bool",
+    "hint": "默认关闭。开启也不会自动启用任何具体操作；每个适配器还必须单独开启并通过当前运行时的代码证明。",
+    "default": false
+  },
+  "owner_action_artifact_read_exact_enabled": {
+    "description": "允许主人读取单个安全文本工件",
+    "type": "bool",
+    "hint": "默认关闭。当前生产运行时证明白名单为空，因此即使开启也会失败关闭，不会读取文件。",
+    "default": false
+  },
+  "owner_action_artifact_grep_enabled": {
+    "description": "允许主人搜索安全文本工件",
+    "type": "bool",
+    "hint": "默认关闭。必须同时配置专用安全根目录并通过路径、输出和运行时证明。",
+    "default": false
+  },
+  "owner_action_memory_write_literal_enabled": {
+    "description": "允许主人写入私有长期记忆",
+    "type": "bool",
+    "hint": "默认关闭。只有当前主人私聊、精确私有作用域和实时管理权限全部通过时才可能启用。",
+    "default": false
+  },
+  "owner_action_sandbox_shell_once_enabled": {
+    "description": "主人单次沙箱命令开关（保留项）",
+    "type": "bool",
+    "hint": "代码级永久关闭；该配置仅用于显示和审计，不会启用命令执行。",
+    "default": false
+  },
+  "owner_action_artifact_root": {
+    "description": "主人文本工件专用安全根目录",
+    "type": "string",
+    "hint": "留空表示不可用。不得填写 AstrBot 数据目录、配置目录、日志目录、凭据目录或用户主目录。",
+    "default": ""
+  },
+  "owner_action_artifact_path_flavor": {
+    "description": "主人文本工件路径类型",
+    "type": "string",
+    "options": ["", "windows", "posix", "wsl_posix"],
+    "labels": ["未配置", "Windows", "POSIX", "WSL POSIX"],
+    "hint": "必须与实际安全根目录一致；未配置时文件动作失败关闭。",
+    "default": ""
+  },
+  "owner_action_shell_family": {
+    "description": "沙箱命令语法族（仅审计）",
+    "type": "string",
+    "options": ["", "posix_sh", "powershell"],
+    "labels": ["未配置", "POSIX sh", "PowerShell"],
+    "hint": "不会启用命令执行；Shell 仍由代码硬关闭。",
+    "default": ""
+  },
+  "trusted_bot_identities": {
+    "description": "可信机器人身份",
+    "type": "list",
+    "hint": "用于群聊入口排除其他机器人，格式为 platform_id|sender_id（例如 aiocqhttp|123456）。只接受适配器提供的结构化平台和发送者 ID；昵称、群名片和正文自称不会生效。配置项格式错误时星汐会失败关闭未确认身份的入口。",
+    "default": []
+  },
+  "permission_guard_enabled": {
+    "description": "启用内置 Agent 权限守卫",
+    "type": "bool",
+    "hint": "强烈建议始终开启。普通用户在 LLM 执行前只保留下方精确白名单中的只读工具；发送者 ID 缺失时清空全部工具。主人动作也必须走独立的 typed 权限链，不能靠此开关获得执行能力。",
+    "default": true
+  },
+  "guest_allowed_tools": {
+    "description": "普通用户只读工具白名单",
+    "type": "list",
+    "hint": "按 LLM 工具名称精确匹配。默认开放 AnySearch 普通搜索和网页提取；批量搜索未默认开放，以控制额度、Token 与等待时间。只加入你亲自确认过的只读查询工具，绝对不要加入浏览器控制、文件、Shell、代码执行、服务器管理或其他可写工具。",
+    "default": [
+      "anysearch_search",
+      "anysearch_extract"
+    ]
+  },
+  "inject_verified_context": {
+    "description": "向模型注入已验证权限状态",
+    "type": "bool",
+    "hint": "推荐开启。权限状态仅在当前请求临时存在，不写入聊天历史；普通角色聊天开始前还会自动清除该技术标签。",
+    "default": true
+  },
+  "permission_audit_log": {
+    "description": "记录工具拦截日志",
+    "type": "bool",
+    "hint": "开启后，AstrBot 日志只记录普通用户请求中被白名单移除的工具数量与脱敏作用域摘要；不记录工具参数、消息正文或原始身份。",
+    "default": true
+  },
+  "persona_name": {
+    "description": "角色名称",
+    "type": "string",
+    "hint": "选择 assets/personas 中已加载且通过校验的人格包显示名。找不到时该轮失败关闭。",
+    "default": "亚托莉"
+  },
+  "replyer_provider_id": {
+    "description": "回复与单次修复模型",
+    "type": "string",
+    "hint": "留空时使用当前 AstrBot 会话模型；指定后用于 typed 回复生成和必要的一次受控修复。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "prefer_livingmemory_group_history": {
+    "description": "优先使用 LivingMemory 群聊身份历史",
+    "type": "bool",
+    "hint": "推荐开启。检测到 LivingMemory 时，星汐会读取其带群 ID、发送者 ID 和昵称的近期消息，避免 AstrBot 原生群聊 contexts 把全群成员压成同一个 user。LivingMemory 不可用时自动安全降级。",
+    "default": true
+  },
+  "max_context_messages": {
+    "description": "当前发送者历史消息数",
+    "type": "int",
+    "hint": "只保留真实 user/assistant 消息，并强制保留来源群 ID、每位群成员的昵称和发送者 ID；无法确认发送者的原生群聊旧轮次会整轮丢弃，防止串人。",
+    "default": 16
+  },
+  "max_context_chars": {
+    "description": "当前发送者历史最大字符数",
+    "type": "int",
+    "hint": "防止群聊历史过长导致延迟和 Token 消耗。",
+    "default": 9000
+  },
+  "enable_chat_bubbles": {
+    "description": "闲聊分成多个聊天气泡",
+    "type": "bool",
+    "hint": "开启后，一至三段自然口语会像真人一样分开发送；内容型长回答不会拆成碎句。",
+    "default": true
+  },
+  "chat_max_bubbles": {
+    "description": "闲聊最多气泡数",
+    "type": "int",
+    "hint": "推荐 2 或 3。多出的完整句会自然合并，不会丢失或硬截断。",
+    "default": 3
+  },
+  "bubble_interval_min_ms": {
+    "description": "气泡最短间隔（毫秒）",
+    "type": "int",
+    "hint": "两条闲聊消息之间的随机等待下限。",
+    "default": 450
+  },
+  "bubble_interval_max_ms": {
+    "description": "气泡最长间隔（毫秒）",
+    "type": "int",
+    "hint": "两条闲聊消息之间的随机等待上限。",
+    "default": 1200
+  },
+  "debug_log": {
+    "description": "输出调试日志",
+    "type": "bool",
+    "hint": "开启后记录 typed 阶段状态和校验命中原因，不记录完整隐藏提示词。",
+    "default": false
+  }
+}

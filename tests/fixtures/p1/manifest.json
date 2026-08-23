@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "privacy": "synthetic_redacted_only",
+  "dimension_values": {
+    "persona": ["primary_character", "warm_character", "calm_character", "neutral_minimal"],
+    "identity": ["owner", "peer_a", "peer_b", "unknown_user", "self_claim_owner"],
+    "conversation": ["private", "solo_group", "fast_multi_user", "parallel_groups"],
+    "ingress": ["human", "banned", "self", "known_bot", "unknown_automation", "plugin_echo", "external_stop"],
+    "plugin": ["livingmemory_ok", "livingmemory_missing", "livingmemory_timeout", "livingmemory_dirty", "anysearch_ok", "anysearch_failed", "anysearch_timeout", "meme_text_and_image", "meme_only", "meme_no_match", "parser_output", "keywords_output", "progress_output"],
+    "address": ["structured_mention", "quoted_self", "vocative_prefix", "vocative_suffix", "emotional_vocative", "third_person_reference", "open_group", "other_people_conversation"],
+    "participation": ["must_reply", "may_join", "react_only", "should_silence", "quiet_initiate"],
+    "memory": ["none", "current_user", "public_group", "other_user_intrusion", "banned_source", "bot_source", "plugin_source", "unknown_subject", "conflicting"],
+    "knowledge": ["common_no_search", "unknown_slang", "current_fact", "explicit_verify", "conflicting_results", "emotional_no_search"],
+    "media": ["none", "direct", "quoted", "reply_id_fallback", "multiple", "image_only", "text_image", "native_caption", "unavailable", "repair"],
+    "tool": ["none", "peer_anysearch", "meme_presentation", "peer_privileged_request", "owner_privileged", "tool_failure", "tool_timeout", "legacy_tool_history"],
+    "affect": ["praise", "tease", "care", "seen_through", "mistake", "hurt", "factual_answer", "conflict_repair"],
+    "output": ["single_bubble", "multi_bubble", "text_meme", "meme_only", "long_answer"],
+    "concurrency": ["none", "new_message_during_generation", "a_b_a", "slow_tool_result", "restart_recovery"],
+    "language": ["chinese", "english_proper_noun", "explicit_translation", "foreign_language_practice", "unexpected_english_switch"]
+  },
+  "scenario_files": [
+    "ingress_identity.json",
+    "address_participation.json",
+    "memory_knowledge_tools.json",
+    "media_presentation.json",
+    "persona_affect_output.json",
+    "concurrency_send.json"
+  ],
+  "required_cross_case_ids": [
+    "ingress.denied_senders.zero_effects",
+    "identity.peer_self_claim.no_escalation",
+    "address.quote.current_principal",
+    "participation.about_self.may_join",
+    "participation.other_people.silence",
+    "memory.subject_boundary",
+    "knowledge.unknown_slang.search",
+    "media.direct.binding",
+    "media.quoted.native_caption",
+    "media.unavailable.repair",
+    "persona.same_intent.ab",
+    "concurrency.slow_tool.stale_drop"
+  ]
+}

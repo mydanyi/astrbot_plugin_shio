@@ -1,0 +1,125 @@
+{
+  "privacy": "synthetic_redacted_only",
+  "cases": [
+    {
+      "id": "memory.subject_boundary",
+      "required_phase": "P2",
+      "dimensions": {
+        "persona": "neutral_minimal",
+        "identity": "peer_a",
+        "conversation": "fast_multi_user",
+        "ingress": "human",
+        "plugin": "livingmemory_dirty",
+        "address": "third_person_reference",
+        "participation": "may_join",
+        "memory": ["public_group", "other_user_intrusion", "conflicting"],
+        "knowledge": "conflicting_results",
+        "media": "none",
+        "tool": "legacy_tool_history",
+        "affect": "conflict_repair",
+        "output": "long_answer",
+        "concurrency": "none",
+        "language": "chinese"
+      },
+      "input": {"scope_alias": "group_a", "turn_aliases": ["peer_a_current", "peer_b_history"]},
+      "stubs": {"livingmemory": "mixed_subjects", "legacy_tool": "unattributed"},
+      "expect": {"current_subject_alias": "peer_a", "other_subject_must_include": 0, "current_message_precedence": true}
+    },
+    {
+      "id": "knowledge.unknown_slang.search",
+      "required_phase": "P3",
+      "dimensions": {
+        "persona": "primary_character",
+        "identity": "peer_a",
+        "conversation": "solo_group",
+        "ingress": "human",
+        "plugin": "anysearch_ok",
+        "address": "vocative_prefix",
+        "participation": "must_reply",
+        "memory": "current_user",
+        "knowledge": "unknown_slang",
+        "media": "none",
+        "tool": "peer_anysearch",
+        "affect": "praise",
+        "output": "long_answer",
+        "concurrency": "none",
+        "language": "english_proper_noun"
+      },
+      "input": {"scope_alias": "group_a", "turn_aliases": ["unknown_term_turn"]},
+      "stubs": {"anysearch": "single_grounded_result", "provider": "single_final_generation"},
+      "expect": {"knowledge_need": "unknown_term", "search_call_count": 1, "tool_protocol_visible": false}
+    },
+    {
+      "id": "knowledge.current_fact.timeout",
+      "required_phase": "P3",
+      "dimensions": {
+        "persona": "calm_character",
+        "identity": "peer_b",
+        "conversation": "private",
+        "ingress": "human",
+        "plugin": "anysearch_timeout",
+        "address": "structured_mention",
+        "participation": "must_reply",
+        "memory": "current_user",
+        "knowledge": "current_fact",
+        "media": "none",
+        "tool": "tool_timeout",
+        "affect": "factual_answer",
+        "output": "long_answer",
+        "concurrency": "slow_tool_result",
+        "language": "english_proper_noun"
+      },
+      "input": {"scope_alias": "private_b", "turn_aliases": ["current_fact_turn"]},
+      "stubs": {"anysearch": "timeout", "clock": "fixed_deadline"},
+      "expect": {"search_call_count": 1, "claim_search_succeeded": false, "visible_failure": "natural"}
+    },
+    {
+      "id": "knowledge.explicit_verify.failure",
+      "required_phase": "P3",
+      "dimensions": {
+        "persona": "neutral_minimal",
+        "identity": "peer_a",
+        "conversation": "solo_group",
+        "ingress": "human",
+        "plugin": "anysearch_failed",
+        "address": "quoted_self",
+        "participation": "must_reply",
+        "memory": "none",
+        "knowledge": "explicit_verify",
+        "media": "none",
+        "tool": "tool_failure",
+        "affect": "factual_answer",
+        "output": "long_answer",
+        "concurrency": "none",
+        "language": "chinese"
+      },
+      "input": {"scope_alias": "group_a", "turn_aliases": ["verification_turn"]},
+      "stubs": {"anysearch": "error", "provider": "honest_failure_reply"},
+      "expect": {"grounding_fact_count": 0, "fabricated_source_count": 0}
+    },
+    {
+      "id": "knowledge.emotional_chat.no_search",
+      "required_phase": "P3",
+      "dimensions": {
+        "persona": "warm_character",
+        "identity": "peer_b",
+        "conversation": "private",
+        "ingress": "human",
+        "plugin": "livingmemory_ok",
+        "address": "vocative_suffix",
+        "participation": "must_reply",
+        "memory": "current_user",
+        "knowledge": "emotional_no_search",
+        "media": "none",
+        "tool": "none",
+        "affect": "care",
+        "output": "multi_bubble",
+        "concurrency": "none",
+        "language": "chinese"
+      },
+      "input": {"scope_alias": "private_b", "turn_aliases": ["emotional_turn"]},
+      "stubs": {"livingmemory": "relevant_current_user", "anysearch": "must_not_call"},
+      "expect": {"knowledge_need": "none", "search_call_count": 0}
+    }
+  ]
+}
