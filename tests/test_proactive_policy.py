@@ -314,8 +314,9 @@ class ProactivePolicyTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertFalse(schema["proactive_initiation_enabled"]["default"])
-        self.assertEqual(schema["proactive_group_allowlist"]["default"], [])
+        proactive = schema["proactive_settings"]["items"]
+        self.assertFalse(proactive["proactive_initiation_enabled"]["default"])
+        self.assertEqual(proactive["proactive_group_allowlist"]["default"], [])
 
         with tempfile.TemporaryDirectory() as root:
             FakeStarTools.data_dir = Path(root)

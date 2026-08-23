@@ -412,7 +412,7 @@ def _validated_presentation_values(
     elif (
         capability_policy is not composer_request.capability_policy
         or capability_policy.principal_key != binding.current_sender_key
-        or capability_policy.conversation_mode != "direct_reply"
+        or capability_policy.conversation_mode not in {"direct_reply", "group_join"}
         or capability_policy.is_degraded
     ):
         reasons.append("presentation_principal_mismatch")

@@ -168,7 +168,7 @@ def _require_reconcile_bindings(
         raise ContractViolation("planner_capability_policy_required")
     if capability_policy.principal_key != binding.current_sender_key:
         raise ContractViolation("planner_capability_principal_mismatch")
-    if capability_policy.conversation_mode != "direct_reply":
+    if capability_policy.conversation_mode not in {"direct_reply", "group_join"}:
         raise ContractViolation("planner_capability_mode_mismatch")
     return binding
 
@@ -909,7 +909,11 @@ def reconcile_action(
             )
         reasons = ("knowledge_capability_denied_reply",)
     else:
-        reasons = ("direct_reply_ready",)
+        reasons = (
+            "group_join_ready"
+            if capability_policy.conversation_mode == "group_join"
+            else "direct_reply_ready",
+        )
 
     action = ActionDecision(
         binding=binding,

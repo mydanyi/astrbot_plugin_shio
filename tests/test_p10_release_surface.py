@@ -7,17 +7,26 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
-RELEASE_VERSION = "0.5.10"
+RELEASE_VERSION = "0.5.14"
 
 
 def _text(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
+def _fields(schema: dict) -> dict:
+    return {
+        key: field
+        for section in schema.values()
+        for key, field in section["items"].items()
+    }
+
+
 class P10ReleaseSurfaceTests(unittest.TestCase):
     def test_name_wake_mode_is_visible_inside_the_name_wake_group(self):
         schema = json.loads(_text("_conf_schema.json"))
-        keys = tuple(schema)
+        wake = schema["wake_settings"]["items"]
+        keys = tuple(wake)
 
         enabled_index = keys.index("natural_name_wake_enabled")
         self.assertEqual(
@@ -29,7 +38,7 @@ class P10ReleaseSurfaceTests(unittest.TestCase):
                 "natural_name_wake_group_whitelist",
             ),
         )
-        mode = schema["natural_name_wake_mode"]
+        mode = wake["natural_name_wake_mode"]
         self.assertEqual(mode["description"], "称名唤醒方式")
         self.assertEqual(mode["options"], ["natural", "contains"])
         self.assertEqual(
@@ -46,21 +55,24 @@ class P10ReleaseSurfaceTests(unittest.TestCase):
         self.assertIn(f"astrbot_plugin_shio_v{RELEASE_VERSION}_upload.zip", readme)
         self.assertRegex(
             changelog,
-            rf"(?m)^## {re.escape(RELEASE_VERSION)} - 2026-08-20$",
+            rf"(?m)^## {re.escape(RELEASE_VERSION)} - 2026-08-23$",
         )
         self.assertIn('astrbot_version: ">=4.26.7,<5"', metadata)
 
     def test_schema_is_current_closed_and_high_risk_defaults_are_all_off(self):
         schema = json.loads(_text("_conf_schema.json"))
-        self.assertEqual(len(schema), 51)
-        self.assertIs(schema["meme_complement_enabled"]["default"], True)
-        self.assertEqual(schema["meme_complement_cadence_turns"]["default"], 4)
-        self.assertEqual(schema["meme_complement_cooldown_turns"]["default"], 4)
+        fields = _fields(schema)
+        self.assertEqual(len(schema), 8)
+        self.assertEqual(len(fields), 57)
+        self.assertIs(fields["meme_complement_enabled"]["default"], True)
+        self.assertEqual(fields["meme_complement_cadence_turns"]["default"], 4)
+        self.assertEqual(fields["meme_complement_cooldown_turns"]["default"], 4)
         self.assertIn(
             "Meme Manager",
-            schema["meme_complement_cadence_turns"]["hint"],
+            fields["meme_complement_cadence_turns"]["hint"],
         )
         for key in (
+            "natural_group_participation_enabled",
             "proactive_initiation_enabled",
             "owner_action_enabled",
             "owner_action_artifact_read_exact_enabled",
@@ -68,17 +80,19 @@ class P10ReleaseSurfaceTests(unittest.TestCase):
             "owner_action_memory_write_literal_enabled",
             "owner_action_sandbox_shell_once_enabled",
         ):
-            self.assertIs(schema[key]["default"], False, key)
-        self.assertEqual(schema["proactive_group_allowlist"]["default"], [])
-        self.assertEqual(schema["owner_ids"]["default"], [])
-        self.assertIn("代码级永久关闭", schema["owner_action_sandbox_shell_once_enabled"]["hint"])
-        self.assertNotIn("部分名称", schema["permission_audit_log"]["hint"])
+            self.assertIs(fields[key]["default"], False, key)
+        self.assertEqual(fields["natural_group_participation_allowlist"]["default"], [])
+        self.assertEqual(fields["proactive_group_allowlist"]["default"], [])
+        self.assertEqual(fields["owner_ids"]["default"], [])
+        self.assertIn("代码级永久关闭", fields["owner_action_sandbox_shell_once_enabled"]["hint"])
+        self.assertNotIn("部分名称", fields["permission_audit_log"]["hint"])
 
     def test_every_schema_field_has_public_shape_runtime_read_and_audit_entry(self):
         schema = json.loads(_text("_conf_schema.json"))
+        fields = _fields(schema)
         source = _text("main.py")
         audit = _text("docs/CONFIG_AUDIT.md")
-        for key, field in schema.items():
+        for key, field in fields.items():
             with self.subTest(key=key):
                 self.assertEqual(
                     set(field).intersection({"description", "type", "default"}),
@@ -102,7 +116,7 @@ class P10ReleaseSurfaceTests(unittest.TestCase):
         )
         for required in (
             "1,200+",
-            "51",
+            "57",
             "X-01",
             "O1",
             "仅图片",

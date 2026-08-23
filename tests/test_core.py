@@ -86,7 +86,10 @@ class CoreTests(unittest.TestCase):
     def test_public_default_owner_list_is_empty(self):
         schema_path = Path(__file__).parents[1] / "_conf_schema.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
-        self.assertEqual(schema["owner_ids"]["default"], [])
+        self.assertEqual(
+            schema["permission_settings"]["items"]["owner_ids"]["default"],
+            [],
+        )
 
 
     def test_detects_deepseek_dsml_protocol_with_fullwidth_bars(self):

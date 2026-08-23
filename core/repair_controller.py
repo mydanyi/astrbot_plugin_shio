@@ -400,6 +400,7 @@ def build_safe_direct_reply_fallback(
     if (
         type(planned_action) is not PlannedAction
         or planned_action.kind is not ActionKind.REPLY
+        or original_request.capability_policy.conversation_mode != "direct_reply"
         or original_request.evidence_outcome is not None
         or original_request.action_outcome is not None
         or original_request.action_outcome_authority is not None

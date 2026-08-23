@@ -209,17 +209,16 @@ def build_guest_capability_policy(
 ) -> CapabilityPolicy:
     """Build the P3-02 guest policy from trusted structural identity only.
 
-    Owner policies use a separate builder. If this builder is called with an
-    owner or non-direct mode, external capabilities fail
-    closed instead of silently inheriting guest access.
+    Owner policies use a separate builder. Natural group participation is a
+    supported text-only mode; every external capability still fails closed.
     """
 
     mode = str(conversation_mode or "direct_reply").strip().lower()
     reasons: list[str] = []
     if principal.is_owner:
         reasons.append("owner_policy_not_applicable")
-    if mode != "direct_reply":
-        reasons.append("non_direct_mode")
+    if mode not in {"direct_reply", "group_join"}:
+        reasons.append("unsupported_conversation_mode")
     if not principal.sender_id or not principal.sender_key:
         reasons.append("identity_unavailable")
     if principal.relationship_role not in {"group_peer", "private_peer"}:
@@ -228,6 +227,7 @@ def build_guest_capability_policy(
         reasons.append("identity_unverified")
 
     guest_verified = not reasons
+    external_tools_allowed = guest_verified and mode == "direct_reply"
     return CapabilityPolicy(
         principal_key=principal.sender_key,
         policy_kind="guest",
@@ -238,9 +238,9 @@ def build_guest_capability_policy(
         # Text conversation remains available even when external capabilities
         # fail closed; callers must still avoid attributing unverified identity.
         chat_read=True,
-        public_web_read=guest_verified,
-        chat_retrieval=guest_verified,
-        local_presentation=guest_verified,
+        public_web_read=external_tools_allowed,
+        chat_retrieval=external_tools_allowed,
+        local_presentation=external_tools_allowed,
         media_generation=False,
         memory_write=False,
         artifact_read=False,
@@ -248,8 +248,8 @@ def build_guest_capability_policy(
         shell_exec=False,
         device_control=False,
         agent_full=False,
-        max_external_tool_calls=2 if guest_verified else 0,
-        max_local_presentation_calls=1 if guest_verified else 0,
+        max_external_tool_calls=2 if external_tools_allowed else 0,
+        max_local_presentation_calls=1 if external_tools_allowed else 0,
         requires_explicit_tool_name=True,
         explicitly_configured_tools=_configured_tool_names(configured_tool_names),
         degradation_reasons=tuple(reasons),
@@ -275,10 +275,11 @@ def build_owner_capability_policy(
         reasons.append("owner_source_untrusted")
     if not principal.verification_source.endswith(":configured_owner_id"):
         reasons.append("owner_allowlist_not_verified")
-    if mode != "direct_reply":
-        reasons.append("non_direct_mode")
+    if mode not in {"direct_reply", "group_join"}:
+        reasons.append("unsupported_conversation_mode")
 
     owner_verified = not reasons
+    external_tools_allowed = owner_verified and mode == "direct_reply"
     return CapabilityPolicy(
         principal_key=principal.sender_key,
         policy_kind="owner",
@@ -287,20 +288,20 @@ def build_owner_capability_policy(
         verification_source=principal.verification_source,
         conversation_mode=mode,
         chat_read=True,
-        public_web_read=owner_verified,
-        chat_retrieval=owner_verified,
-        local_presentation=owner_verified,
-        media_generation=owner_verified,
-        memory_write=owner_verified,
-        artifact_read=owner_verified,
-        artifact_write=owner_verified,
-        shell_exec=owner_verified,
-        device_control=owner_verified,
-        agent_full=owner_verified,
+        public_web_read=external_tools_allowed,
+        chat_retrieval=external_tools_allowed,
+        local_presentation=external_tools_allowed,
+        media_generation=external_tools_allowed,
+        memory_write=external_tools_allowed,
+        artifact_read=external_tools_allowed,
+        artifact_write=external_tools_allowed,
+        shell_exec=external_tools_allowed,
+        device_control=external_tools_allowed,
+        agent_full=external_tools_allowed,
         # -1 means Shio does not add a call-count limit beyond AstrBot's own
         # owner Agent loop and provider constraints.
-        max_external_tool_calls=-1 if owner_verified else 0,
-        max_local_presentation_calls=-1 if owner_verified else 0,
+        max_external_tool_calls=-1 if external_tools_allowed else 0,
+        max_local_presentation_calls=-1 if external_tools_allowed else 0,
         requires_explicit_tool_name=False,
         explicitly_configured_tools=frozenset(),
         degradation_reasons=tuple(reasons),

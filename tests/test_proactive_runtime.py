@@ -60,6 +60,13 @@ class ProactiveRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.temp.cleanup()
 
     def _human(self, message: str, *, created_at: float = 1000.0):
+        if self.turn == 0:
+            self.turn += 1
+            prior = FakeEvent("peer-b", "刚才的话题还没聊完", group_id="group-a")
+            prior.message_id = f"p7-runtime-{self.turn}"
+            prior.created_at = created_at + self.turn
+            admission = self.plugin.admit_ingress_event(prior)
+            self.assertTrue(admission.decision.allows_state_mutation)
         self.turn += 1
         event = FakeEvent("peer-a", message, group_id="group-a")
         event.message_id = f"p7-runtime-{self.turn}"
@@ -93,6 +100,7 @@ class ProactiveRuntimeTests(unittest.IsolatedAsyncioTestCase):
         return self.plugin.proactive_execution_authority.prepare(
             plan,
             persona=persona,
+            temporal_context=self.plugin._build_temporal_context(now=now),
         )
 
     async def test_exact_plan_becomes_zero_tool_request_and_single_segment_send(self):
@@ -111,6 +119,10 @@ class ProactiveRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["contexts"], [])
         self.assertEqual(call["request_max_retries"], 1)
         self.assertNotIn("peer-a", call["system_prompt"] + call["prompt"])
+        self.assertNotIn("peer-b", call["system_prompt"] + call["prompt"])
+        self.assertIn("刚才的话题还没聊完", call["prompt"])
+        self.assertIn("大家晚饭吃什么", call["prompt"])
+        self.assertIn("server_clock", call["system_prompt"])
         self.assertEqual(len(self.context.proactive_messages), 1)
         session, chain = self.context.proactive_messages[0]
         self.assertEqual(session, "aiocqhttp:GroupMessage:123")
@@ -175,6 +187,24 @@ class ProactiveRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.plugin._run_proactive_scheduler_once(now=2100.0), 1)
         await self.plugin.proactive_scheduler_runtime.wait_idle()
         self.assertEqual(len(self.context.proactive_messages), 2)
+
+    async def test_ungrounded_scene_is_silent_without_spending_policy_cooldown(self):
+        self._human("今天天气真不错")
+        self.assertEqual(await self.plugin._run_proactive_scheduler_once(now=2000.0), 0)
+        self.assertEqual(self.context.provider.calls, [])
+        self.assertEqual(self.context.proactive_messages, [])
+        self.assertEqual(
+            self.plugin.proactive_scheduler_runtime.trace_metadata()[
+                "proactive_scheduler_terminal_error_count"
+            ],
+            0,
+        )
+
+        self.context.provider.outputs.append("说到晚饭，我忽然也有点想吃面了。")
+        self._human("大家晚饭吃什么？", created_at=2001.0)
+        self.assertEqual(await self.plugin._run_proactive_scheduler_once(now=2100.0), 1)
+        await self.plugin.proactive_scheduler_runtime.wait_idle()
+        self.assertEqual(len(self.context.proactive_messages), 1)
 
     async def test_new_human_message_cancels_cancel_safe_provider(self):
         started = asyncio.Event()

@@ -15,7 +15,7 @@ from .contracts import (
     ParticipationDecision,
     ParticipationLevel,
 )
-from .group_scene import GroupSceneBook, GroupSceneSnapshot
+from .group_scene import GroupSceneBook, GroupSceneSnapshot, SceneEntrySource
 from .opportunity_attention import (
     OpportunityAttentionAuthority,
     OpportunityAttentionDecision,
@@ -121,6 +121,8 @@ class ParticipationAssessment:
     interruption_cost: float
     response_value: float
     recent_presence: float
+    context_message_count: int
+    opportunistic_join_enabled: bool
     reason_codes: tuple[str, ...]
     _authority_ref: weakref.ReferenceType[ParticipationAuthority] = field(
         repr=False,
@@ -152,6 +154,10 @@ class ParticipationAssessment:
             "participation_interruption_cost": self.interruption_cost,
             "participation_response_value": self.response_value,
             "participation_recent_presence": self.recent_presence,
+            "participation_context_message_count": self.context_message_count,
+            "participation_opportunistic_join_enabled": (
+                self.opportunistic_join_enabled
+            ),
             "participation_reason_count": len(self.reason_codes),
             "participation_canonical": True,
         }
@@ -182,6 +188,8 @@ def _assessment_snapshot(assessment: ParticipationAssessment) -> tuple[object, .
             assessment.interruption_cost,
             assessment.response_value,
             assessment.recent_presence,
+            assessment.context_message_count,
+            assessment.opportunistic_join_enabled,
             assessment.reason_codes,
             assessment._authority_ref,
             assessment._seal,
@@ -195,10 +203,13 @@ def _assessment_snapshot(assessment: ParticipationAssessment) -> tuple[object, .
         or type(values[3]) is not ParticipationDecision
         or type(values[4]) is not str
         or any(type(value) is not float for value in values[5:12])
-        or type(values[12]) is not tuple
-        or any(type(value) is not str for value in values[12])
-        or type(values[13]) is not weakref.ReferenceType
-        or values[14] is not _ASSESSMENT_SEAL
+        or type(values[12]) is not int
+        or values[12] < 0
+        or type(values[13]) is not bool
+        or type(values[14]) is not tuple
+        or any(type(value) is not str for value in values[14])
+        or type(values[15]) is not weakref.ReferenceType
+        or values[16] is not _ASSESSMENT_SEAL
     ):
         raise ContractViolation("participation_assessment_corrupt")
     attention = assessment.attention
@@ -308,11 +319,20 @@ def _build_participation_vault():
         persona: PersonaPackage,
         current_message: str,
         scene: GroupSceneSnapshot | None,
+        opportunistic_join_enabled: bool,
+        minimum_context_messages: int,
     ) -> ParticipationAssessment:
         if type(opportunity) is not OpportunityAttentionDecision:
             raise ContractViolation("participation_opportunity_required")
         if type(current_message) is not str or not current_message:
             raise ContractViolation("participation_message_required")
+        if type(opportunistic_join_enabled) is not bool:
+            raise ContractViolation("participation_join_enabled_invalid")
+        if (
+            type(minimum_context_messages) is not int
+            or not 1 <= minimum_context_messages <= 16
+        ):
+            raise ContractViolation("participation_minimum_context_invalid")
         with lock:
             state = state_for(authority)
             context = state.opportunity_authority.context_for(opportunity)
@@ -347,7 +367,15 @@ def _build_participation_vault():
             else:
                 self_relevance = 0.0
 
-            folded = current_message.casefold()
+            recent_human_topics = tuple(
+                topic
+                for topic in (scene.public_topics[-12:] if scene is not None else ())
+                if topic.source is SceneEntrySource.HUMAN_INBOUND
+            )
+            context_message_count = len(recent_human_topics)
+            folded = "\n".join(
+                topic.content for topic in recent_human_topics
+            ).casefold()
             interest_relevance = max(
                 (
                     interest.weight
@@ -395,6 +423,16 @@ def _build_participation_vault():
                 response_value = 0.0
                 level = ParticipationLevel.NO_ACTION
                 reasons = ("attention_wait_no_participation",)
+            elif not opportunistic_join_enabled:
+                interruption_cost = 1.0
+                response_value = 0.0
+                level = ParticipationLevel.NO_ACTION
+                reasons = ("opportunistic_group_join_disabled",)
+            elif context_message_count < minimum_context_messages:
+                interruption_cost = 1.0
+                response_value = 0.0
+                level = ParticipationLevel.NO_ACTION
+                reasons = ("verified_group_context_too_shallow",)
             elif address_kind is AddressKind.ABOUT_SELF:
                 interruption_cost = _score(
                     0.12 + recent_presence * 0.35 + rhythm_density * 0.08
@@ -483,6 +521,8 @@ def _build_participation_vault():
                 ("interruption_cost", interruption_cost),
                 ("response_value", response_value),
                 ("recent_presence", recent_presence),
+                ("context_message_count", context_message_count),
+                ("opportunistic_join_enabled", opportunistic_join_enabled),
                 ("reason_codes", reasons),
                 ("_authority_ref", authority_ref),
                 ("_seal", _ASSESSMENT_SEAL),
@@ -593,6 +633,8 @@ class ParticipationAuthority:
         persona: PersonaPackage,
         current_message: str,
         scene: GroupSceneSnapshot | None,
+        opportunistic_join_enabled: bool = True,
+        minimum_context_messages: int = 2,
     ) -> ParticipationAssessment:
         return _issue_participation(
             self,
@@ -600,6 +642,8 @@ class ParticipationAuthority:
             persona=persona,
             current_message=current_message,
             scene=scene,
+            opportunistic_join_enabled=opportunistic_join_enabled,
+            minimum_context_messages=minimum_context_messages,
         )
 
     def inspect(

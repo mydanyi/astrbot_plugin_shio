@@ -8,7 +8,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from .contracts import ContractViolation
-from .group_scene import GroupSceneBook, GroupSceneSnapshot, PublicTopic
+from .group_scene import (
+    GroupSceneBook,
+    GroupSceneSnapshot,
+    PublicTopic,
+    SceneEntrySource,
+)
 from .persona import (
     ParticipationInterest,
     PersonaPackage,
@@ -86,6 +91,8 @@ class ProactiveTopicPlan:
     source: ProactiveTopicSource
     topic_text: str = field(repr=False)
     topic_digest: str = field(repr=False)
+    recent_public_context: tuple[str, ...] = field(repr=False)
+    public_context_digest: str = field(repr=False)
     interest_id: str
     scene_revision: int
     model_authorized: bool
@@ -119,6 +126,9 @@ class ProactiveTopicPlan:
             "proactive_topic_canonical": True,
             "proactive_topic_source": record.source.value,
             "proactive_topic_scene_revision": record.scene_revision,
+            "proactive_topic_context_message_count": len(
+                record.recent_public_context
+            ),
             "proactive_topic_bound": True,
             "proactive_model_authorized": False,
             "proactive_send_authorized": False,
@@ -148,6 +158,8 @@ class _PlanRecord:
     interest: ParticipationInterest
     topic_text: str
     topic_digest: str
+    recent_public_context: tuple[str, ...]
+    public_context_digest: str
     interest_id: str
     scene_revision: int
     snapshot: tuple[object, ...]
@@ -206,6 +218,8 @@ def _plan_snapshot(plan: ProactiveTopicPlan) -> tuple[object, ...]:
             plan.source,
             plan.topic_text,
             plan.topic_digest,
+            plan.recent_public_context,
+            plan.public_context_digest,
             plan.interest_id,
             plan.scene_revision,
             plan.model_authorized,
@@ -223,16 +237,21 @@ def _plan_snapshot(plan: ProactiveTopicPlan) -> tuple[object, ...]:
         or not values[3]
         or type(values[4]) is not str
         or _digest_text(values[3]) != values[4]
-        or type(values[5]) is not str
-        or not values[5]
-        or type(values[6]) is not int
-        or values[6] < 1
-        or type(values[7]) is not bool
-        or values[7]
-        or type(values[8]) is not bool
-        or values[8]
-        or type(values[9]) is not weakref.ReferenceType
-        or values[10] is not _PLAN_SEAL
+        or type(values[5]) is not tuple
+        or len(values[5]) < 2
+        or any(type(value) is not str or not value for value in values[5])
+        or type(values[6]) is not str
+        or _digest_text("\n".join(values[5])) != values[6]
+        or type(values[7]) is not str
+        or not values[7]
+        or type(values[8]) is not int
+        or values[8] < 1
+        or type(values[9]) is not bool
+        or values[9]
+        or type(values[10]) is not bool
+        or values[10]
+        or type(values[11]) is not weakref.ReferenceType
+        or values[12] is not _PLAN_SEAL
     ):
         raise ContractViolation("proactive_topic_plan_corrupt")
     return values
@@ -299,6 +318,34 @@ class ProactiveTopicAuthority:
             raise ContractViolation("proactive_topic_persona_corrupt")
         return current
 
+    def has_grounded_context(
+        self,
+        scene: GroupSceneSnapshot,
+        *,
+        persona: PersonaPackage,
+    ) -> bool:
+        """Preflight topic availability without consuming a policy decision.
+
+        This keeps an ungrounded or too-shallow scene silent without spending
+        cooldown/daily quota. Corrupt or cross-authority inputs still raise.
+        """
+
+        with self._lock:
+            self._inspect_persona(persona)
+            self._group_scenes.inspect_current_snapshot(scene)
+            try:
+                self._selection(scene, persona)
+                self._recent_public_context(scene, persona)
+            except ContractViolation as exc:
+                if str(exc) in {
+                    "proactive_topic_context_too_shallow",
+                    "proactive_topic_no_grounded_match",
+                    "proactive_topic_unavailable",
+                }:
+                    return False
+                raise
+            return True
+
     @staticmethod
     def _selection(
         scene: GroupSceneSnapshot,
@@ -312,10 +359,18 @@ class ProactiveTopicAuthority:
         interests = persona.participation_interests
         if not interests:
             raise ContractViolation("proactive_topic_unavailable")
+        recent_topics = scene.public_topics[-12:]
+        recent_human_topics = tuple(
+            topic
+            for topic in recent_topics
+            if topic.source is SceneEntrySource.HUMAN_INBOUND
+        )
+        if len(recent_human_topics) < 2:
+            raise ContractViolation("proactive_topic_context_too_shallow")
         matches: list[
             tuple[float, int, int, PublicTopic, ParticipationInterest]
         ] = []
-        for topic_index, topic in enumerate(scene.public_topics):
+        for topic_index, topic in enumerate(recent_human_topics):
             folded = topic.content.casefold()
             for interest in interests:
                 if any(keyword.casefold() in folded for keyword in interest.keywords):
@@ -336,16 +391,35 @@ class ProactiveTopicAuthority:
                 interest,
                 topic.content,
             )
-        interest = max(
-            enumerate(interests),
-            key=lambda value: (value[1].weight, -value[0]),
-        )[1]
-        return (
-            ProactiveTopicSource.PERSONA_INTEREST,
-            None,
-            interest,
-            interest.keywords[0],
-        )
+        raise ContractViolation("proactive_topic_no_grounded_match")
+
+    @staticmethod
+    def _recent_public_context(
+        scene: GroupSceneSnapshot,
+        persona: PersonaPackage,
+    ) -> tuple[str, ...]:
+        labels: dict[str, str] = {}
+        lines: list[str] = []
+        total_chars = 0
+        for topic in scene.public_topics[-8:]:
+            if topic.source is SceneEntrySource.HUMAN_INBOUND:
+                label = labels.setdefault(
+                    topic.author_sender_key,
+                    f"群友{len(labels) + 1}",
+                )
+            elif topic.source is SceneEntrySource.SHIO_OUTBOUND:
+                label = persona.display_name
+            else:
+                continue
+            content = " ".join(topic.content.split())[:600]
+            line = f"{label}：{content}"
+            if not content or total_chars + len(line) > 4000:
+                continue
+            lines.append(line)
+            total_chars += len(line)
+        if len(lines) < 2:
+            raise ContractViolation("proactive_topic_context_too_shallow")
+        return tuple(lines)
 
     def select(
         self,
@@ -370,6 +444,8 @@ class ProactiveTopicAuthority:
                 raise ContractViolation("proactive_topic_scene_mismatch")
             source, public_topic, interest, topic_text = self._selection(scene, persona)
             topic_digest = _digest_text(topic_text)
+            recent_public_context = self._recent_public_context(scene, persona)
+            public_context_digest = _digest_text("\n".join(recent_public_context))
             plan = object.__new__(ProactiveTopicPlan)
             for name, value in (
                 ("policy_decision", policy_decision),
@@ -377,6 +453,8 @@ class ProactiveTopicAuthority:
                 ("source", source),
                 ("topic_text", topic_text),
                 ("topic_digest", topic_digest),
+                ("recent_public_context", recent_public_context),
+                ("public_context_digest", public_context_digest),
                 ("interest_id", interest.id),
                 ("scene_revision", scene.conversation_revision),
                 ("model_authorized", False),
@@ -398,6 +476,8 @@ class ProactiveTopicAuthority:
                 interest=interest,
                 topic_text=topic_text,
                 topic_digest=topic_digest,
+                recent_public_context=recent_public_context,
+                public_context_digest=public_context_digest,
                 interest_id=interest.id,
                 scene_revision=scene.conversation_revision,
                 snapshot=snapshot,

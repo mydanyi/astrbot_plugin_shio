@@ -83,6 +83,7 @@ from .core.conversation_ledger import (
     PlatformGroupHistoryRead,
     PlatformGroupHistoryStatus,
     adapt_astrbot_history,
+    has_verified_public_group_context,
     ledger_content_digest,
     read_astrbot_group_history,
     records_for_sender_thread,
@@ -362,6 +363,107 @@ SHIO_SEND_OBSERVATION = "_shio_send_observation"
 SHIO_NATURAL_WAKE = "_shio_natural_name_wake"
 SHIO_TYPED_HISTORY_SOURCE = "_shio_typed_history_source"
 SHIO_PLATFORM_GROUP_HISTORY = "_shio_platform_group_history_v1"
+
+_CONFIG_GROUP_BY_KEY = {
+    **dict.fromkeys(
+        (
+            "enabled",
+            "persona_name",
+            "replyer_provider_id",
+            "enable_chat_bubbles",
+            "chat_max_bubbles",
+            "bubble_interval_min_ms",
+            "bubble_interval_max_ms",
+        ),
+        "basic_settings",
+    ),
+    **dict.fromkeys(
+        (
+            "natural_name_wake_enabled",
+            "natural_name_wake_mode",
+            "natural_name_wake_aliases",
+            "natural_name_wake_group_whitelist",
+        ),
+        "wake_settings",
+    ),
+    **dict.fromkeys(
+        (
+            "natural_group_participation_enabled",
+            "natural_group_participation_allowlist",
+            "natural_group_participation_min_context_messages",
+            "natural_group_participation_cooldown_seconds",
+            "natural_group_participation_window_minutes",
+            "natural_group_participation_max_joins_per_window",
+            "social_feedback_enabled",
+            "social_feedback_window_minutes",
+        ),
+        "participation_settings",
+    ),
+    **dict.fromkeys(
+        (
+            "proactive_initiation_enabled",
+            "proactive_group_allowlist",
+            "proactive_active_hour_start",
+            "proactive_active_hour_end",
+            "proactive_timezone_offset_minutes",
+            "proactive_observation_minutes",
+            "proactive_idle_minutes",
+            "proactive_cooldown_minutes",
+            "proactive_daily_limit",
+            "proactive_scheduler_interval_seconds",
+        ),
+        "proactive_settings",
+    ),
+    **dict.fromkeys(
+        (
+            "prefer_livingmemory_group_history",
+            "max_context_messages",
+            "max_context_chars",
+            "inject_verified_context",
+        ),
+        "context_settings",
+    ),
+    **dict.fromkeys(
+        (
+            "meme_complement_enabled",
+            "meme_complement_cadence_turns",
+            "meme_complement_cooldown_turns",
+        ),
+        "meme_settings",
+    ),
+    **dict.fromkeys(
+        (
+            "owner_ids",
+            "trusted_bot_identities",
+            "permission_guard_enabled",
+            "guest_allowed_tools",
+            "permission_audit_log",
+            "owner_action_enabled",
+            "owner_action_artifact_read_exact_enabled",
+            "owner_action_artifact_grep_enabled",
+            "owner_action_memory_write_literal_enabled",
+            "owner_action_sandbox_shell_once_enabled",
+            "owner_action_artifact_root",
+            "owner_action_artifact_path_flavor",
+            "owner_action_shell_family",
+        ),
+        "permission_settings",
+    ),
+    **dict.fromkeys(
+        (
+            "inference_max_parallel",
+            "inference_max_waiters",
+            "inference_queue_timeout_seconds",
+            "inference_active_timeout_seconds",
+            "performance_window_samples",
+            "continuity_max_scopes",
+            "continuity_max_subjects",
+            "debug_log",
+        ),
+        "performance_settings",
+    ),
+}
+_MISSING_CONFIG_VALUE = object()
 SHIO_TYPED_INBOUND_RECORDED = "_shio_typed_inbound_recorded"
 SHIO_TYPED_INBOUND_RECORD = "_shio_typed_inbound_record_v1"
 SHIO_ASSEMBLED_CONTEXT_V2 = "_shio_assembled_context_v2"
@@ -499,6 +601,41 @@ class ShioPlugin(Star):
         self.participation_cadence_authority = ParticipationCadenceAuthority(
             self.participation_authority,
             continuity_store=self.runtime_continuity,
+            join_cooldown_seconds=float(
+                max(
+                    1,
+                    min(
+                        3600,
+                        self._config_int(
+                            "natural_group_participation_cooldown_seconds",
+                            45,
+                        ),
+                    ),
+                )
+            ),
+            window_seconds=float(
+                max(
+                    1,
+                    min(
+                        1440,
+                        self._config_int(
+                            "natural_group_participation_window_minutes",
+                            5,
+                        ),
+                    ),
+                )
+                * 60
+            ),
+            max_joins_per_window=max(
+                1,
+                min(
+                    20,
+                    self._config_int(
+                        "natural_group_participation_max_joins_per_window",
+                        2,
+                    ),
+                ),
+            ),
         )
         self.participation_reaction_authority = ParticipationReactionAuthority(
             self.participation_cadence_authority,
@@ -637,6 +774,13 @@ class ShioPlugin(Star):
         self._ensure_proactive_scheduler_started()
 
     def _config(self, key: str, default: Any) -> Any:
+        group_name = _CONFIG_GROUP_BY_KEY.get(key)
+        if group_name:
+            group = self.config.get(group_name, _MISSING_CONFIG_VALUE)
+            if hasattr(group, "get"):
+                value = group.get(key, _MISSING_CONFIG_VALUE)
+                if value is not _MISSING_CONFIG_VALUE:
+                    return default if value is None else value
         value = self.config.get(key, default)
         return default if value is None else value
 
@@ -957,6 +1101,17 @@ class ShioPlugin(Star):
         else:
             values = []
         return {str(item).strip() for item in values if str(item).strip()}
+
+    def _natural_group_participation_enabled(self, envelope: TurnEnvelope) -> bool:
+        """Keep opportunistic joining independent from cold-silence scheduling."""
+
+        if envelope.chat_type != "group" or not self._config_bool(
+            "natural_group_participation_enabled",
+            False,
+        ):
+            return False
+        allowlist = self._string_set("natural_group_participation_allowlist")
+        return bool(allowlist and envelope.group_id in allowlist)
 
     def _build_trusted_bot_registry(self) -> tuple[TrustedBotRegistry, bool]:
         """Build an exact structural bot registry from ``platform|sender`` rows."""
@@ -2834,6 +2989,19 @@ class ShioPlugin(Star):
                                 if envelope.chat_type == "group"
                                 else None
                             ),
+                            opportunistic_join_enabled=(
+                                self._natural_group_participation_enabled(envelope)
+                            ),
+                            minimum_context_messages=max(
+                                2,
+                                min(
+                                    16,
+                                    self._config_int(
+                                        "natural_group_participation_min_context_messages",
+                                        2,
+                                    ),
+                                ),
+                            ),
                         )
                         participation_cadence = (
                             self.participation_cadence_authority.issue(
@@ -3477,7 +3645,7 @@ class ShioPlugin(Star):
                 principal=principal,
                 reply_target=target,
                 current_message=current_message,
-                conversation_mode="direct_reply",
+                conversation_mode=capability_policy.conversation_mode,
             )
             affect_mutation = event.get_extra(SHIO_AFFECT_STATE_MUTATION, None)
             continuous_affect = self.affect_states.issue_render_context(
@@ -3521,7 +3689,7 @@ class ShioPlugin(Star):
                 persona_package,
                 appraisal,
                 principal=principal,
-                conversation_mode="direct_reply",
+                conversation_mode=capability_policy.conversation_mode,
                 recent_visible_replies=tuple(recent_replies),
             )
             feedback_scores = (
@@ -3730,7 +3898,7 @@ class ShioPlugin(Star):
                 "group_id": str(identity_scope.get("group_id", "")),
                 "identity_key": principal.sender_key,
                 "is_owner": principal.is_owner,
-                "conversation_mode": "direct_reply",
+                "conversation_mode": capability_policy.conversation_mode,
                 "scope_key": scope_key,
                 "target_sequence": 0,
                 "history_source": "typed_assembled",
@@ -3953,7 +4121,19 @@ class ShioPlugin(Star):
             )
             return
 
-        conversation_mode = "direct_reply"
+        wake_metadata = event.get_extra(SHIO_NATURAL_WAKE, None)
+        wake_reason = (
+            str(wake_metadata.get("reason", "") or "").strip()
+            if isinstance(wake_metadata, dict)
+            else ""
+        )
+        conversation_mode = (
+            "group_join"
+            if turn_envelope.chat_type == "group"
+            and wake_reason
+            in {"participation_may_join", "participation_react_only"}
+            else "direct_reply"
+        )
         principal = self._effective_principal(event)
         identity_scope = event.get_extra(SHIO_IDENTITY_SCOPE, None)
         if not isinstance(identity_scope, dict):
@@ -4192,6 +4372,40 @@ class ShioPlugin(Star):
             identity_scope=identity_scope,
         )
         assembled_context = event.get_extra(SHIO_ASSEMBLED_CONTEXT_V2, None)
+        prior_group_join_records = (
+            tuple(
+                record
+                for record in (
+                    *assembled_context.replyer_thread,
+                    *assembled_context.public_background,
+                )
+                if not (
+                    record.role is LedgerRole.USER
+                    and record.message_id
+                    and record.message_id == reply_target.message_id
+                )
+            )
+            if isinstance(assembled_context, AssembledContext)
+            else ()
+        )
+        if conversation_mode == "group_join" and (
+            not isinstance(assembled_context, AssembledContext)
+            or not has_verified_public_group_context(prior_group_join_records)
+        ):
+            structured_log(
+                logger,
+                "info",
+                "participation.context_unavailable",
+                trace_id=get_trace_id(event),
+                conversation_mode=conversation_mode,
+                verified_public_context_count=0,
+            )
+            self._block_typed_turn(
+                event,
+                req,
+                reason_code="participation_verified_context_unavailable",
+            )
+            return
         replyer_history = (
             assembled_context.replyer_thread
             if isinstance(assembled_context, AssembledContext)

@@ -11,6 +11,7 @@ try:
         FakeEvent,
         FakeProvider,
         FakeRequest,
+        FakeResponse,
         FakeStarTools,
         FakeTool,
         FakeToolSet,
@@ -22,6 +23,7 @@ except ModuleNotFoundError:
         FakeEvent,
         FakeProvider,
         FakeRequest,
+        FakeResponse,
         FakeStarTools,
         FakeTool,
         FakeToolSet,
@@ -57,6 +59,8 @@ class P5ParticipationEngineTests(unittest.IsolatedAsyncioTestCase):
         *,
         persona_name: str = "亚托莉",
         trusted_bot_identities: tuple[str, ...] = (),
+        natural_participation_enabled: bool = True,
+        proactive_enabled: bool = False,
     ):
         self.plugin_count += 1
         FakeStarTools.data_dir = Path(self.temp.name) / f"runtime-{self.plugin_count}"
@@ -69,6 +73,13 @@ class P5ParticipationEngineTests(unittest.IsolatedAsyncioTestCase):
                 "guest_allowed_tools": ["anysearch_search"],
                 "prefer_livingmemory_group_history": False,
                 "trusted_bot_identities": list(trusted_bot_identities),
+                "natural_group_participation_enabled": natural_participation_enabled,
+                "natural_group_participation_allowlist": [
+                    "p5-participation-group"
+                ],
+                "natural_group_participation_min_context_messages": 2,
+                "proactive_initiation_enabled": proactive_enabled,
+                "proactive_group_allowlist": ["p5-participation-group"],
             },
         )
         return plugin, provider
@@ -94,6 +105,11 @@ class P5ParticipationEngineTests(unittest.IsolatedAsyncioTestCase):
         assessment = event.get_extra(main.SHIO_PARTICIPATION_ASSESSMENT)
         self.assertIs(type(assessment), ParticipationAssessment)
         return assessment
+
+    def _prime_context(self, plugin, message: str = "刚才的话题还没说完") -> None:
+        prior = self._event(message, f"prior-{self.plugin_count}")
+        prior.sender_id = "peer-b"
+        self._admit(plugin, prior)
 
     def test_direct_required_and_wait_addresses_are_closed_before_scoring(self):
         direct_plugin, _ = self._plugin()
@@ -121,6 +137,7 @@ class P5ParticipationEngineTests(unittest.IsolatedAsyncioTestCase):
 
     def test_about_self_can_join_but_open_group_requires_persona_interest(self):
         about_plugin, _ = self._plugin()
+        self._prime_context(about_plugin)
         about = self._event("我觉得萝卜子这个称呼很有趣", "about")
         about_assessment = self._admit(about_plugin, about)
         self.assertIs(about_assessment.decision.level, ParticipationLevel.MAY_JOIN)
@@ -128,6 +145,7 @@ class P5ParticipationEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(about.is_wake)
 
         atri_plugin, _ = self._plugin(persona_name="亚托莉")
+        self._prime_context(atri_plugin)
         atri = self._event("大家今晚吃什么？", "atri-meal")
         atri_assessment = self._admit(atri_plugin, atri)
         self.assertIs(atri_assessment.decision.level, ParticipationLevel.MAY_JOIN)
@@ -135,6 +153,7 @@ class P5ParticipationEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(atri.is_at_or_wake_command)
 
         neutral_plugin, _ = self._plugin(persona_name="中性基准")
+        self._prime_context(neutral_plugin)
         neutral = self._event("大家今晚吃什么？", "neutral-meal")
         neutral_assessment = self._admit(neutral_plugin, neutral)
         self.assertIs(neutral_assessment.decision.level, ParticipationLevel.NO_ACTION)
@@ -143,6 +162,7 @@ class P5ParticipationEngineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_may_join_uses_typed_reply_pipeline_without_tools(self):
         plugin, provider = self._plugin()
+        self._prime_context(plugin)
         event = self._event("大家今晚吃什么？", "hot-path")
         assessment = self._admit(plugin, event)
         request = FakeRequest(event.message)
@@ -159,9 +179,81 @@ class P5ParticipationEngineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(tuple(request.func_tool.tools), ())
         self.assertEqual(provider.calls, [])
+        policy = event.get_extra(main.SHIO_ACTIVE_CAPABILITY_POLICY)
+        self.assertEqual(policy.conversation_mode, "group_join")
+        self.assertFalse(policy.is_degraded)
+
+        response = FakeResponse("那就吃拉面吧，我也想来一碗。")
+        await plugin.guard_persona_reply(event, response)
+        self.assertTrue(response.completion_text)
+        self.assertIsNotNone(event.get_extra(main.SHIO_PRESENTATION_HANDOFF))
+        self.assertIsNotNone(event.get_extra(main.SHIO_SEMANTIC_VALIDATION_SEAL))
+
+    def test_recent_group_context_can_supply_interest_for_elliptical_current_turn(self):
+        plugin, _ = self._plugin()
+        self._prime_context(plugin, "你们刚才说晚饭想吃面来着")
+        event = self._event("大家也这么想吗？", "contextual-interest")
+
+        assessment = self._admit(plugin, event)
+
+        self.assertIs(assessment.decision.level, ParticipationLevel.MAY_JOIN)
+        self.assertGreater(assessment.interest_relevance, 0.0)
+        self.assertGreaterEqual(assessment.context_message_count, 2)
+        self.assertTrue(event.is_at_or_wake_command)
+
+    def test_independent_master_switch_and_context_depth_fail_closed(self):
+        disabled_plugin, _ = self._plugin(natural_participation_enabled=False)
+        self._prime_context(disabled_plugin)
+        disabled = self._event("大家晚饭吃什么？", "disabled")
+        disabled_assessment = self._admit(disabled_plugin, disabled)
+        self.assertIs(
+            disabled_assessment.decision.level,
+            ParticipationLevel.NO_ACTION,
+        )
+        self.assertIn(
+            "opportunistic_group_join_disabled",
+            disabled_assessment.reason_codes,
+        )
+        self.assertFalse(disabled.is_at_or_wake_command)
+
+        shallow_plugin, _ = self._plugin()
+        shallow = self._event("大家今晚吃什么？", "shallow")
+        shallow_assessment = self._admit(shallow_plugin, shallow)
+        self.assertIs(shallow_assessment.decision.level, ParticipationLevel.NO_ACTION)
+        self.assertIn(
+            "verified_group_context_too_shallow",
+            shallow_assessment.reason_codes,
+        )
+        self.assertFalse(shallow.is_at_or_wake_command)
+
+    def test_cold_scheduler_and_natural_participation_switches_are_independent(self):
+        natural_only, _ = self._plugin(
+            natural_participation_enabled=True,
+            proactive_enabled=False,
+        )
+        self._prime_context(natural_only)
+        natural_event = self._event("大家晚饭吃什么？", "natural-only")
+        natural_assessment = self._admit(natural_only, natural_event)
+        self.assertIs(
+            natural_assessment.decision.level,
+            ParticipationLevel.MAY_JOIN,
+        )
+        self.assertFalse(natural_only.proactive_policy_state.operational)
+
+        cold_only, _ = self._plugin(
+            natural_participation_enabled=False,
+            proactive_enabled=True,
+        )
+        self._prime_context(cold_only)
+        cold_event = self._event("大家晚饭吃什么？", "cold-only")
+        cold_assessment = self._admit(cold_only, cold_event)
+        self.assertIs(cold_assessment.decision.level, ParticipationLevel.NO_ACTION)
+        self.assertFalse(cold_event.is_at_or_wake_command)
+        self.assertTrue(cold_only.proactive_policy_state.operational)
 
     def test_assessment_copy_mutation_cross_authority_and_scene_corruption_fail_closed(self):
         plugin, _ = self._plugin()
+        self._prime_context(plugin)
         event = self._event("大家今晚吃什么？", "canonical")
         assessment = self._admit(plugin, event)
         opportunity = event.get_extra(main.SHIO_OPPORTUNITY_ATTENTION)

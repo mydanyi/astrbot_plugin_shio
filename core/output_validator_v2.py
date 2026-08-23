@@ -924,6 +924,32 @@ def _compute_reply_composer_output_validation(
         if type(assembled_context) is AssembledContext
         else ()
     )
+    group_join_records = (
+        tuple(
+            record
+            for record in (
+                *assembled_context.replyer_thread,
+                *assembled_context.public_background,
+            )
+            if not (
+                record.role is LedgerRole.USER
+                and record.message_id
+                and record.message_id == request.target_message_id
+            )
+        )
+        if type(assembled_context) is AssembledContext
+        else ()
+    )
+    if (
+        request.capability_policy.conversation_mode == "group_join"
+        and not has_verified_public_group_context(group_join_records)
+    ):
+        _issue(
+            issues,
+            "group_join_context_unavailable",
+            "自然参与群聊必须绑定至少一条当前消息之前的可信公开上下文",
+            severity=OutputIssueSeverity.BLOCKING,
+        )
     if (
         is_explicit_group_context_request(context.current_message)
         and not has_verified_public_group_context(public_records)

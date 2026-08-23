@@ -721,6 +721,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
     def test_owner_action_config_is_explicit_and_defaults_all_off(self):
         schema_path = Path(main.__file__).resolve().parent / "_conf_schema.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        permission = schema["permission_settings"]["items"]
         expected_false = (
             "owner_action_enabled",
             "owner_action_artifact_read_exact_enabled",
@@ -729,10 +730,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             "owner_action_sandbox_shell_once_enabled",
         )
         for key in expected_false:
-            self.assertIn(key, schema)
-            self.assertIs(schema[key]["default"], False)
-        self.assertNotIn("完整 Agent", schema["owner_ids"]["hint"])
-        self.assertNotIn("Shell", schema["owner_ids"]["hint"])
+            self.assertIn(key, permission)
+            self.assertIs(permission[key]["default"], False)
+        self.assertNotIn("完整 Agent", permission["owner_ids"]["hint"])
+        self.assertNotIn("Shell", permission["owner_ids"]["hint"])
 
     def test_owner_action_config_is_frozen_at_plugin_initialization(self):
         config = {

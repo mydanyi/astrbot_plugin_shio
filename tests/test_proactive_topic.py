@@ -53,6 +53,12 @@ class ProactiveTopicTests(unittest.TestCase):
         self.temp.cleanup()
 
     def _scene(self, message: str):
+        if self.turn == 0:
+            self.turn += 1
+            prior = FakeEvent("peer-b", "刚才的话题还没聊完", group_id="group-a")
+            prior.message_id = f"p7-topic-{self.turn}"
+            prior.created_at = 1000.0 + self.turn
+            self.plugin.admit_ingress_event(prior)
         self.turn += 1
         event = FakeEvent("peer-a", message, group_id="group-a")
         event.message_id = f"p7-topic-{self.turn}"
@@ -98,17 +104,32 @@ class ProactiveTopicTests(unittest.TestCase):
         self.assertFalse(plan.send_authorized)
         self.assertIs(self.plugin.proactive_topic_authority.inspect(plan), plan)
 
-    def test_unmatched_scene_falls_back_to_public_persona_interest(self):
+    def test_unmatched_scene_is_silent_instead_of_starting_persona_fallback(self):
         scene = self._scene("今天天气真不错")
+        with self.assertRaisesRegex(
+            ContractViolation,
+            "proactive_topic_no_grounded_match",
+        ):
+            self.plugin.proactive_topic_authority.select(
+                self._decision(),
+                scene=scene,
+                persona=self.plugin._configured_persona_package(),
+            )
+
+    def test_plan_carries_bounded_anonymized_multi_turn_public_context(self):
+        scene = self._scene("大家晚饭吃什么？")
         plan = self.plugin.proactive_topic_authority.select(
             self._decision(),
             scene=scene,
             persona=self.plugin._configured_persona_package(),
         )
 
-        self.assertIs(plan.source, ProactiveTopicSource.PERSONA_INTEREST)
-        self.assertEqual(plan.interest_id, "shared_meals")
-        self.assertEqual(plan.topic_text, "吃什么")
+        self.assertGreaterEqual(len(plan.recent_public_context), 2)
+        rendered = "\n".join(plan.recent_public_context)
+        self.assertIn("刚才的话题还没聊完", rendered)
+        self.assertIn("大家晚饭吃什么", rendered)
+        self.assertNotIn("peer-a", rendered)
+        self.assertNotIn("peer-b", rendered)
 
     def test_plan_surface_contains_no_scene_participants_or_private_memory(self):
         scene = self._scene("大家晚饭吃什么？")

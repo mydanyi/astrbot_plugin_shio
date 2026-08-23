@@ -153,10 +153,24 @@ def trusted_relationship_distance(
     """Map code-resolved principal state to expression distance, failing closed."""
 
     mode = str(conversation_mode or "direct_reply").strip().lower()
-    if mode != "direct_reply":
+    if mode not in {"direct_reply", "group_join"}:
         return RelationshipDistance.UNVERIFIED
     if principal is None or not principal.sender_id or not principal.sender_key:
         return RelationshipDistance.UNVERIFIED
+    if mode == "group_join" and (
+        principal is not None
+        and principal.sender_id
+        and principal.sender_key
+        and principal.relationship_role in {"owner", "group_peer"}
+        and principal.verification_source
+        in {
+            "astrbot_event_sender_id:configured_owner_id",
+            "astrbot_event_sender_id:owner_allowlist_miss",
+        }
+    ):
+        # Opportunistic group participation is peer-facing even when the
+        # current speaker is the owner; it must not unlock owner-only intimacy.
+        return RelationshipDistance.PEER
     if (
         principal.is_owner
         and principal.relationship_role == "owner"
@@ -326,7 +340,7 @@ def appraise_affect(
     target_digest = reply_target.content_digest if reply_target is not None else ""
     focus_sender_key = ""
 
-    if mode == "direct_reply":
+    if mode in {"direct_reply", "group_join"}:
         if reply_target is None:
             degradation_reasons.append("missing_reply_target")
         else:
