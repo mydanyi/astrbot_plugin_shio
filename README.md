@@ -1,22 +1,22 @@
 # 星汐（Shio）
 
-> v0.5.14：群聊自然参与与冷场主动续题现在是两套独立开关。自然参与只在白名单群、具备已验证的近期公开上下文时接话；冷场续题只延续最近多轮真实话题，没有匹配话题则保持沉默。Web 设置按功能分组，并兼容旧版扁平配置。
+> v0.5.25：修复主动消息可见发送后被外层误判失败、冷却/每日次数不落盘、重复续题、单气泡和双群隐形兴趣门槛；主动图片按全部 22 个语境类别交给 Meme Manager 的公开兼容接口。
 
 > **星光沉入潮汐，YHN-04B-009 的意识仍在数字海岸醒着。**
 
 星汐是面向 AstrBot 的 typed 群聊心智编排插件。它把当前身份、回复目标、引用、记忆来源、能力权限、人格、情绪、参与决策、工具证据、输出校验和真实发送回执放进同一条可审计链；内置亚托莉示例，但运行机制不绑定单一角色。
 
-0.5.14 把两种“主动”行为彻底拆开：群聊自然参与只在独立总开关和独立白名单允许、且有可信前文时接话；冷场主动续题只延续最近多轮真实讨论。0.5.10 的重启后群聊上下文、0.5.8 的称名唤醒模式和 0.5.7 的 22 类 Meme 情境路由保持不变。
+0.5.25 延续 0.5.24 的身份字段／语义正文隔离，并把主动链的真实发送终态、逐群状态、防重复、最少气泡和图片类别交接纳入同一套可审查合同。Meme Manager 仍是图片开关、概率、资源包、图片构建和发送的唯一所有者。
 
 ## 已闭环能力
 
 - **可信身份和目标**：用平台、机器人账号、会话、群和真实 sender ID 建立 current-turn binding；昵称、自称、引用、记忆和模型文本都不能提升主人权限或替换当前发言人。
 - **直接、引用和多模态同链**：文本、引用文本、quoted image、仅图片、原生 caption/unavailable 和一次 repair 共用 typed MediaContext；URL、base64 和文件路径不进入 prompt、trace 或持久状态。
-- **自然参与**：明确 @／私聊／称名进入直接回复；未点名接话由独立的 `natural_group_participation_enabled` 和白名单控制，还必须有已验证的近期群聊上下文，再经 Address、Attention、Participation、Cadence 决定为 `MAY_JOIN`、`REACT_ONLY`、`WAIT` 或 `NO_ACTION`，模型不能自行抢话。
-- **主动发起**：冷场续题由独立的 `proactive_initiation_enabled` 控制，默认关闭；开启后也只从最近多轮真实公开讨论续题，没有可靠匹配就沉默，并继续受群白名单、观察期、活跃时段、空闲、冷却、日限额、generation、推理预算和真实发送回执约束。
+- **自然参与**：明确 @／私聊／称名进入直接回复；明确 Reply／@ 其他真实成员不会抢话。未点名接话先经过独立开关、群白名单、可信多人上下文和 cadence 预检，再由当前会话 Provider 对真实顺序、真实显示名及结构化受话关系作一次严格语义裁决。问号、问句词、二字重合、Persona 兴趣和 Owner 关系都不能单独决定资格；只有语义 `REPLY` 才提交 `MAY_JOIN`，`WAIT` 不消费 join 或 backoff，`NO_ACTION` 只更新有界 backoff。
+- **主动发起**：冷场续题由独立的 `proactive_initiation_enabled`、白名单和 `proactive_initiation_rules` 控制，默认关闭；开启后只从最近多轮真实公开讨论续题，优先选 Persona 兴趣相关话题，没有兴趣词命中时也可续接最近的实质性可信公开话题，没有可靠内容才沉默。每群独立受观察期、活跃时段、空闲、冷却、日限额、近期话题/成稿防重复、generation、推理预算和真实发送回执约束。
 - **可替换人格与连续情绪**：PersonaPackage 只决定身份资料、关系规则和表达；continuous Affect 与关系状态只投影措辞，不能改变事实、目标或权限。
-- **受控资料能力**：普通用户只看到管理员精确允许且分类为只读的检索工具；AnySearch 结果必须有当前轮 sealed evidence，没有真实工具结果就不能声称“已经查过”。
-- **Meme 与自然气泡**：Meme Manager 只有 exact runtime／plan／expression permit 才能执行；星汐设置控制补图总开关、普通安全闲聊准入回合数与冷却，Meme Manager 自己的“表情出现概率”继续作为唯一最终概率；线上资源包 22 类均有 code-owned 高置信情境入口，执行器只接受一个密封类别标签，无法可靠匹配时不发图，绝不统一兜底 happy；文字、图片和一至三条完整语义气泡按最终 segments 发送，失败段不会记作成功。
+- **受控资料能力**：普通用户只看到管理员精确允许且分类为只读的检索工具；AstrBot 原生知识库与 AnySearch 结果都必须有当前轮 sealed evidence，没有真实结果就不能声称“已经查过”。
+- **Meme 与自然气泡**：普通／自然回复先由星汐完成最终校验，再由官方 Meme Manager 4.15.1 的正常响应、装饰和发送钩子选图；回复模型支持工具时使用逐图语义检索，不支持工具时使用 Manager 自己的类别提示回退。气泡分发保留 Manager 已加入的非文本图片组件。主动／冷场没有 AstrBot 原生消息事件，首稿根据完整公开上下文选择其 22 个官方类别之一，隐藏标记经星汐校验并剥离后再调用 `compat_prepare_message`／`compat_send_prepared_message`；开关、概率、资源包与实际图片发送仍只由 Meme Manager 设置。
 - **输出与并发安全**：协议／隐藏通道／伪工具调用、关系漂移、无依据自传和媒体编造会阻断或至多进行一次无工具 repair；新消息会取消旧 generation，迟到 Provider／工具结果不得发送。
 - **学习有审核边界**：只从 exact、高置信、多 reviewer、无敏感内容的聚合反馈产生候选；默认不改变核心人格，必须经过 code-owned review/shadow/有限启用并可即时撤销。
 - **主人动作默认关闭**：主人 ID 只是提出动作的资格。四个主人动作适配器保持关闭，production runtime allowlist 为空；文件读取／grep／记忆写入不能靠改一个 UI 开关启用，Shell 永久硬关闭。
@@ -47,30 +47,31 @@ AstrBot event
 
 ## 安装与升级
 
-1. 下载 `astrbot_plugin_shio_v0.5.14_upload.zip`。
+1. 下载 `astrbot_plugin_shio_v0.5.25_upload.zip`。
 2. 在 AstrBot WebUI 上传插件；如果装过独立 `astrbot_plugin_agent_guard`，先停用或卸载。
 3. 重启 AstrBot，进入星汐配置页，先在专用测试群核对人格、群员隔离、普通聊天、引用／图片和只读搜索。
 4. 只有需要识别主人资格时才填写 `owner_ids`；公开默认名单为空。填写名单不会自动启用任何动作。
 5. 保持主人动作总开关和四个逐项开关关闭；保持主动发起关闭，除非你已经逐项理解并验证对应策略。
 
-升级前请备份 `/AstrBot/data`。0.5.14 会把旧版扁平字段迁入八个 Web 设置分组；两个主动流程都不会因升级自动开启。旧 Planner、StyleRetriever、recovery queue、architecture rollout 等遗留字段不会重新激活旧代码。上传包只能有一个顶层 `astrbot_plugin_shio/` 目录。
+升级前请备份 `/AstrBot/data`。0.5.25 有七个 Web 设置分组；Meme 的开关、概率和资源包只在 Meme Manager 中设置，旧版星汐的三个 Meme 字段迁移时会被删除，不会形成第二配置源。请在 `guest_allowed_tools` 中保留 `astr_kb_search` 和已审核的 AnySearch 工具，知识库内容、范围和启停继续由 AstrBot 自带知识库设置控制。两个主动流程不会因升级自动开启。旧 `ambient_participation_rules`／`quiet_topic_rules` 只在迁移时映射到新字段。上传包只能有一个顶层 `astrbot_plugin_shio/` 目录。
 
 ## 推荐配置
 
-当前 `_conf_schema.json` 有 8 个功能分组、57 个实际字段：基础回复、称名唤醒、群聊自然参与、冷场主动续题、上下文与记忆、表情补图、权限与主人动作、性能与诊断。
+当前 `_conf_schema.json` 有 7 个功能分组、57 个实际字段：基础回复、称名唤醒、群聊自然参与、冷场主动续题、上下文与记忆、权限与主人动作、性能与诊断。
 
 | 配置 | 建议值 |
 |---|---|
 | `enabled` | 开启 |
 | `natural_name_wake_enabled` / `natural_name_wake_mode` | 开启；可选“自然语言判断（natural）”或“关键词出现即唤醒（contains）” |
 | `natural_group_participation_enabled` | 默认关闭；启用前填写独立群白名单，至少保留 2 条可信上下文门槛 |
+| `natural_group_participation_rules` | 自然接话的完整可编辑规则；不改变代码固定的身份、权限和发送安全门 |
 | `permission_guard_enabled` | 开启 |
-| `guest_allowed_tools` | 只保留亲自审核过的只读工具；默认 `anysearch_search`、`anysearch_extract` |
+| `guest_allowed_tools` | 只保留亲自审核过的只读工具；默认 `astr_kb_search`、`anysearch_search`、`anysearch_extract`；知识库内容仍由 AstrBot 原生设置控制 |
 | `owner_ids` | 不用主人资格时留空；需要时只填真实平台 ID |
 | `owner_action_enabled` 与四个适配器开关 | 全部关闭 |
 | `proactive_initiation_enabled` | 关闭；白名单留空 |
-| `meme_complement_enabled` | 开启；关闭后星汐文字回复不再申请补图 |
-| `meme_complement_cadence_turns` / `meme_complement_cooldown_turns` | 默认 4 / 4；只控制星汐准入节奏，最终出图概率仍在 Meme Manager 设置 |
+| `proactive_initiation_rules` | 冷场续题的完整可编辑规则；无可靠话题或检索失败时仍由代码强制沉默 |
+| `proactive_min_bubbles` | 默认 2；单段首稿触发唯一一次同上下文修复，设为 1 可允许单气泡 |
 | `persona_name` | 默认亚托莉；也可选择暖晴、苏澄或中性基准 |
 | `prefer_livingmemory_group_history` | 安装并核对 LivingMemory 后开启 |
 | 推理预算 | 默认并行 4、等待 128、排队 30 秒、活动 300 秒 |
@@ -78,6 +79,8 @@ AstrBot event
 | `debug_log` | 平时关闭 |
 
 配置的完整含义以 WebUI schema 为准；[配置审计](docs/CONFIG_AUDIT.md) 固定了字段闭集与高风险默认值。
+
+Meme 不再有星汐侧设置项。请直接在 Meme Manager 中设置总开关、表情出现概率、语义检索和资源包；概率调到 100% 时，每个非高风险成功文字回复都会进入 Manager 的语义选择，但资源包未就绪、检索无候选或图片校验失败仍会安全地不发送图片。
 
 ## 权限与主人动作
 
@@ -94,9 +97,14 @@ AstrBot event
 ## 群聊参与和主动发起
 
 - 直接 @、私聊、引用和明确称名优先进入直接回复；
-- 未点名开放群聊只有在对象／话题相关、不是他人私聊、不是工具或主人动作、cadence 允许时才可接话；
+- 未点名的 `OPEN_GROUP`、`ABOUT_SELF` 和无结构化受话对象的 `UNCERTAIN` 都只取得语义候选资格；功能、白名单、可信上下文、连续性、容量、cooldown、窗口和 backoff 会在 Provider 前失败关闭；
+- 语义准入只调用当前会话 Provider 一次，正文与人物 metadata 分离，禁用图片、音频、工具、repair 和备用 Provider。它只输出 `REPLY|WAIT|NO_ACTION`，不生成可见回复；
+- 只有语义 `REPLY` 且 cadence 终结成功后才会推进 generation、取消旧生成，并进入既有 Persona、KnowledgeGap、validator／单次 repair、气泡、SendReceipt 与 Meme Manager 链；
 - `REACT_ONLY` 只发布轻量 expression intent，不偷偷升级成文字回复；
-- 冷场主动续题只能从当前公共 scene 的最近多轮真实讨论选题；Persona 兴趣只用于判断相关性，不能在没有群聊话题时凭空起题，也不读取最后发言者的个人事实或 LivingMemory 私密资料；
+- `MAY_JOIN` 只有在当前话题确有知识缺口时才可调用一次已配置的知识库或公网只读工具；最终角色渲染仍无工具；
+- 冷场主动续题只能从当前公共 scene 的最近多轮真实讨论选题；Persona 兴趣只用于优先排序，不是第二个白名单。没有兴趣词命中时可续接最近的实质性可信公开话题，但不能在没有群聊内容时凭空起题，也不读取最后发言者的个人事实或 LivingMemory 私密资料；
+- 冷场续题涉及稳定知识／黑话时可查 AstrBot 知识库，涉及明确实时事实时可查公网；检索不是选题器，失败时不发送；
+- 两条链路触发后都使用完整公开 Persona、服务器时间、可配置最少值至 3 个语义气泡、逐段 SendReceipt；主动／冷场首稿末尾的一个官方类别标记只作隐藏控制数据，发送前必须剥离，文字全部成功后才通过同一 Meme Manager compatibility adapter 申请可选补图；
 - 新消息、直接唤醒、外部 stop 或 generation 漂移都会取消尚未发送的旧输出。
 
 ## 人格、关系和学习
@@ -130,7 +138,7 @@ AstrBot event
 - `social_state.json`：作用域化互动统计；
 - behavior／learning candidate、activation 与撤销状态；
 - `continuity/runtime_continuity.json`：不可逆 scope/subject 指纹、revision 和 cadence；
-- `proactive/proactive_state.json`：主动策略的不可逆群指纹、配额和冷却；
+- `proactive/proactive_state.json`：主动策略的不可逆群指纹、配额、冷却以及每群最近话题/成稿的不可逆摘要；不保存主动成稿正文；
 - `public_group_ledger.json`：仅含已准入、同群且发送者已验证的人类公开入站消息；每群最多 32 条、最多 128 个 scope，用于重启后的显式群聊回顾；
 - owner lifecycle journal／install secret：即使动作关闭也按最小本地权限管理，正文、路径和参数不进入 trace。
 
@@ -153,7 +161,7 @@ python -X utf8 -m unittest discover -s astrbot_plugin_shio/tests -p "test_*.py"
 python -X utf8 -m compileall -q astrbot_plugin_shio
 ```
 
-当前 Windows 与隔离 AstrBot Linux 自动化均超过 1,200 项；发布前还必须经过 P10 固定矩阵、隐私扫描、container 门和 FNOS 备份／哈希／加载／WebUI／自然流量验收。公开复现步骤见 [测试指南](docs/TESTING.md)。
+当前 Windows 与隔离 AstrBot Linux 自动化均超过 1,200 项；发布前还必须经过 P10 固定矩阵、隐私扫描、container 门和 FNOS 备份／哈希／加载／WebUI／自然流量验收。公开复现步骤见 [测试指南](docs/TESTING.md)，缺陷审查必须遵守 [审查手册](docs/REVIEW_PLAYBOOK.md)，已经踩过的失败模式见 [坑位台账](docs/PITFALL_LEDGER.md)。
 
 ## 反馈
 

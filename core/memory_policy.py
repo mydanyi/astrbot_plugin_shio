@@ -102,8 +102,8 @@ class MemoryPolicyResult:
         object.__setattr__(self, "public_background_facts", public)
         if self.decision.selected_facts != current + public:
             raise ContractViolation("memory_result_selection_mismatch")
-        sender_key = self.decision.binding.current_sender_key
-        if any(fact.subject_key != sender_key for fact in current):
+        account_key = self.decision.current_account_key
+        if any(fact.subject_key != account_key for fact in current):
             raise ContractViolation("memory_current_subject_mismatch")
         if any(
             fact.scope not in {
@@ -353,12 +353,12 @@ class MemoryPolicy:
     ) -> tuple[tuple[ProvenancedFact, ...], tuple[ProvenancedFact, ...]]:
         current: list[LivingMemoryCandidate] = []
         public: list[LivingMemoryCandidate] = []
-        sender_key = event.binding.current_sender_key
+        account_key = event.principal.account_key
         chat_type = event.envelope.chat_type
         for candidate in adapter_result.candidates:
             fact = candidate.fact
             if fact.subject_key:
-                if fact.subject_key != sender_key:
+                if not account_key or fact.subject_key != account_key:
                     exclusions["other_subject"] += 1
                     continue
                 if fact.scope == MemoryScope.OWNER_PRIVATE.value:
@@ -503,6 +503,7 @@ class MemoryPolicy:
             decision = MemoryDecision(
                 binding=binding,
                 mode=mode,
+                current_account_key=event.principal.account_key,
                 selected_facts=current_facts + public_facts,
                 max_results=decision_max_results,
                 reason_codes=decision_reasons,

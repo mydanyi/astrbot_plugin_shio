@@ -33,6 +33,8 @@ from .contracts._validation import require_hex, require_safe_name, require_text
 DEFAULT_ACQUISITION_TIMEOUT_S = 20.0
 _REQUEST_SHAPE_SEAL = object()
 _ANYSEARCH_PLUGIN_ID = "astrbot_plugin_anysearch"
+_ASTRBOT_KB_TOOL_NAME = "astr_kb_search"
+_ASTRBOT_KB_MODULE = "astrbot.core.tools.knowledge_base_tools"
 _ANYSEARCH_BY_KIND: dict["AcquisitionKind", tuple[str, str]] = {}
 _FORBIDDEN_ARGUMENT_KEYS = frozenset(
     {
@@ -60,6 +62,7 @@ class AcquisitionKind(str, Enum):
     SEARCH = "search"
     EXTRACT = "extract"
     BATCH_SEARCH = "batch_search"
+    KNOWLEDGE_BASE = "knowledge_base"
     CAPABILITY_ACTION = "capability_action"
 
 
@@ -268,6 +271,19 @@ def build_extract_request_shape(
     )
 
 
+def build_knowledge_base_request_shape(
+    binding: DecisionBinding,
+    *,
+    query: str,
+) -> AcquisitionRequestShape:
+    return _issue_request_shape(
+        binding=binding,
+        kind=AcquisitionKind.KNOWLEDGE_BASE,
+        capability=CapabilityClass.CHAT_RETRIEVAL,
+        argument_items=(("query", _clean_text(query, "knowledge_base_query")),),
+    )
+
+
 def build_batch_request_shape(
     binding: DecisionBinding,
     *,
@@ -460,7 +476,6 @@ def _verified_owner_policy(policy: CapabilityPolicy) -> bool:
         and policy.relationship_role == "owner"
         and policy.verification_source.startswith("astrbot_event_sender_id:")
         and policy.verification_source.endswith(":configured_owner_id")
-        and policy.agent_full
         and not policy.is_degraded
     )
 
@@ -510,6 +525,10 @@ def _attested_source(classification: ToolClassification) -> str:
         if _ANYSEARCH_PLUGIN_ID not in source_text:
             raise ContractViolation("broker_anysearch_source_mismatch")
         return _ANYSEARCH_PLUGIN_ID
+    if name == _ASTRBOT_KB_TOOL_NAME:
+        if descriptor.module_path.strip().lower() != _ASTRBOT_KB_MODULE:
+            raise ContractViolation("broker_knowledge_base_source_mismatch")
+        return _ASTRBOT_KB_MODULE
     source = descriptor.module_path.strip() or descriptor.origin.strip()
     return require_text(source, "broker_tool_source")
 
@@ -540,6 +559,26 @@ def _select_candidate(
             raise ContractViolation("broker_anysearch_capability_mismatch")
         if required_parameter not in candidate.descriptor.parameter_names:
             raise ContractViolation("broker_anysearch_interface_changed")
+        return candidate
+
+    if request_shape.kind is AcquisitionKind.KNOWLEDGE_BASE:
+        if _ASTRBOT_KB_TOOL_NAME not in configured_names:
+            raise ContractViolation("broker_required_tool_not_configured")
+        matches = tuple(
+            item
+            for item in classifications
+            if item.descriptor.name.strip().lower() == _ASTRBOT_KB_TOOL_NAME
+        )
+        if len(matches) != 1:
+            raise ContractViolation("broker_required_tool_missing_or_ambiguous")
+        candidate = matches[0]
+        if (
+            candidate.capability is not CapabilityClass.CHAT_RETRIEVAL
+            or candidate.side_effect is not SideEffectClass.SCOPED_READ
+        ):
+            raise ContractViolation("broker_knowledge_base_capability_mismatch")
+        if "query" not in candidate.descriptor.parameter_names:
+            raise ContractViolation("broker_knowledge_base_interface_changed")
         return candidate
 
     matches = tuple(
@@ -582,7 +621,7 @@ def broker_tool_request(
         raise ContractViolation("broker_capability_policy_required")
     if capability_policy.principal_key != binding.current_sender_key:
         raise ContractViolation("broker_capability_principal_mismatch")
-    if capability_policy.conversation_mode != "direct_reply":
+    if capability_policy.conversation_mode not in {"direct_reply", "group_join"}:
         raise ContractViolation("broker_capability_mode_mismatch")
     if (
         not isinstance(request_shape, AcquisitionRequestShape)
@@ -604,9 +643,15 @@ def broker_tool_request(
     if not owner_verified and not guest_verified:
         raise ContractViolation("broker_principal_policy_unverified")
     if guest_verified:
-        if capability is not CapabilityClass.PUBLIC_WEB_READ:
+        if capability not in {
+            CapabilityClass.PUBLIC_WEB_READ,
+            CapabilityClass.CHAT_RETRIEVAL,
+        }:
             raise ContractViolation("broker_guest_capability_forbidden")
-        if request_shape.kind not in _ANYSEARCH_BY_KIND:
+        if (
+            request_shape.kind not in _ANYSEARCH_BY_KIND
+            and request_shape.kind is not AcquisitionKind.KNOWLEDGE_BASE
+        ):
             raise ContractViolation("broker_guest_request_shape_forbidden")
         if (
             knowledge_gap.need is KnowledgeNeed.NONE
@@ -675,15 +720,107 @@ def broker_tool_request(
     )
 
 
+def broker_proactive_read_request(
+    *,
+    proactive_request: object,
+    capability: CapabilityClass,
+    runtime_tools: Iterable[ToolClassification],
+    configured_tool_names: Iterable[str],
+    now: float,
+) -> AcquisitionRequest:
+    """Issue one public-read request for a canonical group-initiation topic."""
+
+    from .proactive_runtime import ProactiveComposerRequest
+
+    if type(proactive_request) is not ProactiveComposerRequest:
+        raise ContractViolation("broker_proactive_request_required")
+    authority_ref = getattr(proactive_request, "_authority_ref", None)
+    authority = authority_ref() if callable(authority_ref) else None
+    try:
+        authority.inspect_request(proactive_request)
+    except (AttributeError, ContractViolation, TypeError) as exc:
+        raise ContractViolation("broker_proactive_request_untrusted") from exc
+    if capability not in {
+        CapabilityClass.CHAT_RETRIEVAL,
+        CapabilityClass.PUBLIC_WEB_READ,
+    }:
+        raise ContractViolation("broker_proactive_capability_forbidden")
+    plan = proactive_request.plan
+    trace_id = hashlib.sha256(
+        f"proactive-read|{plan.target.scope_key}|{plan.topic_digest}".encode("utf-8")
+    ).hexdigest()[:32]
+    binding = DecisionBinding(
+        scope_key=plan.target.scope_key,
+        session_id=plan.target.unified_msg_origin,
+        current_message_id=f"proactive:{plan.topic_digest[:32]}",
+        current_sender_key=f"{plan.target.scope_key}|actor:proactive_group",
+        current_content_digest=plan.topic_digest,
+        conversation_revision=plan.scene_revision,
+        generation_epoch=plan.scene_revision,
+        trace_id=trace_id,
+    )
+    request_shape = (
+        build_knowledge_base_request_shape(binding, query=plan.topic_text)
+        if capability is CapabilityClass.CHAT_RETRIEVAL
+        else build_search_request_shape(binding, query=plan.topic_text)
+    )
+    configured_names = _configured_names(configured_tool_names)
+    classifications = _runtime_classifications(runtime_tools, configured_names)
+    candidate = _select_candidate(
+        request_shape=request_shape,
+        capability=capability,
+        classifications=classifications,
+        configured_names=configured_names,
+    )
+    if not candidate.descriptor.active:
+        raise ContractViolation("broker_tool_disabled")
+    if candidate.side_effect not in {
+        SideEffectClass.PUBLIC_READ,
+        SideEffectClass.SCOPED_READ,
+    }:
+        raise ContractViolation("broker_proactive_side_effect_forbidden")
+    try:
+        current_time = float(now)
+    except (TypeError, ValueError) as exc:
+        raise ContractViolation("broker_clock_invalid") from exc
+    if not math.isfinite(current_time) or current_time < 0:
+        raise ContractViolation("broker_clock_invalid")
+    action_id = hashlib.sha256(
+        (
+            "proactive-read-action|"
+            + plan.topic_digest
+            + "|"
+            + request_shape.shape_digest
+        ).encode("utf-8")
+    ).hexdigest()
+    selection = ToolSelection(
+        binding=binding,
+        action_id=action_id,
+        tool_name=candidate.descriptor.name,
+        source=_attested_source(candidate),
+        capability=capability,
+        deadline=current_time + DEFAULT_ACQUISITION_TIMEOUT_S,
+        call_budget=1,
+    )
+    return AcquisitionRequest(
+        selection=selection,
+        kind=request_shape.kind,
+        request_shape_digest=request_shape.shape_digest,
+        argument_items=request_shape.argument_items,
+    )
+
+
 __all__ = [
     "DEFAULT_ACQUISITION_TIMEOUT_S",
     "AcquisitionKind",
     "AcquisitionRequest",
     "AcquisitionRequestShape",
     "ToolSelection",
+    "broker_proactive_read_request",
     "broker_tool_request",
     "build_batch_request_shape",
     "build_capability_request_shape",
     "build_extract_request_shape",
+    "build_knowledge_base_request_shape",
     "build_search_request_shape",
 ]

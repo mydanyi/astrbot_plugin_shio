@@ -468,6 +468,29 @@ class OwnerCapabilityPolicyTests(unittest.TestCase):
             ).allowed
         )
 
+    def test_owner_group_join_is_reduced_to_one_public_read_and_no_actions(self):
+        policy = build_owner_capability_policy(
+            self.owner(),
+            conversation_mode="group_join",
+        )
+
+        self.assertTrue(policy.is_owner)
+        self.assertTrue(policy.public_web_read)
+        self.assertTrue(policy.chat_retrieval)
+        self.assertEqual(policy.max_external_tool_calls, 1)
+        self.assertFalse(policy.local_presentation)
+        self.assertFalse(policy.memory_write)
+        self.assertFalse(policy.artifact_read)
+        self.assertFalse(policy.shell_exec)
+        self.assertFalse(policy.device_control)
+        self.assertFalse(policy.agent_full)
+        self.assertFalse(
+            decide_tool(
+                policy,
+                classify_tool(tool("astrbot_execute_shell")),
+            ).allowed
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

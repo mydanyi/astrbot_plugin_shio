@@ -175,6 +175,15 @@ class TurnEnvelopeTests(unittest.TestCase):
 
 
 class ScopeKeyTests(unittest.TestCase):
+    def test_same_account_is_cross_group_while_scoped_participant_stays_isolated(self):
+        from astrbot_plugin_shio.core.identity import build_account_key
+
+        group_a = build_scope_key(platform_id="qq", bot_id="bot", chat_type="group", group_id="a")
+        group_b = build_scope_key(platform_id="qq", bot_id="bot", chat_type="group", group_id="b")
+        self.assertEqual(build_account_key("qq", "10001"), "platform:qq|account:10001")
+        self.assertNotEqual(group_a, group_b)
+        self.assertNotEqual(build_sender_key(group_a, "10001"), build_sender_key(group_b, "10001"))
+        self.assertEqual(build_account_key("qq", ""), "")
     def test_same_sender_in_different_groups_has_different_key(self):
         group_a = build_scope_key(
             platform_id="adapter-main",

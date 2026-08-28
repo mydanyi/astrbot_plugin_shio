@@ -247,6 +247,7 @@ class TurnScopeCoordinator:
         principal_snapshot: _PrincipalSnapshot | None,
         kind: ScopeWorkKind,
         current_check: Callable[[], None],
+        final_check: Callable[[], None] | None = None,
         work_factory: Callable[[], Awaitable[T]],
     ) -> T:
         if type(kind) is not ScopeWorkKind:
@@ -294,7 +295,7 @@ class TurnScopeCoordinator:
             with self._state_lock:
                 if self._closed:
                     raise ScopeConcurrencyError("scope_coordinator_closed")
-            current_check()
+            (final_check or current_check)()
             with self._state_lock:
                 self._completed_total += 1
             return result
@@ -353,11 +354,26 @@ class TurnScopeCoordinator:
         def current_check() -> None:
             self._proactive_scope(request, authority)
 
+        def final_check() -> None:
+            try:
+                authority.inspect_request_integrity(request)
+                final_scope = self._exact_text(
+                    request.plan.target.scope_key,
+                    "proactive_scope_invalid",
+                )
+            except Exception as exc:
+                raise ScopeConcurrencyError(
+                    "proactive_request_not_canonical"
+                ) from exc
+            if final_scope != scope_key:
+                raise ScopeConcurrencyError("proactive_scope_changed")
+
         return await self._run(
             scope_key=scope_key,
             principal_snapshot=None,
             kind=ScopeWorkKind.PROACTIVE,
             current_check=current_check,
+            final_check=final_check,
             work_factory=work_factory,
         )
 

@@ -669,7 +669,7 @@ class InternalSendReceiptLedger:
                 topic_digest,
             ))
             or type(handoff.final_segments) is not tuple
-            or len(handoff.final_segments) != 1
+            or not 1 <= len(handoff.final_segments) <= 3
         ):
             raise ValueError("proactive_send_target_invalid")
         with self._lock:

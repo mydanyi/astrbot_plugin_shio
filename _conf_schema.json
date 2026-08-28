@@ -17,9 +17,9 @@
         "default": "亚托莉"
       },
       "replyer_provider_id": {
-        "description": "回复与单次修复模型",
+        "description": "冷场续题与单次修复模型",
         "type": "string",
-        "hint": "留空时使用当前 AstrBot 会话模型；指定后用于 typed 回复生成和必要的一次受控修复。",
+        "hint": "只用于冷场主动续题和首稿被拦后的单次修复。普通被点名回复与群聊自然接话始终使用 AstrBot 当前会话模型；此项不是全局回复模型。留空时以上两个阶段也使用当前会话模型。",
         "default": "",
         "_special": "select_provider"
       },
@@ -104,6 +104,12 @@
         "type": "bool",
         "default": false
       },
+      "natural_group_participation_rules": {
+        "description": "自然接话完整规则",
+        "type": "text",
+        "hint": "仅控制没有被点名时如何顺着真实群聊接话；身份、权限、检索安全和发送校验仍由代码固定控制。",
+        "default": "像已经在群里的普通成员一样，从当前多人话题中间顺势插一句。\n直接接最想回应的一点，可用接梗、短吐槽、补充、附和或轻微反驳。\n不要打招呼、复述题目、逐条总结或变成客服。\n不要强行追问某个人，不要把多人话题收束成一对一私聊。\n通常说一至两条短消息，让其他群友都能继续接话。"
+      },
       "natural_group_participation_allowlist": {
         "description": "群聊自然参与群白名单",
         "hint": "只在名单中的群允许自然接话；留空时即使总开关开启也不会插话。",
@@ -158,6 +164,18 @@
         "type": "bool",
         "hint": "只控制群聊真正冷场后的定时续题，不控制「群聊自然参与」。关闭后冷场调度不会发消息。",
         "default": false
+      },
+      "proactive_initiation_rules": {
+        "description": "冷场主动续题完整规则",
+        "type": "text",
+        "hint": "仅控制群聊真正冷场后如何续上公开话题；没有可靠公开线索、检索失败或证据不足时必须保持沉默。",
+        "default": "面向整个群自然续上最近的公开话题，不主持、不采访、不用客服式暖场。\n优先回应近期讨论中仍有延续空间的一点，可说短感想、联想、吐槽、补充或轻量分享。\n没有可靠公开话题、检索失败或证据不足时保持沉默，不为找话题而搜索。\n不要求问句；确实自然时最多带一个容易接的问题。\n不要用‘大家好’‘有人吗’‘你们怎么看’‘今天过得怎么样’‘有什么想聊的吗’。\n不要解释为什么突然说话、群安静多久或后台机制。\n通常说一至两条短消息。"
+      },
+      "proactive_min_bubbles": {
+        "description": "冷场续题最少气泡数",
+        "type": "int",
+        "hint": "推荐 2。首稿少于该数量时会按同一上下文进行唯一一次修复；实际值不会超过「闲聊最多气泡数」。设置为 1 可允许单气泡。",
+        "default": 2
       },
       "proactive_group_allowlist": {
         "description": "冷场主动发起群白名单",
@@ -246,31 +264,6 @@
       }
     }
   },
-  "meme_settings": {
-    "description": "表情与表达",
-    "hint": "星汐只负责表情补充节奏；Meme Manager 负责最终开关、概率、类别与图片。",
-    "type": "object",
-    "items": {
-      "meme_complement_enabled": {
-        "description": "启用星汐文字回复后的表情包补充",
-        "type": "bool",
-        "hint": "只控制星汐是否为已成功发送的安全文字回复申请一次 Meme 补图。关闭后星汐不会调用 compatibility 补图链；Meme Manager 自身功能和其他插件不受影响。",
-        "default": true
-      },
-      "meme_complement_cadence_turns": {
-        "description": "普通安全闲聊触发表情包所需回合数",
-        "type": "int",
-        "hint": "至少为 1；实际出图仍由 Meme Manager 插件的开关、类别和概率共同决定。",
-        "default": 4
-      },
-      "meme_complement_cooldown_turns": {
-        "description": "表情包补充后的冷却回合数",
-        "type": "int",
-        "hint": "至少为 1；星汐只决定是否尝试补充，Meme Manager 负责最终出图。",
-        "default": 4
-      }
-    }
-  },
   "permission_settings": {
     "description": "权限与主人动作",
     "hint": "可信身份、普通用户工具白名单和默认关闭的主人动作。",
@@ -297,8 +290,9 @@
       "guest_allowed_tools": {
         "description": "普通用户只读工具白名单",
         "type": "list",
-        "hint": "按 LLM 工具名称精确匹配。默认开放 AnySearch 普通搜索和网页提取；批量搜索未默认开放，以控制额度、Token 与等待时间。只加入你亲自确认过的只读查询工具，绝对不要加入浏览器控制、文件、Shell、代码执行、服务器管理或其他可写工具。",
+        "hint": "按 LLM 工具名称精确匹配。默认开放 AstrBot 原生知识库查询、AnySearch 普通搜索和网页提取；批量搜索未默认开放，以控制额度、Token 与等待时间。知识库内容及启停仍由 AstrBot 自带知识库设置控制。只加入你亲自确认过的只读查询工具，绝对不要加入浏览器控制、文件、Shell、代码执行、服务器管理或其他可写工具。",
         "default": [
+          "astr_kb_search",
           "anysearch_search",
           "anysearch_extract"
         ]

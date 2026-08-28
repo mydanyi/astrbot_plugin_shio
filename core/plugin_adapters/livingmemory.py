@@ -13,7 +13,7 @@ from typing import Any
 
 from ..context_assembler import ProvenancedFact
 from ..contracts import DecisionBinding, PluginEvidenceStatus
-from ..identity import build_sender_key
+from ..identity import build_account_key
 
 
 EXPECTED_PLUGIN_NAME = "astrbot_plugin_livingmemory"
@@ -358,18 +358,8 @@ def _adapt_candidate(
     content = _content(row, metadata)
     if not content:
         return None, "empty_content"
-    explicit_subject = str(
-        _first(row, metadata, "subject_key") or ""
-    ).strip()
-    if explicit_subject:
-        if not explicit_subject.startswith(f"{binding.scope_key}|user:"):
-            return None, "foreign_scope"
-        subject_key = explicit_subject
-    else:
-        sender_id = str(
-            _first(row, metadata, "sender_id", "user_id") or ""
-        ).strip()
-        subject_key = build_sender_key(binding.scope_key, sender_id)
+    sender_id = str(_first(row, metadata, "sender_id", "user_id") or "").strip()
+    subject_key = build_account_key(_first(row, metadata, "platform_id"), sender_id)
 
     raw_scope = str(_first(row, metadata, "scope") or "").strip().lower()
     if subject_key:
@@ -386,6 +376,8 @@ def _adapt_candidate(
             return None, "missing_subject"
         if raw_scope not in {"group", "group_background", "global", "public"}:
             return None, "missing_subject"
+        if raw_scope in {"group", "group_background"} and record_session != binding.session_id:
+            return None, "unverified_group_scope"
         fact_scope = raw_scope
 
     default_confidence = (

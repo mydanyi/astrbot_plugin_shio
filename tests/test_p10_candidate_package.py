@@ -16,7 +16,7 @@ from astrbot_plugin_shio.scripts.build_p10_candidate import (
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_VERSION = "0.5.10"
+EXPECTED_VERSION = "0.5.25"
 FORBIDDEN_PARTS = {
     ".git",
     ".github",

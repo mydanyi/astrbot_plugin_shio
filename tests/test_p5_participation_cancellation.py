@@ -34,16 +34,30 @@ from astrbot_plugin_shio.core.generation_epoch import (
 )
 
 
+_SEMANTIC_REPLY = (
+    '{"decision":"REPLY","target":"current_message",'
+    '"topic_anchor":"current_message","reason_code":"natural_continuation",'
+    '"confidence":0.9}'
+)
+
+
 class P5ParticipationCancellationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         FakeStarTools.data_dir = Path(self.temp.name)
+        self.provider = FakeProvider([])
         self.plugin = main.ShioPlugin(
-            FakeContext(FakeProvider([])),
+            FakeContext(self.provider),
             {
                 "persona_name": "亚托莉",
                 "natural_name_wake_aliases": ["亚托莉", "萝卜子"],
                 "prefer_livingmemory_group_history": False,
+                "natural_group_participation_enabled": True,
+                "natural_group_participation_allowlist": [
+                    "p5-cancel-same",
+                    "p5-cancel-react",
+                ],
+                "natural_group_participation_min_context_messages": 2,
             },
         )
         self.turn = 0
@@ -67,13 +81,27 @@ class P5ParticipationCancellationTests(unittest.IsolatedAsyncioTestCase):
         return event
 
     async def _prepare(self, event: FakeEvent, *, now: float):
-        request = FakeRequest(event.message)
         with patch("astrbot_plugin_shio.main.time.monotonic", return_value=now):
-            await self.plugin.enforce_agent_permission(event, request)
-            await self.plugin.build_persona_reply(event, request)
+            self.plugin.admit_ingress_event(event)
+        if event.get_extra(main.SHIO_PARTICIPATION_SEMANTIC_REQUEST) is not None:
+            self.provider.outputs.append(_SEMANTIC_REPLY)
+            await self.plugin._resolve_participation_semantic(event)
+        request = FakeRequest(event.message)
+        await self.plugin.enforce_agent_permission(event, request)
+        await self.plugin.build_persona_reply(event, request)
         return request, event.get_extra(main.SHIO_PLANNED_ACTION)
 
+    def _prime(self, group: str, *, now: float) -> None:
+        prior = self._event(
+            "peer-b",
+            "刚才的话题还没说完",
+            group=group,
+        )
+        with patch("astrbot_plugin_shio.main.time.monotonic", return_value=now):
+            self.plugin.admit_ingress_event(prior)
+
     async def test_new_same_scope_turn_drops_old_natural_join_before_guard(self):
+        self._prime("p5-cancel-same", now=90.0)
         old = self._event("peer-a", "大家今晚吃什么？", group="p5-cancel-same")
         _, old_plan = await self._prepare(old, now=100.0)
         self.assertIs(old_plan.kind, ActionKind.REPLY)
@@ -95,6 +123,7 @@ class P5ParticipationCancellationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_new_same_scope_turn_invalidates_react_but_other_scope_does_not(self):
+        self._prime("p5-cancel-react", now=190.0)
         reaction = self._event(
             "peer-a",
             "我觉得萝卜子这个表情好可爱哈哈",

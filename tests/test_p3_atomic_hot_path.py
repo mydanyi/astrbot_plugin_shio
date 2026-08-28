@@ -49,6 +49,11 @@ from astrbot_plugin_shio.core.tool_broker import AcquisitionRequest
 ROOT = Path(main.__file__).parent
 ANYSEARCH_SOURCE = "data.plugins.astrbot_plugin_anysearch.main"
 LEGACY_TOOL_RESULTS_EXTRA = "_shio_typed_tool_results"
+_SEMANTIC_REPLY = (
+    '{"decision":"REPLY","target":"current_message",'
+    '"topic_anchor":"current_message","reason_code":"natural_continuation",'
+    '"confidence":0.9}'
+)
 
 
 class At:
@@ -97,6 +102,7 @@ class P3AtomicHotPathTests(unittest.IsolatedAsyncioTestCase):
         tools: tuple[FakeTool, ...] = (),
         direct: bool = True,
         components: tuple[object, ...] = (),
+        prime_context: bool = False,
     ):
         self.runtime_count += 1
         FakeStarTools.data_dir = Path(self.temp.name) / f"runtime-{self.runtime_count}"
@@ -108,8 +114,19 @@ class P3AtomicHotPathTests(unittest.IsolatedAsyncioTestCase):
                 "persona_name": "亚托莉",
                 "guest_allowed_tools": ["anysearch_search"],
                 "prefer_livingmemory_group_history": False,
+                "natural_group_participation_enabled": True,
+                "natural_group_participation_allowlist": [group_id] if group_id else [],
+                "natural_group_participation_min_context_messages": 2,
             },
         )
+        if group_id and prime_context:
+            prior = FakeEvent(
+                "peer-b",
+                "刚才的话题还没说完",
+                group_id=group_id,
+            )
+            prior.message_id = f"p3-hot-prior-{self.runtime_count}"
+            plugin.admit_ingress_event(prior)
         event = FakeEvent(sender_id, message, group_id=group_id)
         event.message_id = f"p3-hot-{sender_id}-{abs(hash((message, group_id))) % 100000}"
         event.get_messages = lambda: list(components)
@@ -119,6 +136,8 @@ class P3AtomicHotPathTests(unittest.IsolatedAsyncioTestCase):
             event.unified_msg_origin = f"aiocqhttp:FriendMessage:{sender_id}"
         request = FakeRequest(message)
         request.func_tool = FakeToolSet(list(tools))
+        if group_id and prime_context and not direct:
+            provider.outputs.append(_SEMANTIC_REPLY)
 
         await plugin.enforce_agent_permission(event, request)
         await plugin.build_persona_reply(event, request)
@@ -188,6 +207,7 @@ class P3AtomicHotPathTests(unittest.IsolatedAsyncioTestCase):
                     direct=False,
                     components=components,
                     tools=(_anysearch_tool(),),
+                    prime_context=True,
                 )
 
                 address = event.get_extra(main.SHIO_ADDRESS_DECISION)
@@ -212,7 +232,10 @@ class P3AtomicHotPathTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(request.prompt)
                 self.assertEqual(_tool_names(request), [])
                 self.assertIsNone(request.tool_calls_result)
-                self.assertEqual(provider.calls, [])
+                self.assertEqual(
+                    len(provider.calls),
+                    0 if expected_action is ActionKind.NO_ACTION else 1,
+                )
 
     async def test_ordinary_chat_has_no_acquisition_or_tool_execution(self):
         _, event, request, provider = await self._run_turn(

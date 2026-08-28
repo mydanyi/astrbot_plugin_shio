@@ -38,6 +38,13 @@ from astrbot_plugin_shio.core.contracts import (
 from astrbot_plugin_shio.core.participation_engine import ParticipationAssessment
 
 
+_SEMANTIC_REPLY = (
+    '{"decision":"REPLY","target":"current_message",'
+    '"topic_anchor":"current_message","reason_code":"natural_continuation",'
+    '"confidence":0.9}'
+)
+
+
 class At:
     type = "at"
 
@@ -135,36 +142,56 @@ class P5ParticipationEngineTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertFalse(wait.is_at_or_wake_command)
 
-    def test_about_self_can_join_but_open_group_requires_persona_interest(self):
+    def test_about_self_interest_and_grounded_open_question_can_join(self):
         about_plugin, _ = self._plugin()
         self._prime_context(about_plugin)
         about = self._event("我觉得萝卜子这个称呼很有趣", "about")
         about_assessment = self._admit(about_plugin, about)
         self.assertIs(about_assessment.decision.level, ParticipationLevel.MAY_JOIN)
-        self.assertTrue(about.is_at_or_wake_command)
-        self.assertTrue(about.is_wake)
+        self.assertFalse(about.is_at_or_wake_command)
+        self.assertIsNotNone(
+            about.get_extra(main.SHIO_PARTICIPATION_SEMANTIC_REQUEST)
+        )
 
         atri_plugin, _ = self._plugin(persona_name="亚托莉")
         self._prime_context(atri_plugin)
         atri = self._event("大家今晚吃什么？", "atri-meal")
         atri_assessment = self._admit(atri_plugin, atri)
         self.assertIs(atri_assessment.decision.level, ParticipationLevel.MAY_JOIN)
-        self.assertGreater(atri_assessment.interest_relevance, 0.0)
-        self.assertTrue(atri.is_at_or_wake_command)
+        self.assertEqual(atri_assessment.interest_relevance, 0.0)
+        self.assertFalse(atri.is_at_or_wake_command)
 
         neutral_plugin, _ = self._plugin(persona_name="中性基准")
         self._prime_context(neutral_plugin)
         neutral = self._event("大家今晚吃什么？", "neutral-meal")
         neutral_assessment = self._admit(neutral_plugin, neutral)
-        self.assertIs(neutral_assessment.decision.level, ParticipationLevel.NO_ACTION)
+        self.assertIs(neutral_assessment.decision.level, ParticipationLevel.MAY_JOIN)
         self.assertEqual(neutral_assessment.interest_relevance, 0.0)
+        self.assertIn(
+            "semantic_participation_candidate",
+            neutral_assessment.reason_codes,
+        )
         self.assertFalse(neutral.is_at_or_wake_command)
+
+        unrelated_plugin, _ = self._plugin(persona_name="中性基准")
+        self._prime_context(unrelated_plugin, "刚把文档整理完")
+        unrelated = self._event("我换了个新头像", "neutral-unrelated")
+        unrelated_assessment = self._admit(unrelated_plugin, unrelated)
+        self.assertIs(
+            unrelated_assessment.decision.level,
+            ParticipationLevel.MAY_JOIN,
+        )
+        self.assertIn(
+            "semantic_participation_candidate",
+            unrelated_assessment.reason_codes,
+        )
 
     async def test_may_join_uses_typed_reply_pipeline_without_tools(self):
         plugin, provider = self._plugin()
         self._prime_context(plugin)
         event = self._event("大家今晚吃什么？", "hot-path")
         assessment = self._admit(plugin, event)
+        provider.outputs.append(_SEMANTIC_REPLY)
         request = FakeRequest(event.message)
         request.func_tool = FakeToolSet([FakeTool("anysearch_search")])
 
@@ -178,7 +205,7 @@ class P5ParticipationEngineTests(unittest.IsolatedAsyncioTestCase):
             ParticipationLevel.MAY_JOIN,
         )
         self.assertEqual(tuple(request.func_tool.tools), ())
-        self.assertEqual(provider.calls, [])
+        self.assertEqual(len(provider.calls), 1)
         policy = event.get_extra(main.SHIO_ACTIVE_CAPABILITY_POLICY)
         self.assertEqual(policy.conversation_mode, "group_join")
         self.assertFalse(policy.is_degraded)
@@ -189,6 +216,52 @@ class P5ParticipationEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(event.get_extra(main.SHIO_PRESENTATION_HANDOFF))
         self.assertIsNotNone(event.get_extra(main.SHIO_SEMANTIC_VALIDATION_SEAL))
 
+    async def test_may_join_uses_kb_then_keeps_final_renderer_tool_free(self):
+        kb_tool = FakeTool(
+            "astr_kb_search",
+            "Query the knowledge base for facts or relevant context.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+            module="astrbot.core.tools.knowledge_base_tools",
+            result_content="仿生人是外表和行为接近人类的人造生命。",
+        )
+        self.plugin_count += 1
+        FakeStarTools.data_dir = Path(self.temp.name) / f"runtime-{self.plugin_count}"
+        provider = FakeProvider([_SEMANTIC_REPLY])
+        plugin = main.ShioPlugin(
+            FakeContext(provider, global_tools=[kb_tool]),
+            {
+                "persona_name": "亚托莉",
+                "guest_allowed_tools": ["astr_kb_search"],
+                "prefer_livingmemory_group_history": False,
+                "natural_group_participation_enabled": True,
+                "natural_group_participation_rules": "像普通群友一样顺着话题接一句。",
+                "natural_group_participation_allowlist": ["p5-participation-group"],
+                "natural_group_participation_min_context_messages": 2,
+            },
+        )
+        self._prime_context(plugin, "他们刚才一直在聊仿生人这个网络黑话")
+        event = self._event("仿生人这个网络黑话是什么意思？", "group-kb")
+        assessment = self._admit(plugin, event)
+        self.assertIs(assessment.decision.level, ParticipationLevel.MAY_JOIN)
+        request = FakeRequest(event.message)
+        request.func_tool = FakeToolSet([kb_tool])
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+
+        planned = event.get_extra(main.SHIO_PLANNED_ACTION)
+        acquisition = event.get_extra(main.SHIO_ACQUISITION_REQUEST)
+        evidence = event.get_extra(main.SHIO_EVIDENCE_OUTCOME)
+        self.assertIs(planned.kind, ActionKind.USE_TOOL)
+        self.assertEqual(acquisition.selection.tool_name, "astr_kb_search")
+        self.assertTrue(evidence.facts)
+        self.assertTrue(request.func_tool.empty())
+        self.assertIn("自然接话完整规则", request.system_prompt)
+
     def test_recent_group_context_can_supply_interest_for_elliptical_current_turn(self):
         plugin, _ = self._plugin()
         self._prime_context(plugin, "你们刚才说晚饭想吃面来着")
@@ -197,9 +270,12 @@ class P5ParticipationEngineTests(unittest.IsolatedAsyncioTestCase):
         assessment = self._admit(plugin, event)
 
         self.assertIs(assessment.decision.level, ParticipationLevel.MAY_JOIN)
-        self.assertGreater(assessment.interest_relevance, 0.0)
+        self.assertEqual(assessment.interest_relevance, 0.0)
         self.assertGreaterEqual(assessment.context_message_count, 2)
-        self.assertTrue(event.is_at_or_wake_command)
+        self.assertFalse(event.is_at_or_wake_command)
+        self.assertIsNotNone(
+            event.get_extra(main.SHIO_PARTICIPATION_SEMANTIC_REQUEST)
+        )
 
     def test_independent_master_switch_and_context_depth_fail_closed(self):
         disabled_plugin, _ = self._plugin(natural_participation_enabled=False)

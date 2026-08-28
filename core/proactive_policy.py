@@ -20,6 +20,8 @@ _DECISION_SEAL = object()
 _STATE_FILENAME = "proactive_state.json"
 _SECRET_FILENAME = ".proactive_install_secret"
 _MAX_STATE_BYTES = 1024 * 1024
+_RECENT_DIGEST_LIMIT = 4
+_STATE_TRANSACTION_LOCK = threading.RLock()
 
 
 def _exact_text(value: object, reason: str, *, maximum: int = 512) -> str:
@@ -32,6 +34,16 @@ def _exact_text(value: object, reason: str, *, maximum: int = 512) -> str:
 
 def _exact_time(value: object, reason: str) -> float:
     if type(value) is not float or not math.isfinite(value) or value < 0:
+        raise ContractViolation(reason)
+    return value
+
+
+def _exact_digest(value: object, reason: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
         raise ContractViolation(reason)
     return value
 
@@ -119,6 +131,7 @@ class ProactivePolicyTerminalKind(str, Enum):
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     PROVIDER_FAILED = "provider_failed"
     OUTPUT_REJECTED = "output_rejected"
+    GROUNDING_UNAVAILABLE = "grounding_unavailable"
     SEND_FAILED = "send_failed"
     SUPERSEDED = "superseded"
     STOPPED = "stopped"
@@ -195,6 +208,8 @@ class _GroupState:
     trigger_day: int
     daily_count: int
     last_trigger_observed_at: float
+    recent_topic_digests: tuple[str, ...]
+    recent_final_digests: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +384,8 @@ class ProactivePolicyState:
             "trigger_day": record.trigger_day,
             "daily_count": record.daily_count,
             "last_trigger_observed_at": record.last_trigger_observed_at,
+            "recent_topic_digests": list(record.recent_topic_digests),
+            "recent_final_digests": list(record.recent_final_digests),
         }
 
     def _load_records(self) -> dict[str, _GroupState]:
@@ -384,7 +401,7 @@ class ProactivePolicyState:
             raise ValueError("state_shape")
         if (
             type(payload["schema_version"]) is not int
-            or payload["schema_version"] not in {1, 2}
+            or payload["schema_version"] not in {1, 2, 3}
         ):
             raise ValueError("state_schema")
         schema_version = payload["schema_version"]
@@ -415,7 +432,7 @@ class ProactivePolicyState:
         if not hmac.compare_digest(state_mac, expected_mac):
             raise ValueError("state_mac")
         records: dict[str, _GroupState] = {}
-        expected = {
+        legacy_expected = {
             "fingerprint",
             "first_observed_at",
             "last_activity_at",
@@ -425,8 +442,13 @@ class ProactivePolicyState:
             "daily_count",
             "last_trigger_observed_at",
         }
+        expected = legacy_expected | {
+            "recent_topic_digests",
+            "recent_final_digests",
+        }
         for row in rows:
-            if type(row) is not dict or set(row) != expected:
+            required_shape = expected if schema_version == 3 else legacy_expected
+            if type(row) is not dict or set(row) != required_shape:
                 raise ValueError("state_record_shape")
             fingerprint = row["fingerprint"]
             times = tuple(
@@ -439,6 +461,18 @@ class ProactivePolicyState:
                     "last_trigger_observed_at",
                 )
             )
+            topic_digests = (
+                tuple(row["recent_topic_digests"])
+                if schema_version == 3
+                and type(row["recent_topic_digests"]) is list
+                else ()
+            )
+            final_digests = (
+                tuple(row["recent_final_digests"])
+                if schema_version == 3
+                and type(row["recent_final_digests"]) is list
+                else ()
+            )
             if (
                 type(fingerprint) is not str
                 or len(fingerprint) != 64
@@ -448,6 +482,23 @@ class ProactivePolicyState:
                 or row["trigger_day"] < -1
                 or type(row["daily_count"]) is not int
                 or not 0 <= row["daily_count"] <= self._policy.daily_limit
+                or (
+                    schema_version == 3
+                    and (
+                        type(row["recent_topic_digests"]) is not list
+                        or type(row["recent_final_digests"]) is not list
+                    )
+                )
+                or len(topic_digests) > _RECENT_DIGEST_LIMIT
+                or len(final_digests) > _RECENT_DIGEST_LIMIT
+                or any(
+                    type(value) is not str
+                    or len(value) != 64
+                    or any(character not in "0123456789abcdef" for character in value)
+                    for value in (*topic_digests, *final_digests)
+                )
+                or len(set(topic_digests)) != len(topic_digests)
+                or len(set(final_digests)) != len(final_digests)
                 or fingerprint in records
             ):
                 raise ValueError("state_record_invalid")
@@ -460,6 +511,8 @@ class ProactivePolicyState:
                 trigger_day=row["trigger_day"],
                 daily_count=row["daily_count"],
                 last_trigger_observed_at=times[4],
+                recent_topic_digests=topic_digests,
+                recent_final_digests=final_digests,
             )
         return records
 
@@ -473,11 +526,11 @@ class ProactivePolicyState:
             allow_nan=False,
         ).encode("utf-8")
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "records": rows,
             "state_mac": hmac.new(
                 self._secret,
-                b"proactive-state-v2\x00" + rows_encoded,
+                b"proactive-state-v3\x00" + rows_encoded,
                 hashlib.sha256,
             ).hexdigest(),
         }
@@ -507,6 +560,22 @@ class ProactivePolicyState:
             return False
         return True
 
+    def _refresh_records(self) -> bool:
+        """Reload the latest authenticated snapshot inside the global transaction."""
+
+        try:
+            if self._state_path.exists():
+                self._records = self._load_records()
+            elif self._records:
+                raise ValueError("state_disappeared")
+            else:
+                self._records = {}
+        except BaseException:
+            self._records = {}
+            self._failure_code = "proactive_state_unavailable"
+            return False
+        return True
+
     def observe_group_activity(
         self,
         *,
@@ -519,10 +588,12 @@ class ProactivePolicyState:
         bot = _exact_text(bot_id, "proactive_bot_invalid", maximum=160)
         group = _exact_text(group_id, "proactive_group_invalid", maximum=160)
         timestamp = _exact_time(observed_at, "proactive_activity_clock_invalid")
-        with self._lock:
+        with self._lock, _STATE_TRANSACTION_LOCK:
             if not self._policy.enabled or not self._policy.group_allowlist:
                 return False
             if group not in self._policy.group_allowlist or self._failure_code:
+                return False
+            if not self._refresh_records():
                 return False
             fingerprint = self._fingerprint(platform, bot, group)
             current = self._records.get(fingerprint)
@@ -543,6 +614,12 @@ class ProactivePolicyState:
                 last_trigger_observed_at=(
                     current.last_trigger_observed_at if current is not None else 0.0
                 ),
+                recent_topic_digests=(
+                    current.recent_topic_digests if current is not None else ()
+                ),
+                recent_final_digests=(
+                    current.recent_final_digests if current is not None else ()
+                ),
             )
             candidate = dict(self._records)
             candidate[fingerprint] = updated
@@ -553,13 +630,39 @@ class ProactivePolicyState:
 
     def tracks_group(self, group_id: str) -> bool:
         group = _exact_text(group_id, "proactive_group_invalid", maximum=160)
-        with self._lock:
+        with self._lock, _STATE_TRANSACTION_LOCK:
             return bool(
                 self._policy.enabled
                 and group in self._policy.group_allowlist
                 and not self._failure_code
                 and self._secret
             )
+
+    def recent_delivery_digests(
+        self,
+        *,
+        platform_id: str,
+        bot_id: str,
+        group_id: str,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Return privacy-minimal per-group repeat guards from authenticated state."""
+
+        platform = _exact_text(platform_id, "proactive_platform_invalid", maximum=160)
+        bot = _exact_text(bot_id, "proactive_bot_invalid", maximum=160)
+        group = _exact_text(group_id, "proactive_group_invalid", maximum=160)
+        with self._lock, _STATE_TRANSACTION_LOCK:
+            if (
+                not self._policy.enabled
+                or group not in self._policy.group_allowlist
+                or self._failure_code
+                or not self._secret
+                or not self._refresh_records()
+            ):
+                raise ContractViolation("proactive_state_unavailable")
+            current = self._records.get(self._fingerprint(platform, bot, group))
+            if current is None:
+                return (), ()
+            return current.recent_topic_digests, current.recent_final_digests
 
     def _active_hour(self, now: float) -> bool:
         local_seconds = now + self._policy.timezone_offset_minutes * 60
@@ -620,7 +723,7 @@ class ProactivePolicyState:
     ) -> ProactivePolicyDecision:
         timestamp = _exact_time(now, "proactive_policy_clock_invalid")
         self._trigger_authority.inspect_candidate(candidate)
-        with self._lock:
+        with self._lock, _STATE_TRANSACTION_LOCK:
             if candidate in self._evaluated:
                 raise ContractViolation("proactive_candidate_evaluated")
             source = candidate.source
@@ -658,6 +761,12 @@ class ProactivePolicyState:
                     kind=ProactivePolicyDecisionKind.STATE_UNAVAILABLE,
                     now=timestamp,
                 )
+            if not self._refresh_records():
+                return self._issue_decision(
+                    candidate,
+                    kind=ProactivePolicyDecisionKind.STATE_UNAVAILABLE,
+                    now=timestamp,
+                )
             if not self._active_hour(timestamp):
                 return self._issue_decision(
                     candidate,
@@ -686,6 +795,8 @@ class ProactivePolicyState:
                     trigger_day=-1,
                     daily_count=0,
                     last_trigger_observed_at=0.0,
+                    recent_topic_digests=(),
+                    recent_final_digests=(),
                 )
             if timestamp < current.last_seen_at or observed_at < current.first_observed_at:
                 return self._issue_decision(
@@ -751,17 +862,35 @@ class ProactivePolicyState:
         terminal: ProactivePolicyTerminalKind,
         *,
         now: float,
+        topic_digest: str = "",
+        final_text_digest: str = "",
     ) -> None:
         timestamp = _exact_time(now, "proactive_terminal_clock_invalid")
         if type(terminal) is not ProactivePolicyTerminalKind:
             raise ContractViolation("proactive_terminal_kind_invalid")
-        with self._lock:
+        if terminal is ProactivePolicyTerminalKind.SENT:
+            topic = _exact_digest(
+                topic_digest,
+                "proactive_terminal_topic_digest_invalid",
+            )
+            final = _exact_digest(
+                final_text_digest,
+                "proactive_terminal_final_digest_invalid",
+            )
+        elif topic_digest or final_text_digest:
+            raise ContractViolation("proactive_terminal_digest_not_sent")
+        else:
+            topic = ""
+            final = ""
+        with self._lock, _STATE_TRANSACTION_LOCK:
             record = self._inspect(decision, require_current=False)
             if record.kind is not ProactivePolicyDecisionKind.ADMITTED or not record.admitted:
                 raise ContractViolation("proactive_terminal_policy_not_admitted")
             if decision in self._terminals:
                 raise ContractViolation("proactive_terminal_replayed")
             if terminal is ProactivePolicyTerminalKind.SENT:
+                if not self._refresh_records():
+                    raise ContractViolation("proactive_terminal_state_unavailable")
                 target = record.candidate.target
                 fingerprint = self._fingerprint(
                     target.platform_id,
@@ -781,6 +910,12 @@ class ProactivePolicyState:
                     last_trigger_at=timestamp,
                     trigger_day=day,
                     daily_count=daily_count + 1,
+                    recent_topic_digests=tuple(
+                        dict.fromkeys((*current.recent_topic_digests, topic))
+                    )[-_RECENT_DIGEST_LIMIT:],
+                    recent_final_digests=tuple(
+                        dict.fromkeys((*current.recent_final_digests, final))
+                    )[-_RECENT_DIGEST_LIMIT:],
                 )
                 persisted = dict(self._records)
                 persisted[fingerprint] = updated
@@ -832,7 +967,7 @@ class ProactivePolicyState:
     def trace_metadata(self) -> dict[str, str | int | bool]:
         with self._lock:
             return {
-                "schema_version": 2,
+                "schema_version": 3,
                 "proactive_policy_enabled": self._policy.enabled,
                 "proactive_allowlist_empty": not bool(self._policy.group_allowlist),
                 "proactive_state_operational": bool(

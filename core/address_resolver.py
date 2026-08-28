@@ -421,6 +421,32 @@ def _build_address_authority_vault():
                 raise ContractViolation("resolved_address_corrupt")
             return decision
 
+    def release(
+        authority: AddressResolutionAuthority,
+        decision: AddressDecision,
+    ) -> bool:
+        """Terminally retire one exact canonical decision.
+
+        A decision remains inspectable until its owning pipeline reaches a
+        terminal state.  Release validates the immutable decision snapshot
+        before removing it; a duplicate release is deliberately harmless and
+        a removed decision can never be inspected again.
+        """
+        if type(decision) is not AddressDecision:
+            raise ContractViolation("resolved_address_required")
+        with lock:
+            state = state_for(authority)
+            record = state.records.get(decision)
+            if record is None:
+                return False
+            try:
+                if decision.binding is not record.binding or _address_snapshot(decision) != record.snapshot:
+                    raise ContractViolation("resolved_address_corrupt")
+            except ContractViolation:
+                raise
+            del state.records[decision]
+            return True
+
     def metrics(authority: AddressResolutionAuthority) -> dict[str, int | bool]:
         with lock:
             state = state_for(authority)
@@ -431,7 +457,7 @@ def _build_address_authority_vault():
                 "resolved_address_bounded": count <= state.max_decisions,
             }
 
-    return register, publish, inspect, metrics
+    return register, publish, inspect, metrics, release
 
 
 (
@@ -439,6 +465,7 @@ def _build_address_authority_vault():
     _publish_resolved_address,
     _inspect_resolved_address,
     _address_authority_metrics,
+    _release_resolved_address,
 ) = _build_address_authority_vault()
 
 
@@ -500,6 +527,11 @@ class AddressResolutionAuthority:
             context=context,
             binding=binding,
         )
+
+    def release(self, decision: AddressDecision) -> bool:
+        """Release an exact decision after its pipeline reaches terminal state."""
+
+        return _release_resolved_address(self, decision)
 
     def trace_metadata(self) -> dict[str, int | bool]:
         return _address_authority_metrics(self)

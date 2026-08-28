@@ -77,6 +77,16 @@ def _load_fixture():
     )
 
 
+def _system_sections(system_prompt: str) -> tuple[str, str, str]:
+    common, remainder = system_prompt.split(
+        "[角色人格与表达｜可信配置]", 1
+    )
+    persona, capability = remainder.split(
+        "[本轮真实能力｜代码生成]", 1
+    )
+    return common, persona, capability
+
+
 def _canonical_chain(package, message: str):
     turn = typed_turn(package, message)
     media = MediaContext(binding=turn.binding)
@@ -91,7 +101,7 @@ def _canonical_chain(package, message: str):
         persona_package=package,
         capability_policy=turn.policy,
         current_message=message,
-        sender_name="群友",
+        sender_name="人格评测参与者",
         current_question_anchor=turn.anchor,
         media_context=media,
     )
@@ -182,19 +192,27 @@ class P10PersonaABTests(unittest.IsolatedAsyncioTestCase):
                 turn.continuous_affect.trace_metadata(),
                 baseline_turn.continuous_affect.trace_metadata(),
             )
-            self.assertEqual(request.system_prompt, baseline_request.system_prompt)
+            request_common, _request_persona, request_capability = _system_sections(
+                request.system_prompt
+            )
+            baseline_common, _baseline_persona, baseline_capability = _system_sections(
+                baseline_request.system_prompt
+            )
+            self.assertEqual(request_common, baseline_common)
+            self.assertEqual(request_capability, baseline_capability)
             self.assertEqual(request.reply_shape, baseline_request.reply_shape)
             self.assertEqual(request.call_budget, baseline_request.call_budget)
-            self.assertEqual(
-                request.user_prompt.split("[人格与表达]", 1)[0],
-                baseline_request.user_prompt.split("[人格与表达]", 1)[0],
-            )
+            self.assertEqual(request.user_prompt, baseline_request.user_prompt)
 
         persona_sections = tuple(
-            request.user_prompt.split("[人格与表达]", 1)[1]
+            _system_sections(request.system_prompt)[1]
             for _turn, request, _contract, _context in chains
         )
         self.assertEqual(len(set(persona_sections)), 4)
+        self.assertIn("人格评测参与者", baseline_request.system_prompt)
+        self.assertNotIn("人格评测参与者", baseline_request.user_prompt)
+        self.assertNotIn("同群成员", baseline_request.system_prompt)
+        self.assertNotRegex(baseline_request.system_prompt, r"群友[0-9]+")
 
     def test_fixed_chinese_outputs_share_facts_but_are_distinguishable(self):
         required = tuple(self.scenario["required_fact_atoms"])
@@ -263,10 +281,11 @@ class P10PersonaABTests(unittest.IsolatedAsyncioTestCase):
                 repair_payload["original_generation_data"],
                 request.user_prompt,
             )
-            self.assertIn("人格和关系边界", repair_request.system_prompt)
-            persona_section = repair_payload["original_generation_data"].split(
-                "[人格与表达]", 1
-            )[1]
+            self.assertIn("[受限修复模式]", repair_request.system_prompt)
+            self.assertTrue(
+                repair_request.system_prompt.startswith(request.system_prompt)
+            )
+            persona_section = _system_sections(repair_request.system_prompt)[1]
             repair_persona_sections.append(persona_section)
             self.assertEqual(repair_request.composer_request.package_id, row["package_id"])
             self.assertIn(row["display_name"], persona_section)
@@ -355,11 +374,15 @@ class P10PersonaABTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(request.planned_action.kind, baseline.planned_action.kind)
             self.assertEqual(request.capability_policy, baseline.capability_policy)
-            self.assertEqual(request.system_prompt, baseline.system_prompt)
-            self.assertEqual(
-                request.user_prompt.split("[人格与表达]", 1)[0],
-                baseline.user_prompt.split("[人格与表达]", 1)[0],
+            request_common, _request_persona, request_capability = _system_sections(
+                request.system_prompt
             )
+            baseline_common, _baseline_persona, baseline_capability = _system_sections(
+                baseline.system_prompt
+            )
+            self.assertEqual(request_common, baseline_common)
+            self.assertEqual(request_capability, baseline_capability)
+            self.assertEqual(request.user_prompt, baseline.user_prompt)
 
     def test_generic_runtime_has_no_four_persona_branch(self):
         source = Path(main.__file__).read_text(encoding="utf-8")

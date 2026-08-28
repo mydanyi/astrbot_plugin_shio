@@ -36,8 +36,10 @@ class InferencePriority(str, Enum):
 
 
 class InferencePurpose(str, Enum):
+    RISK = "risk"
     PRIMARY = "primary"
     REPAIR = "repair"
+    PARTICIPATION = "participation"
     PROACTIVE = "proactive"
 
 
@@ -113,10 +115,13 @@ class _PermitRecord:
     purpose: InferencePurpose
     wait_seconds: float
     acquired_at: float
+    completed_at: float | None
     state: str
     snapshot: tuple[object, ...]
     generation_snapshot: GenerationEpochSnapshot | None
     planned_action: PlannedAction | None
+    participation_request: object | None
+    participation_authority: object | None
     proactive_request: object | None
     proactive_authority: object | None
 
@@ -132,6 +137,8 @@ class _Waiter:
     generation_snapshot: GenerationEpochSnapshot | None = None
     principal_snapshot: _PrincipalSnapshot | None = None
     planned_action: PlannedAction | None = None
+    participation_request: object | None = None
+    participation_authority: object | None = None
     proactive_request: object | None = None
     proactive_authority: object | None = None
 
@@ -189,6 +196,9 @@ class InferenceBudgetAuthority:
             tuple[str, int], set[InferencePurpose]
         ] = OrderedDict()
         self._issued_proactive: weakref.WeakKeyDictionary[object, bool] = (
+            weakref.WeakKeyDictionary()
+        )
+        self._issued_participation: weakref.WeakKeyDictionary[object, bool] = (
             weakref.WeakKeyDictionary()
         )
         self._active_count = 0
@@ -267,6 +277,7 @@ class InferenceBudgetAuthority:
         tuple[str, int], InferencePriority, _PrincipalSnapshot
     ]:
         if type(purpose) is not InferencePurpose or purpose not in {
+            InferencePurpose.RISK,
             InferencePurpose.PRIMARY,
             InferencePurpose.REPAIR,
         }:
@@ -352,10 +363,13 @@ class InferenceBudgetAuthority:
             purpose=waiter.purpose,
             wait_seconds=wait_seconds,
             acquired_at=acquired_at,
+            completed_at=None,
             state="active",
             snapshot=snapshot,
             generation_snapshot=waiter.generation_snapshot,
             planned_action=waiter.planned_action,
+            participation_request=waiter.participation_request,
+            participation_authority=waiter.participation_authority,
             proactive_request=waiter.proactive_request,
             proactive_authority=waiter.proactive_authority,
         )
@@ -404,6 +418,13 @@ class InferenceBudgetAuthority:
                     self._planned_action_authority.inspect_plan(record.planned_action)
                 except ContractViolation as exc:
                     raise InferenceBudgetError("inference_permit_corrupt") from exc
+            elif record.participation_request is not None:
+                try:
+                    record.participation_authority.inspect_request(
+                        record.participation_request
+                    )
+                except Exception as exc:
+                    raise InferenceBudgetError("inference_permit_corrupt") from exc
             elif record.proactive_request is not None:
                 try:
                     record.proactive_authority.inspect_request(record.proactive_request)
@@ -437,6 +458,20 @@ class InferenceBudgetAuthority:
             return False
         return True
 
+    @staticmethod
+    def _participation_current(waiter: _Waiter) -> bool:
+        try:
+            waiter.participation_authority.inspect_request(
+                waiter.participation_request
+            )
+            return bool(
+                waiter.participation_authority.is_current(
+                    waiter.participation_request
+                )
+            )
+        except Exception:
+            return False
+
     def _rollback_waiter_reservation(self, waiter: _Waiter) -> None:
         if waiter.call_key is not None:
             purposes = self._issued_event_calls.get(waiter.call_key)
@@ -444,6 +479,8 @@ class InferenceBudgetAuthority:
                 purposes.discard(waiter.purpose)
                 if not purposes:
                     self._issued_event_calls.pop(waiter.call_key, None)
+        elif waiter.participation_request is not None:
+            self._issued_participation.pop(waiter.participation_request, None)
         elif waiter.proactive_request is not None:
             self._issued_proactive.pop(waiter.proactive_request, None)
 
@@ -458,7 +495,11 @@ class InferenceBudgetAuthority:
             current = (
                 self._event_current(waiter)
                 if waiter.generation_snapshot is not None
-                else self._proactive_current(waiter)
+                else (
+                    self._participation_current(waiter)
+                    if waiter.participation_request is not None
+                    else self._proactive_current(waiter)
+                )
             )
             if not current:
                 self._rollback_waiter_reservation(waiter)
@@ -485,9 +526,15 @@ class InferenceBudgetAuthority:
         expired = 0
         with self._permit_lock:
             for permit, record in tuple(self._permit_records.items()):
+                observed_at = (
+                    record.completed_at
+                    if record.completed_at is not None
+                    else now
+                )
                 if (
                     record.state != "active"
-                    or now - record.acquired_at < self._active_timeout_seconds
+                    or observed_at - record.acquired_at
+                    < self._active_timeout_seconds
                 ):
                     continue
                 self._permit_records[permit] = _PermitRecord(
@@ -495,10 +542,13 @@ class InferenceBudgetAuthority:
                     purpose=record.purpose,
                     wait_seconds=record.wait_seconds,
                     acquired_at=record.acquired_at,
+                    completed_at=record.completed_at,
                     state="expired",
                     snapshot=record.snapshot,
                     generation_snapshot=record.generation_snapshot,
                     planned_action=record.planned_action,
+                    participation_request=record.participation_request,
+                    participation_authority=record.participation_authority,
                     proactive_request=record.proactive_request,
                     proactive_authority=record.proactive_authority,
                 )
@@ -576,10 +626,16 @@ class InferenceBudgetAuthority:
                 self._rejected_count += 1
                 raise InferenceBudgetError("inference_active_timeout")
             purposes = self._issued_event_calls.setdefault(call_key, set())
-            if purpose in purposes or len(purposes) >= 2:
+            if purpose in purposes or len(purposes) >= 3:
                 self._rejected_count += 1
                 raise InferenceBudgetError("inference_call_budget_exhausted")
-            if purpose is InferencePurpose.REPAIR and InferencePurpose.PRIMARY not in purposes:
+            if purpose is InferencePurpose.PRIMARY and InferencePurpose.RISK not in purposes:
+                self._rejected_count += 1
+                raise InferenceBudgetError("inference_risk_call_required")
+            if purpose is InferencePurpose.REPAIR and (
+                InferencePurpose.RISK not in purposes
+                or InferencePurpose.PRIMARY not in purposes
+            ):
                 self._rejected_count += 1
                 raise InferenceBudgetError("inference_primary_call_required")
             purposes.add(purpose)
@@ -644,6 +700,56 @@ class InferenceBudgetAuthority:
             )
         return await self._enqueue(waiter)
 
+    async def acquire_participation(
+        self,
+        request: object,
+        authority: object,
+    ) -> InferencePermit:
+        from .participation_semantic import (
+            ParticipationSemanticAuthority,
+            ParticipationSemanticRequest,
+        )
+
+        if (
+            type(request) is not ParticipationSemanticRequest
+            or type(authority) is not ParticipationSemanticAuthority
+        ):
+            raise InferenceBudgetError("inference_participation_not_canonical")
+        try:
+            authority.inspect_request(request)
+            current = authority.is_current(request)
+        except Exception as exc:
+            raise InferenceBudgetError(
+                "inference_participation_not_canonical"
+            ) from exc
+        if not current:
+            raise InferenceBudgetError("inference_waiter_superseded")
+        lock = self._lock_for_loop()
+        loop = asyncio.get_running_loop()
+        async with lock:
+            if self._closed:
+                raise InferenceBudgetError("inference_budget_closed")
+            self._expire_active_locked(_monotonic())
+            if self._expired_active_count:
+                self._rejected_count += 1
+                raise InferenceBudgetError("inference_active_timeout")
+            if self._issued_participation.get(request, False):
+                self._rejected_count += 1
+                raise InferenceBudgetError("inference_call_budget_exhausted")
+            self._issued_participation[request] = True
+            self._sequence += 1
+            waiter = _Waiter(
+                sequence=self._sequence,
+                priority=InferencePriority.PARTICIPATION,
+                purpose=InferencePurpose.PARTICIPATION,
+                enqueued_at=_monotonic(),
+                future=loop.create_future(),
+                call_key=None,
+                participation_request=request,
+                participation_authority=authority,
+            )
+        return await self._enqueue(waiter)
+
     def _release_locked(self, permit: InferencePermit, *, state: str) -> bool:
         with self._permit_lock:
             record = self._permit_records.get(permit)
@@ -658,10 +764,13 @@ class InferenceBudgetAuthority:
                 purpose=record.purpose,
                 wait_seconds=record.wait_seconds,
                 acquired_at=record.acquired_at,
+                completed_at=record.completed_at,
                 state=state,
                 snapshot=record.snapshot,
                 generation_snapshot=record.generation_snapshot,
                 planned_action=record.planned_action,
+                participation_request=record.participation_request,
+                participation_authority=record.participation_authority,
                 proactive_request=record.proactive_request,
                 proactive_authority=record.proactive_authority,
             )
@@ -672,7 +781,39 @@ class InferenceBudgetAuthority:
         self._completed_count += 1
         return timely
 
-    async def release(self, permit: InferencePermit) -> bool:
+    def _bind_completion_time(
+        self,
+        permit: InferencePermit,
+        *,
+        completed_at: float,
+    ) -> bool:
+        with self._permit_lock:
+            record = self._inspect_record(permit, validate_source=False)
+            if record.state not in {"active", "expired"}:
+                return False
+            if record.completed_at is not None:
+                return True
+            self._permit_records[permit] = _PermitRecord(
+                priority=record.priority,
+                purpose=record.purpose,
+                wait_seconds=record.wait_seconds,
+                acquired_at=record.acquired_at,
+                completed_at=completed_at,
+                state=record.state,
+                snapshot=record.snapshot,
+                generation_snapshot=record.generation_snapshot,
+                planned_action=record.planned_action,
+                participation_request=record.participation_request,
+                participation_authority=record.participation_authority,
+                proactive_request=record.proactive_request,
+                proactive_authority=record.proactive_authority,
+            )
+            return True
+
+    async def _release_bound_completion(
+        self,
+        permit: InferencePermit,
+    ) -> bool:
         lock = self._lock_for_loop()
         async with lock:
             if self._closed:
@@ -680,16 +821,39 @@ class InferenceBudgetAuthority:
             # Releasing capacity is cleanup, not a new authorization decision.
             # The source plan may have been superseded or evicted while the
             # external model call was in flight; an exact active permit must
-            # still be able to free its global slot.
-            self._expire_active_locked(_monotonic())
-            self._inspect_record(permit, validate_source=False)
+            # still be able to free its global slot. Bind timeout ownership to
+            # when work handed the permit back, not to later async-lock delay.
+            record = self._inspect_record(permit, validate_source=False)
+            if record.state not in {"active", "expired"}:
+                return False
+            if record.completed_at is None:
+                raise InferenceBudgetError("inference_permit_corrupt")
+            if (
+                record.state == "active"
+                and record.completed_at - record.acquired_at
+                >= self._active_timeout_seconds
+            ):
+                self._expire_active_locked(record.completed_at)
             released = self._release_locked(permit, state="released")
+            # The exact permit is no longer active. Sweep other permits at the
+            # current clock without letting cleanup scheduling rewrite this
+            # permit's already-bound completion time.
+            self._expire_active_locked(_monotonic())
             if self._expired_active_count == 0:
                 self._dispatch_locked(_monotonic())
             return released
 
+    async def release(self, permit: InferencePermit) -> bool:
+        return await self._release_after_work(permit)
+
     async def _release_after_work(self, permit: InferencePermit) -> bool:
-        task = asyncio.create_task(self.release(permit))
+        self._lock_for_loop()
+        completed_at = _monotonic()
+        if not self._bind_completion_time(permit, completed_at=completed_at):
+            return False
+        task = asyncio.create_task(
+            self._release_bound_completion(permit)
+        )
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -764,6 +928,33 @@ class InferenceBudgetAuthority:
             raise InferenceBudgetError("inference_active_timeout")
         return result
 
+    async def run_participation_call(
+        self,
+        request: object,
+        authority: object,
+        *,
+        work_factory: Callable[[], Awaitable[T]],
+        permit_observer: Callable[[InferencePermit], None] | None = None,
+    ) -> T:
+        if not callable(work_factory):
+            raise InferenceBudgetError("inference_work_factory_invalid")
+        if permit_observer is not None and not callable(permit_observer):
+            raise InferenceBudgetError("inference_permit_observer_invalid")
+        permit = await self.acquire_participation(request, authority)
+        try:
+            if permit_observer is not None:
+                permit_observer(permit)
+            awaitable = work_factory()
+            if not inspect.isawaitable(awaitable):
+                raise InferenceBudgetError("inference_work_not_awaitable")
+            result = await awaitable
+        except BaseException:
+            await self._release_after_work(permit)
+            raise
+        if not await self._release_after_work(permit):
+            raise InferenceBudgetError("inference_active_timeout")
+        return result
+
     async def close(self) -> None:
         lock = self._lock_for_loop()
         async with lock:
@@ -785,10 +976,13 @@ class InferenceBudgetAuthority:
                             purpose=record.purpose,
                             wait_seconds=record.wait_seconds,
                             acquired_at=record.acquired_at,
+                            completed_at=record.completed_at,
                             state="closed",
                             snapshot=record.snapshot,
                             generation_snapshot=record.generation_snapshot,
                             planned_action=record.planned_action,
+                            participation_request=record.participation_request,
+                            participation_authority=record.participation_authority,
                             proactive_request=record.proactive_request,
                             proactive_authority=record.proactive_authority,
                         )

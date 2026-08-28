@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
-RELEASE_VERSION = "0.5.14"
+RELEASE_VERSION = "0.5.25"
 
 
 def _text(path: str) -> str:
@@ -55,22 +55,17 @@ class P10ReleaseSurfaceTests(unittest.TestCase):
         self.assertIn(f"astrbot_plugin_shio_v{RELEASE_VERSION}_upload.zip", readme)
         self.assertRegex(
             changelog,
-            rf"(?m)^## {re.escape(RELEASE_VERSION)} - 2026-08-23$",
+            rf"(?m)^## {re.escape(RELEASE_VERSION)} - 2026-08-25$",
         )
         self.assertIn('astrbot_version: ">=4.26.7,<5"', metadata)
 
     def test_schema_is_current_closed_and_high_risk_defaults_are_all_off(self):
         schema = json.loads(_text("_conf_schema.json"))
         fields = _fields(schema)
-        self.assertEqual(len(schema), 8)
+        self.assertEqual(len(schema), 7)
         self.assertEqual(len(fields), 57)
-        self.assertIs(fields["meme_complement_enabled"]["default"], True)
-        self.assertEqual(fields["meme_complement_cadence_turns"]["default"], 4)
-        self.assertEqual(fields["meme_complement_cooldown_turns"]["default"], 4)
-        self.assertIn(
-            "Meme Manager",
-            fields["meme_complement_cadence_turns"]["hint"],
-        )
+        self.assertNotIn("meme_settings", schema)
+        self.assertNotIn("meme_complement_enabled", fields)
         for key in (
             "natural_group_participation_enabled",
             "proactive_initiation_enabled",
@@ -98,7 +93,10 @@ class P10ReleaseSurfaceTests(unittest.TestCase):
                     set(field).intersection({"description", "type", "default"}),
                     {"description", "type", "default"},
                 )
-                self.assertIn(field["type"], {"bool", "int", "string", "list"})
+                self.assertIn(
+                    field["type"],
+                    {"bool", "int", "string", "text", "list"},
+                )
                 self.assertIn(f'"{key}"', source)
                 self.assertIn(f"`{key}`", audit)
 
@@ -112,6 +110,8 @@ class P10ReleaseSurfaceTests(unittest.TestCase):
                 "docs/COMPATIBILITY.md",
                 "docs/PRIVACY_AND_SECURITY.md",
                 "docs/TESTING.md",
+                "docs/REVIEW_PLAYBOOK.md",
+                "docs/PITFALL_LEDGER.md",
             )
         )
         for required in (
@@ -151,6 +151,8 @@ class P10ReleaseSurfaceTests(unittest.TestCase):
             "docs/COMPATIBILITY.md",
             "docs/PRIVACY_AND_SECURITY.md",
             "docs/TESTING.md",
+            "docs/REVIEW_PLAYBOOK.md",
+            "docs/PITFALL_LEDGER.md",
         )
         link_pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
         for path in paths:
@@ -162,6 +164,83 @@ class P10ReleaseSurfaceTests(unittest.TestCase):
                 resolved = (document.parent / target).resolve()
                 with self.subTest(document=path, target=target):
                     self.assertTrue(resolved.is_file(), resolved)
+
+    def test_review_rules_and_pitfall_ledger_are_durable_repository_assets(self):
+        agents = (ROOT.parent / "AGENTS.md").read_text(encoding="utf-8")
+        handoff = (ROOT.parent / "HANDOFF.md").read_text(encoding="utf-8")
+        review = _text("docs/REVIEW_PLAYBOOK.md")
+        pitfalls = _text("docs/PITFALL_LEDGER.md")
+
+        for required in (
+            "false-block",
+            "false-pass",
+            "real user-visible path",
+            "PITFALL_LEDGER.md",
+            "invalidate previously passing conclusions",
+            "Never remove a production safety gate",
+            "Content-free traces",
+        ):
+            self.assertIn(required, agents)
+        for required in (
+            "原始失败样本",
+            "正确邻近样本",
+            "反向失败样本",
+            "reasoning-only",
+            "真实群消息触发",
+            "旧结论失效",
+            "不得拆除生产安全门",
+            "语义质量需要用户确认",
+        ):
+            self.assertIn(required, review)
+        for required in (
+            "P-009",
+            "P-010",
+            "P-011",
+            "P-024",
+            "P-025",
+            "P-028",
+            "P-029",
+            "P-030",
+            "P-031",
+            "P-051",
+            "P-052",
+            "P-053",
+            "P-054",
+            "P-055",
+            "P-059",
+            "P-060",
+            "P-064",
+            "P-065",
+            "P-066",
+        ):
+            self.assertIn(required, pitfalls)
+        for required in (
+            "检查一下／排查一下",
+            "query relevance",
+            "初稿与 repair",
+            "施事者、受事者",
+            "主人聊天关系",
+        ):
+            self.assertIn(required, review)
+        self.assertIn("## Next Steps", handoff)
+        self.assertIn("端到端验收完成", handoff)
+
+    def test_v0525_deployment_bundle_is_locally_closed(self):
+        deploy_root = ROOT.parent / "deploy"
+        script = deploy_root / "deploy_v0525_shio_only.sh"
+        self.assertTrue(script.is_file(), script)
+        source = script.read_text(encoding="utf-8")
+        for filename in (
+            "astrbot_plugin_shio_v0.5.25_upload.zip",
+            "astrbot_plugin_shio_v0.5.25_upload.manifest.json",
+            "verify_live_v0525.py",
+            "verify_config_v0525.py",
+            "migrate_v0525_config.py",
+            "probe_v0525.py",
+        ):
+            with self.subTest(filename=filename):
+                self.assertIn(filename, source)
+                self.assertTrue((deploy_root / filename).is_file(), filename)
 
 
 if __name__ == "__main__":

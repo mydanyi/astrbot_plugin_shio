@@ -27,7 +27,11 @@ except ModuleNotFoundError:
     )
 
 from astrbot_plugin_shio.core.affect_state import AffectMutationStatus
-from astrbot_plugin_shio.core.contracts import ParticipationLevel, SenderKind
+from astrbot_plugin_shio.core.contracts import (
+    ContractViolation,
+    ParticipationLevel,
+    SenderKind,
+)
 from astrbot_plugin_shio.core.conversation_event import (
     ConversationRevisionBook,
     build_ingress_event,
@@ -43,6 +47,30 @@ from astrbot_plugin_shio.core.runtime_continuity import (
 
 SCOPE = "platform:test|bot:shio|group:continuity-private-marker"
 SENDER = f"{SCOPE}|user:continuity-user-marker"
+
+
+class _At:
+    type = "at"
+
+    def __init__(self, sender_id: str, display_name: str) -> None:
+        self.qq = sender_id
+        self.name = display_name
+
+
+class _Reply:
+    type = "reply"
+
+    def __init__(
+        self,
+        message_id: str,
+        sender_id: str,
+        display_name: str,
+        quoted_content: str,
+    ) -> None:
+        self.id = message_id
+        self.sender_id = sender_id
+        self.sender_nickname = display_name
+        self.message_str = quoted_content
 
 
 def _envelope(message: str) -> TurnEnvelope:
@@ -291,6 +319,17 @@ class RuntimeContinuityStoreTests(unittest.TestCase):
 
 
 class RuntimeContinuityIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    _SEMANTIC_REPLY = (
+        '{"decision":"REPLY","target":"current_message",'
+        '"topic_anchor":"current_message","reason_code":"natural_continuation",'
+        '"confidence":0.9}'
+    )
+    _SEMANTIC_WAIT = (
+        '{"decision":"WAIT","target":"current_message",'
+        '"topic_anchor":"current_message","reason_code":"defer_to_others",'
+        '"confidence":0.9}'
+    )
+
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         FakeStarTools.data_dir = Path(self.temp.name)
@@ -298,33 +337,268 @@ class RuntimeContinuityIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         self.temp.cleanup()
 
-    def _plugin(self):
+    def _plugin(self, provider=None):
         return main.ShioPlugin(
-            FakeContext(FakeProvider([])),
+            FakeContext(provider or FakeProvider([])),
             {
+                # 星汐是测试中的机器人显示名；既有 Persona 包名保持不变。
                 "persona_name": "亚托莉",
-                "natural_name_wake_aliases": ["亚托莉", "萝卜子"],
+                "natural_name_wake_aliases": ["星汐", "亚托莉", "萝卜子"],
                 "prefer_livingmemory_group_history": False,
+                "natural_group_participation_enabled": True,
+                "natural_group_participation_allowlist": ["p9-continuity-group"],
+                "natural_group_participation_min_context_messages": 1,
             },
         )
 
     @staticmethod
-    def _admit(plugin, *, turn: int, now: float, direct: bool = False):
+    def _named_event(
+        display_name: str,
+        sender_id: str,
+        message: str,
+        suffix: str,
+        *,
+        components: tuple[object, ...] = (),
+        direct: bool = False,
+    ):
         event = FakeEvent(
-            "peer-a",
-            "大家今晚吃什么？" if not direct else "萝卜子，你在吗？",
+            sender_id,
+            message,
             group_id="p9-continuity-group",
         )
-        event.message_id = f"p9-continuity-{turn}"
+        event.message_id = f"p9-continuity-{suffix}"
+        event.get_sender_name = lambda: display_name
+        event.get_messages = lambda: list(components)
         event.is_at_or_wake_command = direct
+        return event
+
+    def _prime_named_context(self, plugin, *, prefix: str, start_at: float) -> None:
+        mountain_tea = self._named_event(
+            "山茶",
+            "synthetic-shancha",
+            "说明书第一行是处理器型号，后面才是重量。",
+            f"{prefix}-shancha",
+            components=(
+                _Reply(
+                    f"{prefix}-earlier-mingchuan",
+                    "synthetic-mingchuan",
+                    "明川",
+                    "处理器型号那行字有点小。",
+                ),
+            ),
+        )
+        bright_river = self._named_event(
+            "明川",
+            "synthetic-mingchuan",
+            "我看到了重量，处理器那行字有点小。",
+            f"{prefix}-mingchuan",
+            components=(
+                _Reply(
+                    mountain_tea.message_id,
+                    "synthetic-shancha",
+                    "山茶",
+                    mountain_tea.message,
+                ),
+            ),
+        )
+        danyi = self._named_event(
+            "Danyi",
+            "synthetic-danyi",
+            "你们先核对处理器那一行。",
+            f"{prefix}-danyi",
+            components=(
+                _At("synthetic-mingchuan", "明川"),
+                _At("synthetic-bailu", "白露"),
+            ),
+        )
+        for offset, event in enumerate(
+            (mountain_tea, bright_river, danyi),
+            start=0,
+        ):
+            with patch(
+                "astrbot_plugin_shio.main.time.monotonic",
+                return_value=start_at + float(offset),
+            ):
+                result = plugin.admit_ingress_event(event)
+            self.assertIsNotNone(result)
+            self.assertIsNone(
+                event.get_extra(main.SHIO_PARTICIPATION_SEMANTIC_REQUEST)
+            )
+
+    async def _admit_named_async(self, plugin, event, *, now: float) -> None:
+        with patch(
+            "astrbot_plugin_shio.main.time.monotonic",
+            return_value=now,
+        ):
+            outputs = [item async for item in plugin.admit_inbound_event(event)]
+        self.assertEqual(outputs, [])
+
+    async def _seed_named_join(self, plugin, provider) -> None:
+        self._prime_named_context(plugin, prefix="before-restart", start_at=10.0)
+        white_dew = self._named_event(
+            "白露",
+            "synthetic-bailu",
+            "但是价格顶不住",
+            "before-restart-bailu",
+        )
+        with patch(
+            "astrbot_plugin_shio.core.runtime_continuity._wall_time",
+            return_value=1000.0,
+        ):
+            await self._admit_named_async(plugin, white_dew, now=100.0)
+        self.assertEqual(len(provider.calls), 1)
+        cadence = white_dew.get_extra(main.SHIO_PARTICIPATION_CADENCE)
+        self.assertIs(cadence.decision.level, ParticipationLevel.MAY_JOIN)
+        self.assertTrue(cadence.join_selected)
+        self.assertTrue(white_dew.is_at_or_wake_command)
+
+    async def _admit(
+        self,
+        plugin,
+        *,
+        turn: int,
+        now: float,
+        direct: bool = False,
+        semantic_output: str | None = None,
+    ):
+        event = self._named_event(
+            "白露",
+            "synthetic-bailu",
+            "大家今晚吃什么？" if not direct else "星汐，你在吗？",
+            f"legacy-{turn}",
+            direct=direct,
+        )
         with patch("astrbot_plugin_shio.main.time.monotonic", return_value=now):
             result = plugin.admit_ingress_event(event)
+        if event.get_extra(main.SHIO_PARTICIPATION_SEMANTIC_REQUEST) is not None:
+            plugin.context.provider.outputs.append(
+                semantic_output
+                or RuntimeContinuityIntegrationTests._SEMANTIC_REPLY
+            )
+            await plugin._resolve_participation_semantic(event)
         return event, result
+
+    async def test_restart_restored_join_uses_exact_cooldown_without_provider(self):
+        first_provider = FakeProvider([self._SEMANTIC_REPLY])
+        first = self._plugin(first_provider)
+        await self._seed_named_join(first, first_provider)
+        await first.terminate()
+
+        second_provider = FakeProvider([])
+        second = self._plugin(second_provider)
+        self._prime_named_context(second, prefix="cooldown-restart", start_at=105.0)
+        white_dew = self._named_event(
+            "白露",
+            "synthetic-bailu",
+            "嗯有点悬",
+            "cooldown-restart-bailu",
+        )
+        with patch(
+            "astrbot_plugin_shio.core.runtime_continuity._wall_time",
+            side_effect=(1010.125, 1010.875),
+        ) as wall_clock:
+            await self._admit_named_async(second, white_dew, now=110.0)
+
+        cadence = white_dew.get_extra(main.SHIO_PARTICIPATION_CADENCE)
+        self.assertEqual(second_provider.calls, [])
+        self.assertIs(cadence.decision.level, ParticipationLevel.WAIT)
+        self.assertEqual(
+            cadence.reason_codes,
+            ("participation_join_cooldown",),
+        )
+        self.assertGreater(cadence.decision.cooldown_remaining_s, 0.0)
+        self.assertFalse(white_dew.is_at_or_wake_command)
+        self.assertEqual(wall_clock.call_count, 1)
+        metrics = second.participation_cadence_authority.trace_metadata()
+        self.assertEqual(metrics["participation_cadence_subject_count"], 1)
+        self.assertTrue(metrics["participation_cadence_subjects_bounded"])
+        await second.terminate()
+
+    async def test_restart_after_limits_expire_replies_once_commits_and_wakes(self):
+        first_provider = FakeProvider([self._SEMANTIC_REPLY])
+        first = self._plugin(first_provider)
+        await self._seed_named_join(first, first_provider)
+        await first.terminate()
+
+        second_provider = FakeProvider([self._SEMANTIC_REPLY])
+        second = self._plugin(second_provider)
+        self._prime_named_context(second, prefix="resumed-restart", start_at=450.0)
+        white_dew = self._named_event(
+            "白露",
+            "synthetic-bailu",
+            "外面雨突然变大了",
+            "resumed-restart-bailu",
+        )
+        with patch(
+            "astrbot_plugin_shio.core.runtime_continuity._wall_time",
+            side_effect=(1400.125, 1400.875),
+        ):
+            await self._admit_named_async(second, white_dew, now=500.0)
+
+        self.assertEqual(len(second_provider.calls), 1)
+        call = second_provider.calls[0]
+        for display_name in ("山茶", "明川", "白露", "Danyi", "星汐"):
+            self.assertIn(display_name, call["system_prompt"])
+        cadence = white_dew.get_extra(main.SHIO_PARTICIPATION_CADENCE)
+        self.assertIs(cadence.decision.level, ParticipationLevel.MAY_JOIN)
+        self.assertEqual(
+            cadence.reason_codes,
+            ("participation_semantic_natural_continuation",),
+        )
+        self.assertTrue(cadence.join_selected)
+        reaction = white_dew.get_extra(main.SHIO_PARTICIPATION_REACTION)
+        self.assertIn(
+            reaction.decision.level,
+            {ParticipationLevel.MAY_JOIN, ParticipationLevel.REACT_ONLY},
+        )
+        self.assertTrue(white_dew.is_at_or_wake_command)
+        self.assertTrue(white_dew.is_wake)
+
+        with patch(
+            "astrbot_plugin_shio.core.runtime_continuity._wall_time",
+            return_value=1400.875,
+        ):
+            persisted = second.runtime_continuity.cadence_for_subject(
+                cadence.binding.scope_key,
+                cadence.binding.current_sender_key,
+                now=500.0,
+            )
+        self.assertEqual(persisted.join_times[-1], 500.0)
+        metrics = second.participation_cadence_authority.trace_metadata()
+        self.assertEqual(metrics["participation_cadence_subject_count"], 1)
+        self.assertTrue(metrics["participation_cadence_subjects_bounded"])
+
+        preflight = white_dew.get_extra(main.SHIO_PARTICIPATION_CADENCE_PREFLIGHT)
+        self.assertFalse(second.participation_cadence_authority.is_open(preflight))
+        with self.assertRaisesRegex(
+            ContractViolation,
+            "participation_cadence_preflight_replayed",
+        ):
+            second.participation_cadence_authority.finalize(
+                preflight,
+                outcome=ParticipationLevel.WAIT,
+                reason_code="participation_semantic_defer_to_others",
+            )
+        await second.terminate()
 
     async def test_plugin_restart_restores_revision_cadence_affect_and_scene_continuity(self):
         first = self._plugin()
-        event1, result1 = self._admit(first, turn=1, now=100.0)
-        self.assertEqual(result1.conversation_event.binding.conversation_revision, 1)
+        prior, prior_result = await self._admit(
+            first,
+            turn=0,
+            now=0.0,
+            semantic_output=self._SEMANTIC_WAIT,
+        )
+        self.assertEqual(
+            prior_result.conversation_event.binding.conversation_revision,
+            1,
+        )
+        self.assertIs(
+            prior.get_extra(main.SHIO_PARTICIPATION_CADENCE).decision.level,
+            ParticipationLevel.NO_ACTION,
+        )
+        event1, result1 = await self._admit(first, turn=1, now=100.0)
+        self.assertEqual(result1.conversation_event.binding.conversation_revision, 2)
         self.assertIs(
             event1.get_extra(main.SHIO_PARTICIPATION_CADENCE).decision.level,
             ParticipationLevel.MAY_JOIN,
@@ -332,11 +606,11 @@ class RuntimeContinuityIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await first.terminate()
 
         second = self._plugin()
-        event2, result2 = self._admit(second, turn=2, now=110.0)
-        self.assertEqual(result2.conversation_event.binding.conversation_revision, 2)
+        event2, result2 = await self._admit(second, turn=2, now=110.0)
+        self.assertEqual(result2.conversation_event.binding.conversation_revision, 3)
         self.assertEqual(second.conversation_revisions.restored_revision(
             result2.conversation_event.envelope.scope_key
-        ), 1)
+        ), 2)
         self.assertIs(
             event2.get_extra(main.SHIO_PARTICIPATION_CADENCE).decision.level,
             ParticipationLevel.WAIT,
@@ -358,13 +632,17 @@ class RuntimeContinuityIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         degraded = self._plugin()
         self.assertFalse(degraded.runtime_continuity.enabled)
-        passive_event, passive = self._admit(degraded, turn=1, now=200.0)
+        passive_event, passive = await self._admit(
+            degraded,
+            turn=1,
+            now=200.0,
+        )
         self.assertIsNotNone(passive)
         self.assertIs(
             passive_event.get_extra(main.SHIO_PARTICIPATION_CADENCE).decision.level,
             ParticipationLevel.WAIT,
         )
-        direct_event, direct = self._admit(
+        direct_event, direct = await self._admit(
             degraded,
             turn=2,
             now=201.0,

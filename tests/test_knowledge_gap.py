@@ -45,6 +45,28 @@ def _seed(message: str, *, revision: int = 1):
 
 
 class KnowledgeGapTests(unittest.TestCase):
+    def test_proactive_topic_uses_kb_for_stable_terms_web_for_current_facts_only(self):
+        from astrbot_plugin_shio.core.capability_policy import CapabilityClass
+        from astrbot_plugin_shio.core.knowledge_gap import (
+            decide_proactive_knowledge_need,
+        )
+
+        self.assertIs(
+            decide_proactive_knowledge_need(
+                "仿生人这个网络黑话是什么意思？"
+            ).capability,
+            CapabilityClass.CHAT_RETRIEVAL,
+        )
+        self.assertIs(
+            decide_proactive_knowledge_need(
+                "现在晚饭价格多少？"
+            ).capability,
+            CapabilityClass.PUBLIC_WEB_READ,
+        )
+        self.assertIsNone(
+            decide_proactive_knowledge_need("今晚的晚饭好香").capability
+        )
+
     def test_common_and_emotional_chat_do_not_search(self):
         from astrbot_plugin_shio.core.knowledge_gap import decide_knowledge_gap
 
@@ -64,7 +86,39 @@ class KnowledgeGapTests(unittest.TestCase):
                 self.assertFalse(decision.requires_evidence)
                 self.assertEqual(decision.max_tool_calls, 0)
 
-    def test_unknown_slang_requests_one_public_read(self):
+    def test_embedded_lookup_substring_in_local_check_does_not_search(self):
+        from astrbot_plugin_shio.core.knowledge_gap import decide_knowledge_gap
+
+        for message in (
+            "醒醒起床，让我检查一下身体，看看有没有修好",
+            "你排查一下插件有没有修好",
+            "我先自查一下状态，不要联网",
+        ):
+            with self.subTest(message=message):
+                decision = decide_knowledge_gap(
+                    content_seed=_seed(message),
+                    current_message=message,
+                )
+                self.assertIs(decision.need, KnowledgeNeed.NONE)
+                self.assertFalse(decision.requires_evidence)
+
+    def test_explicit_lookup_boundaries_still_request_evidence(self):
+        from astrbot_plugin_shio.core.knowledge_gap import decide_knowledge_gap
+
+        for message in (
+            "查一下北京今天的天气",
+            "帮我查一下这个公开型号的发布时间",
+            "请联网核实这条公开消息",
+        ):
+            with self.subTest(message=message):
+                decision = decide_knowledge_gap(
+                    content_seed=_seed(message),
+                    current_message=message,
+                )
+                self.assertIs(decision.need, KnowledgeNeed.EXPLICIT_VERIFY)
+                self.assertTrue(decision.requires_evidence)
+
+    def test_unknown_slang_requests_one_native_knowledge_base_read(self):
         from astrbot_plugin_shio.core.capability_policy import CapabilityClass
         from astrbot_plugin_shio.core.knowledge_gap import decide_knowledge_gap
 
@@ -75,8 +129,23 @@ class KnowledgeGapTests(unittest.TestCase):
         )
 
         self.assertIs(decision.need, KnowledgeNeed.UNKNOWN_TERM)
-        self.assertIs(decision.requested_capability, CapabilityClass.PUBLIC_WEB_READ)
+        self.assertIs(decision.requested_capability, CapabilityClass.CHAT_RETRIEVAL)
         self.assertEqual(decision.max_tool_calls, 1)
+
+    def test_natural_do_you_know_question_requests_native_knowledge_base(self):
+        from astrbot_plugin_shio.core.capability_policy import CapabilityClass
+        from astrbot_plugin_shio.core.knowledge_gap import decide_knowledge_gap
+
+        message = "亚托莉 你知道华强买瓜吗？"
+        decision = decide_knowledge_gap(
+            content_seed=_seed(message),
+            current_message=message,
+        )
+
+        self.assertIs(decision.need, KnowledgeNeed.UNKNOWN_TERM)
+        self.assertIs(decision.requested_capability, CapabilityClass.CHAT_RETRIEVAL)
+        self.assertEqual(decision.max_tool_calls, 1)
+        self.assertIn("knowledge_base_question_present", decision.reason_codes)
 
     def test_time_sensitive_fact_requests_one_public_read(self):
         from astrbot_plugin_shio.core.knowledge_gap import decide_knowledge_gap

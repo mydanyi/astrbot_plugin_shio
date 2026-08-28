@@ -18,7 +18,7 @@
       "case_id": "capability.local_presentation",
       "descriptor": {"name": "search_memes", "description": "local presentation lookup", "origin": "astrbot_plugin_meme_manager", "module_path": "astrbot_plugin_meme_manager.tools", "parameter_names": ["keywords"], "active": true},
       "expected": {"capability_id": "local_presentation", "side_effect": "scoped_read", "guest_allowed": true, "owner_policy_allowed": true, "production_disposition": "presentation_only"},
-      "evidence_test_id": "astrbot_plugin_shio.tests.test_p6_presentation_transaction.P6PresentationTransactionTests.test_text_complement_waits_for_terminal_text_and_runs_once"
+      "evidence_test_id": "astrbot_plugin_shio.tests.test_p6_presentation_transaction.P6PresentationTransactionTests.test_text_terminal_never_duplicates_manager_hook_selection"
     },
     {
       "case_id": "capability.media_generation",

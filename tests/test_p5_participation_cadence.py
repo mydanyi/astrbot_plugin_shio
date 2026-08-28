@@ -35,6 +35,18 @@ from astrbot_plugin_shio.core.participation_cadence import (
 )
 
 
+_SEMANTIC_REPLY = (
+    '{"decision":"REPLY","target":"current_message",'
+    '"topic_anchor":"current_message","reason_code":"natural_continuation",'
+    '"confidence":0.9}'
+)
+_SEMANTIC_NO_ACTION = (
+    '{"decision":"NO_ACTION","target":"current_message",'
+    '"topic_anchor":"current_message","reason_code":"not_helpful",'
+    '"confidence":0.9}'
+)
+
+
 class P5ParticipationCadenceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -46,9 +58,20 @@ class P5ParticipationCadenceTests(unittest.IsolatedAsyncioTestCase):
                 "persona_name": "亚托莉",
                 "natural_name_wake_aliases": ["亚托莉", "萝卜子"],
                 "prefer_livingmemory_group_history": False,
+                "natural_group_participation_enabled": True,
+                "natural_group_participation_allowlist": ["p5-cadence-group"],
+                "natural_group_participation_min_context_messages": 2,
             },
         )
         self.turn = 0
+        prior = FakeEvent(
+            "peer-b",
+            "刚才的话题还没说完",
+            group_id="p5-cadence-group",
+        )
+        prior.message_id = "p5-cadence-prior"
+        with patch("astrbot_plugin_shio.main.time.monotonic", return_value=0.0):
+            self.plugin.admit_ingress_event(prior)
 
     async def asyncTearDown(self) -> None:
         self.temp.cleanup()
@@ -60,44 +83,58 @@ class P5ParticipationCadenceTests(unittest.IsolatedAsyncioTestCase):
         event.is_at_or_wake_command = direct
         return event
 
-    def _admit(self, message: str, *, now: float, direct: bool = False):
+    async def _admit(
+        self,
+        message: str,
+        *,
+        now: float,
+        direct: bool = False,
+        semantic_output: str = _SEMANTIC_REPLY,
+    ):
         event = self._event(message, direct=direct)
         with patch("astrbot_plugin_shio.main.time.monotonic", return_value=now):
             result = self.plugin.admit_ingress_event(event)
         self.assertIsNotNone(result)
+        if event.get_extra(main.SHIO_PARTICIPATION_SEMANTIC_REQUEST) is not None:
+            self.provider.outputs.append(semantic_output)
+            await self.plugin._resolve_participation_semantic(event)
         cadence = event.get_extra(main.SHIO_PARTICIPATION_CADENCE)
         self.assertIs(type(cadence), ParticipationCadenceDecision)
         return event, cadence
 
-    def test_join_cooldown_and_window_limit_prevent_consecutive_interruption(self):
-        first_event, first = self._admit("大家今晚吃什么？", now=100.0)
+    async def test_join_cooldown_and_window_limit_prevent_consecutive_interruption(self):
+        first_event, first = await self._admit("大家今晚吃什么？", now=100.0)
         self.assertIs(first.decision.level, ParticipationLevel.MAY_JOIN)
         self.assertTrue(first_event.is_at_or_wake_command)
 
-        blocked_event, blocked = self._admit("大家晚饭怎么选？", now=110.0)
+        blocked_event, blocked = await self._admit("大家晚饭怎么选？", now=110.0)
         self.assertIs(blocked.base.decision.level, ParticipationLevel.MAY_JOIN)
         self.assertIs(blocked.decision.level, ParticipationLevel.WAIT)
         self.assertGreater(blocked.decision.cooldown_remaining_s, 0.0)
         self.assertFalse(blocked_event.is_at_or_wake_command)
 
-        second_event, second = self._admit("大家吃什么料理？", now=146.0)
+        second_event, second = await self._admit("大家吃什么料理？", now=146.0)
         self.assertIs(second.decision.level, ParticipationLevel.MAY_JOIN)
         self.assertTrue(second_event.is_at_or_wake_command)
 
-        limited_event, limited = self._admit("大家晚餐吃什么？", now=192.0)
+        limited_event, limited = await self._admit("大家晚餐吃什么？", now=192.0)
         self.assertIs(limited.decision.level, ParticipationLevel.WAIT)
         self.assertIn("participation_window_limit", limited.decision.reason_codes)
         self.assertFalse(limited_event.is_at_or_wake_command)
 
-        resumed_event, resumed = self._admit("大家晚餐怎么选？", now=401.0)
+        resumed_event, resumed = await self._admit("大家晚餐怎么选？", now=401.0)
         self.assertIs(resumed.decision.level, ParticipationLevel.MAY_JOIN)
         self.assertTrue(resumed_event.is_at_or_wake_command)
 
-    def test_no_action_backoff_blocks_candidate_but_never_direct(self):
-        _, no_action = self._admit("今天下雨了", now=10.0)
+    async def test_no_action_backoff_blocks_candidate_but_never_direct(self):
+        _, no_action = await self._admit(
+            "今天下雨了",
+            now=10.0,
+            semantic_output=_SEMANTIC_NO_ACTION,
+        )
         self.assertIs(no_action.decision.level, ParticipationLevel.NO_ACTION)
 
-        candidate_event, candidate = self._admit(
+        candidate_event, candidate = await self._admit(
             "我觉得萝卜子这个称呼很有趣",
             now=11.0,
         )
@@ -106,12 +143,16 @@ class P5ParticipationCadenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("participation_no_action_backoff", candidate.decision.reason_codes)
         self.assertFalse(candidate_event.is_at_or_wake_command)
 
-        direct_event, direct = self._admit("萝卜子，你在吗？", now=11.5, direct=True)
+        direct_event, direct = await self._admit(
+            "萝卜子，你在吗？",
+            now=11.5,
+            direct=True,
+        )
         self.assertIs(direct.decision.level, ParticipationLevel.MUST_REPLY)
         self.assertEqual(direct.decision.cooldown_remaining_s, 0.0)
         self.assertTrue(direct_event.is_at_or_wake_command)
 
-        resumed_event, resumed = self._admit(
+        resumed_event, resumed = await self._admit(
             "我觉得萝卜子这个称呼很有趣",
             now=13.0,
         )
@@ -119,8 +160,9 @@ class P5ParticipationCadenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(resumed_event.is_at_or_wake_command)
 
     async def test_wait_is_terminal_zero_model_zero_tool(self):
-        self._admit("大家今晚吃什么？", now=20.0)
-        event, cadence = self._admit("大家晚饭吃什么？", now=21.0)
+        await self._admit("大家今晚吃什么？", now=20.0)
+        semantic_calls_before_wait = len(self.provider.calls)
+        event, cadence = await self._admit("大家晚饭吃什么？", now=21.0)
         request = FakeRequest(event.message)
 
         await self.plugin.enforce_agent_permission(event, request)
@@ -132,10 +174,11 @@ class P5ParticipationCadenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.system_prompt, "")
         self.assertEqual(request.prompt, "")
         self.assertEqual(tuple(request.func_tool.tools), ())
-        self.assertEqual(self.provider.calls, [])
+        self.assertEqual(semantic_calls_before_wait, 1)
+        self.assertEqual(len(self.provider.calls), semantic_calls_before_wait)
 
-    def test_cadence_copy_cross_runtime_and_mutation_fail_closed(self):
-        event, cadence = self._admit("大家今晚吃什么？", now=30.0)
+    async def test_cadence_copy_cross_runtime_and_mutation_fail_closed(self):
+        event, cadence = await self._admit("大家今晚吃什么？", now=30.0)
         with self.assertRaisesRegex(ContractViolation, "not_canonical"):
             self.plugin.participation_cadence_authority.inspect(copy.copy(cadence))
 

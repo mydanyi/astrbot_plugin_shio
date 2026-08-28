@@ -20,9 +20,12 @@ from .conversation_event import (
 )
 from .conversation_ledger import (
     ConversationLedger,
+    InboundIdentityMetadata,
     LedgerRecord,
     LedgerRole,
     LedgerSourceKind,
+    build_inbound_identity_metadata,
+    identity_metadata_integrity,
 )
 from .identity import build_sender_key
 from .send_receipt import SegmentSendStatus, SentReplyRecord
@@ -53,6 +56,7 @@ class SceneRejectReason(str, Enum):
     CONTENT_MISMATCH = "content_mismatch"
     PERSONAL_FACT_INVALID = "personal_fact_invalid"
     PERSONAL_FACT_SUBJECT_MISMATCH = "personal_fact_subject_mismatch"
+    IDENTITY_METADATA_INVALID = "identity_metadata_invalid"
     REVISION_STALE = "revision_stale"
     REVISION_GAP = "revision_gap"
     SOURCE_NOT_ALLOWED = "source_not_allowed"
@@ -111,8 +115,11 @@ def _scene_snapshot_integrity(snapshot: GroupSceneSnapshot) -> tuple[object, ...
                 topic.conversation_revision,
                 topic.author_sender_key,
                 topic.target_sender_key,
+                topic.message_id,
+                topic.reply_to_message_id,
                 topic.content,
                 topic.content_digest,
+                identity_metadata_integrity(topic.identity_metadata),
             )
         except AttributeError as exc:
             raise ContractViolation("scene_snapshot_corrupt") from exc
@@ -120,7 +127,8 @@ def _scene_snapshot_integrity(snapshot: GroupSceneSnapshot) -> tuple[object, ...
             type(topic.source) is not SceneEntrySource
             or type(topic.conversation_revision) is not int
             or topic.conversation_revision < 1
-            or any(type(value) is not str for value in topic_snapshot[2:])
+            or any(type(value) is not str for value in topic_snapshot[2:8])
+            or type(topic_snapshot[8]) is not tuple
             or _content_digest(topic.content) != topic.content_digest
         ):
             raise ContractViolation("scene_snapshot_corrupt")
@@ -229,8 +237,14 @@ class PublicTopic:
     conversation_revision: int
     author_sender_key: str = field(default="", repr=False)
     target_sender_key: str = field(default="", repr=False)
+    message_id: str = field(default="", repr=False)
+    reply_to_message_id: str = field(default="", repr=False)
     content: str = field(default="", repr=False)
     content_digest: str = field(default="", repr=False)
+    identity_metadata: InboundIdentityMetadata = field(
+        default_factory=InboundIdentityMetadata,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.source not in {
@@ -249,6 +263,8 @@ class PublicTopic:
         if digest != _content_digest(content):
             raise ContractViolation("public_topic_content_digest_mismatch")
         object.__setattr__(self, "content_digest", digest)
+        if type(self.identity_metadata) is not InboundIdentityMetadata:
+            raise ContractViolation("public_topic_identity_metadata_invalid")
         if self.source is SceneEntrySource.HUMAN_INBOUND:
             object.__setattr__(
                 self,
@@ -265,6 +281,27 @@ class PublicTopic:
             )
             if self.author_sender_key:
                 raise ContractViolation("shio_public_topic_author_forbidden")
+
+    @property
+    def author_display_name(self) -> str:
+        return self.identity_metadata.display.value
+
+    @property
+    def author_display_name_status(self) -> str:
+        return self.identity_metadata.display.status
+
+    @property
+    def referenced_sender_key(self) -> str:
+        referenced = self.identity_metadata.referenced_sender
+        return referenced.sender_key if referenced is not None else ""
+
+    @property
+    def mention_targets(self):
+        return self.identity_metadata.mention_targets
+
+    @property
+    def addressing_status(self) -> str:
+        return self.identity_metadata.addressing_status
 
     def trace_metadata(self) -> dict[str, str | int | bool]:
         return {
@@ -543,8 +580,11 @@ class GroupSceneBook:
                         source=SceneEntrySource.HUMAN_INBOUND,
                         conversation_revision=record_revision,
                         author_sender_key=record.sender_key,
+                        message_id=record.message_id,
+                        reply_to_message_id=record.reply_to_message_id,
                         content=record.content,
                         content_digest=record.content_digest,
+                        identity_metadata=record.identity_metadata,
                     )
                 )
                 current = participants.get(record.sender_key)
@@ -737,6 +777,7 @@ class GroupSceneBook:
         decision: IngressDecision,
         public_content: str,
         personal_facts: Iterable[PersonalFactCandidate] = (),
+        identity_metadata: InboundIdentityMetadata | None = None,
     ) -> SceneMutationResult:
         if not isinstance(event, ConversationEvent):
             raise ContractViolation("conversation_event_required")
@@ -781,6 +822,17 @@ class GroupSceneBook:
                     scope_key=scope,
                     source=source,
                     reason=SceneRejectReason.CONTENT_MISMATCH,
+                )
+            normalized_identity = (
+                identity_metadata
+                if identity_metadata is not None
+                else build_inbound_identity_metadata(open_group=True)
+            )
+            if type(normalized_identity) is not InboundIdentityMetadata:
+                return self._reject(
+                    scope_key=scope,
+                    source=source,
+                    reason=SceneRejectReason.IDENTITY_METADATA_INVALID,
                 )
             if isinstance(personal_facts, (str, bytes)):
                 return self._reject(
@@ -851,8 +903,11 @@ class GroupSceneBook:
                         source=source,
                         conversation_revision=revision,
                         author_sender_key=event.envelope.sender_key,
+                        message_id=event.envelope.message_id,
+                        reply_to_message_id=event.envelope.reply_to_message_id,
                         content=public_content,
                         content_digest=event.content_digest,
+                        identity_metadata=normalized_identity,
                     )
                 )
             topics = topics[-self._max_public_topics :]
@@ -1054,6 +1109,8 @@ class GroupSceneBook:
                     source=source,
                     conversation_revision=target.conversation_revision,
                     target_sender_key=target.sender_key,
+                    message_id=receipt.reply_id,
+                    reply_to_message_id=target.message_id,
                     content=visible_content,
                     content_digest=_content_digest(visible_content),
                 ),
@@ -1142,6 +1199,7 @@ class GroupSceneBook:
                     source=SceneEntrySource.SHIO_OUTBOUND,
                     conversation_revision=state.snapshot.conversation_revision,
                     target_sender_key=build_sender_key(scope, target.bot_id),
+                    message_id=receipt.reply_id,
                     content=visible_content,
                     content_digest=_content_digest(visible_content),
                 ),

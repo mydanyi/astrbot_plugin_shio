@@ -145,6 +145,72 @@ class CurrentQuestionAnchorTests(unittest.TestCase):
         self.assertFalse(wrong.current_topic_supported)
         self.assertTrue(relevant.current_topic_supported)
 
+    def test_numeric_relation_target_survives_stray_punctuation(self):
+        message = "@亚托莉 1+1等于多少，不等于，2为什么"
+        anchor = build_current_question_anchor(binding(message), message)
+        atoms = {(atom.kind, atom.value) for atom in anchor.semantic_atoms}
+
+        self.assertIn((SemanticAtomKind.ENTITY, "1+1"), atoms)
+        self.assertIn((SemanticAtomKind.ENTITY, "2"), atoms)
+        self.assertIn((SemanticAtomKind.NEGATION, "不等于"), atoms)
+        self.assertIn((SemanticAtomKind.FACT, "1+1不等于2"), atoms)
+        self.assertIn(("neq", "1+1", "2"), {
+            relation.signature for relation in anchor.relation_assertions
+        })
+        self.assertEqual(anchor.trace_metadata()["current_anchor_relation_count"], 2)
+
+    def test_changed_relation_target_changes_typed_anchor(self):
+        first = "1+1等于多少，不等于1为什么"
+        second = "1+1等于多少，不等于，2为什么"
+        first_anchor = build_current_question_anchor(binding(first), first)
+        second_anchor = build_current_question_anchor(binding(second), second)
+
+        self.assertNotEqual(
+            {relation.signature for relation in first_anchor.relation_assertions},
+            {relation.signature for relation in second_anchor.relation_assertions},
+        )
+
+    def test_interaction_action_roles_preserve_who_acts_on_whom(self):
+        cases = (
+            (
+                "醒醒，让我检查一下身体，看看有没有修好",
+                ("inspect", "current_user", "assistant", "pending"),
+            ),
+            (
+                "帮我检查一下身体，看看有没有问题",
+                ("inspect", "assistant", "current_user", "pending"),
+            ),
+            (
+                "你自己检查一下身体",
+                ("inspect", "assistant", "assistant", "pending"),
+            ),
+        )
+
+        for message, expected in cases:
+            with self.subTest(message=message):
+                anchor = build_current_question_anchor(binding(message), message)
+                self.assertEqual(len(anchor.action_role_assertions), 1)
+                assertion = anchor.action_role_assertions[0]
+                self.assertEqual(
+                    (
+                        assertion.action_code,
+                        assertion.actor.value,
+                        assertion.target.value,
+                        assertion.phase.value,
+                    ),
+                    expected,
+                )
+                self.assertEqual(
+                    anchor.trace_metadata()["current_anchor_action_role_count"],
+                    1,
+                )
+
+    def test_plain_inspection_statement_does_not_invent_action_roles(self):
+        message = "这份检查报告看起来已经修好了"
+        anchor = build_current_question_anchor(binding(message), message)
+
+        self.assertEqual(anchor.action_role_assertions, ())
+
     def test_builder_has_no_history_or_memory_override_parameter(self):
         parameters = inspect.signature(build_current_question_anchor).parameters
 

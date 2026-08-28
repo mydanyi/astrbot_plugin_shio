@@ -1,6 +1,7 @@
 import unittest
 import hashlib
 import json
+import types
 from pathlib import Path
 
 from astrbot_plugin_shio.core.affect import appraise_affect
@@ -18,6 +19,8 @@ from astrbot_plugin_shio.core.output_validator_v2 import (
     build_output_validation_context,
     validate_reply_composer_output,
 )
+from astrbot_plugin_shio.core import output_validator_v2 as validator_module
+from astrbot_plugin_shio.core.model_input_contract import CanonicalModelMessage
 from astrbot_plugin_shio.core.context_assembler import (
     AssembledContext,
     FactSelection,
@@ -99,6 +102,7 @@ def anchored_request(
     forbidden_facts=(),
     context_references=(),
     assistant_replies=(),
+    recent_exchanges=(),
 ):
     digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
     binding = DecisionBinding(
@@ -198,13 +202,56 @@ def anchored_request(
         )
         for index, content in enumerate(assistant_replies, start=1)
     )
+    exchange_records = tuple(
+        record
+        for index, (user_content, assistant_content) in enumerate(
+            recent_exchanges,
+            start=1,
+        )
+        for record in (
+            LedgerRecord(
+                sequence=40 + (index * 2),
+                source_kind=LedgerSourceKind.INBOUND,
+                role=LedgerRole.USER,
+                scope_key=binding.scope_key,
+                session_id=binding.session_id,
+                message_id=f"exchange-user-{index}",
+                sender_key=binding.current_sender_key,
+                reply_to_message_id="",
+                referenced_sender_key="",
+                target_sender_key=binding.current_sender_key,
+                timestamp=float(40 + (index * 2)),
+                content=str(user_content),
+                content_digest=ledger_content_digest(str(user_content)),
+                source_id=f"validator-exchange-user-{index}",
+                attribution_status="verified_sender",
+            ),
+            LedgerRecord(
+                sequence=41 + (index * 2),
+                source_kind=LedgerSourceKind.OUTBOUND,
+                role=LedgerRole.ASSISTANT,
+                scope_key=binding.scope_key,
+                session_id=binding.session_id,
+                message_id=f"exchange-assistant-{index}",
+                sender_key="scope-anchor-secret|assistant:shio",
+                reply_to_message_id=f"exchange-user-{index}",
+                referenced_sender_key="",
+                target_sender_key=binding.current_sender_key,
+                timestamp=float(41 + (index * 2)),
+                content=str(assistant_content),
+                content_digest=ledger_content_digest(str(assistant_content)),
+                source_id=f"validator-exchange-assistant-{index}",
+                attribution_status="verified_send_receipt",
+            ),
+        )
+    )
     assembled = None
-    if public_facts or other_facts or reference_records or assistant_records:
+    if public_facts or other_facts or reference_records or assistant_records or exchange_records:
         assembled = AssembledContext(
             reply_target=target,
             reference=None,
             planner_records=reference_records,
-            replyer_thread=(*reference_records, *assistant_records),
+            replyer_thread=(*reference_records, *exchange_records, *assistant_records),
             public_background=(),
             fact_selection=FactSelection(
                 must_include_candidates=(),
@@ -540,6 +587,99 @@ class OutputValidatorV2Tests(unittest.TestCase):
         self.assertFalse(report.anchor_coverage.current_topic_supported)
         self.assertEqual(report.disposition, OutputDisposition.PASS)
 
+    def test_multi_action_drift_is_rejected_again_after_repair(self):
+        message = "醒醒起床，让我检查一下身体，看看有没有修好"
+        wrong = (
+            "资料建议预约治疗师，因为抑郁可能影响思维。"
+            "也可以通过刺激身体活动提供帮助。"
+        )
+        req, anchor = anchored_request(message)
+        context = semantic_context(message, req, anchor)
+        initial = validate_reply_composer_output(
+            request=req,
+            result=parse_reply_composer_output(req, wrong),
+            raw_output=wrong,
+            context=context,
+        )
+        permit = build_single_repair_request(
+            original_request=req,
+            rejected_visible_text=initial.validated_result.visible_text,
+            report=initial,
+            repair_attempts_used=0,
+            semantic_contract=context.semantic_contract,
+        )
+        repaired_wrong = "可以去找治疗师，也可以适当增加身体活动。"
+        repaired = validate_reply_composer_output(
+            request=req,
+            result=parse_reply_composer_output(req, repaired_wrong),
+            raw_output=repaired_wrong,
+            context=context,
+            semantic_phase=SemanticGuardPhase.REPAIR,
+            repair_request=permit,
+        )
+
+        self.assertIn("answer_obligation_multi_action_drift", initial.issue_codes)
+        self.assertIn("answer_obligation_multi_action_drift", repaired.issue_codes)
+        self.assertFalse(repaired.is_valid)
+
+    def test_natural_multi_action_reply_passes_final_validator(self):
+        message = "醒醒起床，让我检查一下身体，看看有没有修好"
+        report = validate(
+            "唔……我醒啦。来吧，你想先检查哪里？",
+            context_kwargs={"current_message": message},
+        )
+
+        self.assertNotIn("answer_obligation_multi_action_drift", report.issue_codes)
+        self.assertTrue(report.is_valid, report.issues)
+
+    def test_owner_interaction_role_reversal_is_rejected_initial_and_repair(self):
+        message = "醒醒，让我检查一下身体，看看有没有修好"
+        wrong = "我已经检查过啦，一切都很正常，绝对没有坏掉！"
+        req, anchor = anchored_request(message, owner=True)
+        context = semantic_context(message, req, anchor)
+        initial = validate_reply_composer_output(
+            request=req,
+            result=parse_reply_composer_output(req, wrong),
+            raw_output=wrong,
+            context=context,
+        )
+        permit = build_single_repair_request(
+            original_request=req,
+            rejected_visible_text=initial.validated_result.visible_text,
+            report=initial,
+            repair_attempts_used=0,
+            semantic_contract=context.semantic_contract,
+        )
+        repaired_wrong = "我醒了。来，让我帮你检查一下身体。"
+        repaired = validate_reply_composer_output(
+            request=req,
+            result=parse_reply_composer_output(req, repaired_wrong),
+            raw_output=repaired_wrong,
+            context=context,
+            semantic_phase=SemanticGuardPhase.REPAIR,
+            repair_request=permit,
+        )
+
+        self.assertIn("answer_obligation_action_role_drift", initial.issue_codes)
+        self.assertIn("answer_obligation_action_completion_invented", initial.issue_codes)
+        self.assertIn("answer_obligation_action_role_drift", repaired.issue_codes)
+        self.assertFalse(repaired.is_valid)
+
+    def test_owner_sensitive_interaction_may_reply_naturally_without_role_reversal(self):
+        message = "醒醒，让我检查一下身体，看看有没有修好"
+        report = validate(
+            "唔……醒啦。来吧，主人想先检查哪里？不过要轻一点……我感觉已经好多了。",
+            owner=True,
+            context_kwargs={"current_message": message},
+        )
+
+        self.assertNotIn("answer_obligation_action_role_drift", report.issue_codes)
+        self.assertNotIn(
+            "answer_obligation_action_completion_invented",
+            report.issue_codes,
+        )
+        self.assertTrue(report.is_valid, report.issues)
+
     def test_obvious_context_drift_is_repairable_and_trace_is_content_free(self):
         message = "请解释 Docker 和 Kubernetes 的差别。"
         wrong = "蛋糕需要先把鸡蛋和面粉搅拌均匀。"
@@ -592,6 +732,82 @@ class OutputValidatorV2Tests(unittest.TestCase):
         self.assertTrue(report.is_valid, report.issues)
         self.assertNotIn("current_question_context_drift", report.issue_codes)
 
+    def test_changed_numeric_relation_rejects_rephrased_old_answer(self):
+        old_question = "@亚托莉 1+1等于多少，不等于1为什么"
+        current = "@亚托莉 1+1等于多少，不等于，2为什么"
+        old_answer = "1+1等于2，所以当然不等于1啦。"
+        req, anchor = anchored_request(
+            current,
+            recent_exchanges=((old_question, old_answer),),
+        )
+        copied_meaning = (
+            "1+1等于2，所以当然不等于1呀！我之前说的不等于1，"
+            "就是因为一加一合起来是二。"
+        )
+        report = validate_reply_composer_output(
+            request=req,
+            result=parse_reply_composer_output(req, copied_meaning),
+            raw_output=copied_meaning,
+            context=semantic_context(current, req, anchor),
+        )
+
+        self.assertIn("current_question_relation_drift", report.issue_codes)
+        self.assertTrue(report.trace_metadata()["relation_context_drift_detected"])
+
+    def test_changed_similar_question_does_not_exempt_exact_old_answer(self):
+        old_question = "1+1等于多少，不等于1为什么"
+        current = "1+1等于多少，不等于，2为什么"
+        old_answer = "1+1等于2，所以当然不等于1啦。"
+        req, anchor = anchored_request(
+            current,
+            recent_exchanges=((old_question, old_answer),),
+        )
+        report = validate_reply_composer_output(
+            request=req,
+            result=parse_reply_composer_output(req, old_answer),
+            raw_output=old_answer,
+            context=semantic_context(current, req, anchor),
+        )
+
+        self.assertIn("dialogue_repetition", report.issue_codes)
+        self.assertIn("current_question_relation_drift", report.issue_codes)
+
+    def test_same_repeated_question_may_receive_same_answer(self):
+        current = "1+1等于多少，不等于2为什么"
+        answer = "1+1本来就等于2呀，所以“不等于2”这个前提不成立。"
+        req, anchor = anchored_request(
+            current,
+            recent_exchanges=((current, answer),),
+        )
+        report = validate_reply_composer_output(
+            request=req,
+            result=parse_reply_composer_output(req, answer),
+            raw_output=answer,
+            context=semantic_context(current, req, anchor),
+        )
+
+        self.assertNotIn("dialogue_repetition", report.issue_codes)
+        self.assertNotIn("current_question_relation_drift", report.issue_codes)
+        self.assertTrue(report.is_valid, report.issues)
+
+    def test_current_relation_answer_passes_without_copying_old_target(self):
+        old_question = "1+1等于多少，不等于1为什么"
+        current = "1+1等于多少，不等于，2为什么"
+        old_answer = "1+1等于2，所以当然不等于1啦。"
+        answer = "1+1本来就等于2呀，所以“不等于2”这个前提不成立。"
+        req, anchor = anchored_request(
+            current,
+            recent_exchanges=((old_question, old_answer),),
+        )
+        report = validate_reply_composer_output(
+            request=req,
+            result=parse_reply_composer_output(req, answer),
+            raw_output=answer,
+            context=semantic_context(current, req, anchor),
+        )
+
+        self.assertTrue(report.is_valid, report.issues)
+
     def test_anchor_binding_mismatch_is_blocking(self):
         message = "请解释 Docker。"
         req, anchor = anchored_request(message)
@@ -629,6 +845,27 @@ class OutputValidatorV2Tests(unittest.TestCase):
         for token in ("亚托莉", "ATRI", "高性能机器人", "才没有", "校准失误"):
             with self.subTest(token=token):
                 self.assertNotIn(token, source)
+
+    def test_r11_typed_segment_attack_matrix(self):
+        """Hand-written malformed segments cannot become send authority."""
+        history = (
+            CanonicalModelMessage(role="user", content="peer fact", source_kind="inbound", source_message_id="peer-msg", sender_key="scope|user:peer", platform_id="p", sender_id="peer"),
+            CanonicalModelMessage(role="user", content="other fact", source_kind="inbound", source_message_id="other-msg", sender_key="scope|user:other", platform_id="p", sender_id="other"),
+        )
+        request = types.SimpleNamespace(target_sender_key="scope|user:owner", current_question_anchor=types.SimpleNamespace(question_count=1), attribution_risk=validator_module.AttributionRisk.IDENTITY_RECAP, model_messages=history)
+        def issues(segment):
+            result = types.SimpleNamespace(typed_attribution={"segments": [segment]})
+            return validator_module._validate_typed_attribution(request=request, result=result)
+        base = {"actor_platform_id":"p", "actor_sender_id":"peer", "predicate":"did work", "polarity":"affirmed", "scope":"history", "evidence_message_ids":["history-1"]}
+        self.assertEqual(issues(base), ())
+        for field, value in (("predicate", ""), ("polarity", "unknown"), ("scope", "current"), ("evidence_message_ids", ["history-9"]), ("evidence_message_ids", ["history-1", "history-1"]), ("actor_sender_id", "owner")):
+            candidate = dict(base); candidate[field] = value
+            self.assertTrue(issues(candidate), msg=field)
+        duplicate = types.SimpleNamespace(typed_attribution={"segments": [base, dict(base)]})
+        self.assertIn("typed_attribution_segment_duplicate", validator_module._validate_typed_attribution(request=request, result=duplicate))
+        mixed = dict(base); mixed["evidence_message_ids"] = ["history-1", "history-2"]
+        self.assertIn("typed_attribution_actor_mismatch", issues(mixed))
+        self.assertIn("typed_attribution_missing", validator_module._validate_typed_attribution(request=request, result=types.SimpleNamespace(typed_attribution=None)))
 
 
 if __name__ == "__main__":

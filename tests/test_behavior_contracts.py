@@ -456,7 +456,7 @@ class BehaviorContractTests(unittest.TestCase):
 class ContextContractTests(unittest.TestCase):
     def test_memory_decision_rejects_other_subject_and_unsafe_plugin_fact(self):
         current = ProvenancedFact(
-            subject_key=binding().current_sender_key,
+            subject_key="platform:test|account:current",
             scope="personal",
             content="合成的当前用户偏好",
             source_kind="livingmemory_semantic",
@@ -467,12 +467,13 @@ class ContextContractTests(unittest.TestCase):
         MemoryDecision(
             binding=binding(),
             mode=MemoryMode.SEMANTIC_RECALL,
+            current_account_key="platform:test|account:current",
             selected_facts=(current,),
             max_results=5,
         )
         other = dataclasses.replace(
             current,
-            subject_key=binding(sender="peer-b").current_sender_key,
+            subject_key="platform:test|account:peer-b",
             source_id="fact-other",
         )
         unsafe = dataclasses.replace(
@@ -485,6 +486,7 @@ class ContextContractTests(unittest.TestCase):
                 MemoryDecision(
                     binding=binding(),
                     mode=MemoryMode.SEMANTIC_RECALL,
+                    current_account_key="platform:test|account:current",
                     selected_facts=(fact,),
                     max_results=5,
                 )

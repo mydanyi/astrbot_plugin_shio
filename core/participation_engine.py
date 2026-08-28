@@ -373,35 +373,12 @@ def _build_participation_vault():
                 if topic.source is SceneEntrySource.HUMAN_INBOUND
             )
             context_message_count = len(recent_human_topics)
-            folded = "\n".join(
-                topic.content for topic in recent_human_topics
-            ).casefold()
-            interest_relevance = max(
-                (
-                    interest.weight
-                    for interest in persona.participation_interests
-                    if any(keyword.casefold() in folded for keyword in interest.keywords)
-                ),
-                default=0.0,
-            )
-            role = context.principal.relationship_role
-            distance = (
-                RelationshipDistance.PRIMARY_BOND
-                if role == "owner"
-                else (
-                    RelationshipDistance.PEER
-                    if role in {"group_peer", "private_peer"}
-                    else RelationshipDistance.UNVERIFIED
-                )
-            )
-            relationship_affinity = next(
-                (
-                    rule.warmth
-                    for rule in persona.relationship_rules
-                    if rule.distance is distance
-                ),
-                0.0,
-            )
+            # Lexical overlap, Persona interests and relationship warmth are
+            # deliberately excluded from admission.  They remain owned by the
+            # later expression pipeline and cannot become a hidden eligibility
+            # score here.
+            interest_relevance = 0.0
+            relationship_affinity = 0.0
             rhythm_density = 0.0
             recent_presence = 0.0
             if scene is not None:
@@ -433,45 +410,15 @@ def _build_participation_vault():
                 response_value = 0.0
                 level = ParticipationLevel.NO_ACTION
                 reasons = ("verified_group_context_too_shallow",)
-            elif address_kind is AddressKind.ABOUT_SELF:
-                interruption_cost = _score(
-                    0.12 + recent_presence * 0.35 + rhythm_density * 0.08
-                )
-                response_value = _score(
-                    0.72 + self_relevance * 0.15 + relationship_affinity * 0.1
-                )
-                level = (
-                    ParticipationLevel.MAY_JOIN
-                    if response_value >= interruption_cost + 0.15
-                    else ParticipationLevel.NO_ACTION
-                )
-                reasons = (
-                    "about_self_response_value_sufficient"
-                    if level is ParticipationLevel.MAY_JOIN
-                    else "about_self_interruption_cost_high",
-                )
-            elif address_kind is AddressKind.OPEN_GROUP:
-                interruption_cost = _score(
-                    0.38 + recent_presence * 0.35 + rhythm_density * 0.08
-                )
-                response_value = _score(
-                    0.2 + interest_relevance * 0.65 + relationship_affinity * 0.1
-                )
-                level = (
-                    ParticipationLevel.MAY_JOIN
-                    if interest_relevance >= 0.65
-                    and response_value >= interruption_cost + 0.15
-                    else ParticipationLevel.NO_ACTION
-                )
-                reasons = (
-                    "persona_interest_response_value_sufficient"
-                    if level is ParticipationLevel.MAY_JOIN
-                    else (
-                        "persona_interest_not_matched"
-                        if interest_relevance == 0.0
-                        else "open_group_interruption_cost_high"
-                    ),
-                )
+            elif address_kind in {
+                AddressKind.ABOUT_SELF,
+                AddressKind.OPEN_GROUP,
+                AddressKind.UNCERTAIN,
+            }:
+                interruption_cost = 0.0
+                response_value = 0.5
+                level = ParticipationLevel.MAY_JOIN
+                reasons = ("semantic_participation_candidate",)
             else:
                 interruption_cost = 1.0
                 response_value = 0.0
@@ -582,13 +529,39 @@ def _build_participation_vault():
                 "participation_ledger_bounded": count <= state.max_assessments,
             }
 
-    return register, issue, inspect, metrics
+    def context_for(
+        authority: ParticipationAuthority,
+        assessment: ParticipationAssessment,
+    ):
+        inspect(authority, assessment)
+        with lock:
+            state = state_for(authority)
+            record = state.records.get(assessment)
+            if record is None:
+                raise ContractViolation("participation_assessment_not_canonical")
+            return state.opportunity_authority.context_for(record.opportunity)
+
+    def scene_for(
+        authority: ParticipationAuthority,
+        assessment: ParticipationAssessment,
+    ) -> GroupSceneSnapshot | None:
+        inspect(authority, assessment)
+        with lock:
+            state = state_for(authority)
+            record = state.records.get(assessment)
+            if record is None:
+                raise ContractViolation("participation_assessment_not_canonical")
+            return record.scene
+
+    return register, issue, inspect, context_for, scene_for, metrics
 
 
 (
     _register_participation_authority,
     _issue_participation,
     _inspect_participation,
+    _participation_context_for,
+    _participation_scene_for,
     _participation_metrics,
 ) = _build_participation_vault()
 
@@ -651,6 +624,15 @@ class ParticipationAuthority:
         assessment: ParticipationAssessment,
     ) -> ParticipationAssessment:
         return _inspect_participation(self, assessment)
+
+    def context_for(self, assessment: ParticipationAssessment):
+        return _participation_context_for(self, assessment)
+
+    def scene_for(
+        self,
+        assessment: ParticipationAssessment,
+    ) -> GroupSceneSnapshot | None:
+        return _participation_scene_for(self, assessment)
 
     def trace_metadata(self) -> dict[str, int | bool]:
         return _participation_metrics(self)

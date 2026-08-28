@@ -71,6 +71,12 @@ def build_sender_key(scope_key: str, sender_id: str) -> str:
     return f"{scope}|user:{sender}"
 
 
+def build_account_key(platform_id: str, sender_id: str) -> str:
+    platform = _identifier(platform_id)
+    sender = _identifier(sender_id)
+    return f"platform:{platform}|account:{sender}" if platform and sender else ""
+
+
 def _message_type(event: Any, message_obj: Any) -> str:
     raw = _safe_call(event, "get_message_type")
     if raw is None and message_obj is not None:
@@ -126,6 +132,7 @@ class TurnEnvelope:
     timestamp_source: str
     source_kind: str
     degradation_reasons: tuple[str, ...]
+    account_key: str = ""
 
     @property
     def is_degraded(self) -> bool:
@@ -162,12 +169,14 @@ class PrincipalContext:
     is_owner: bool
     relationship_role: str
     verification_source: str
+    account_key: str = ""
 
 
 def resolve_principal(
     *,
     sender_id: str,
     sender_key: str,
+    account_key: str = "",
     chat_type: str,
     owner_ids: Any,
     verification_source: str,
@@ -200,6 +209,7 @@ def resolve_principal(
             is_owner=False,
             relationship_role="unverified",
             verification_source=f"{base_source}:identity_unverified",
+            account_key=str(account_key or ""),
         )
 
     is_owner = normalized_sender_id in normalized_owner_ids
@@ -218,6 +228,7 @@ def resolve_principal(
         is_owner=is_owner,
         relationship_role=relationship_role,
         verification_source=f"{base_source}:{verdict}",
+        account_key=str(account_key or ""),
     )
 
 
@@ -288,6 +299,7 @@ def build_turn_envelope(event: Any, *, source_kind: str = "inbound") -> TurnEnve
         session_id=session_id,
     )
     sender_key = build_sender_key(scope_key, sender_id)
+    account_key = build_account_key(platform_id, sender_id)
 
     degradation_reasons: list[str] = []
     for value, reason in (
@@ -322,6 +334,7 @@ def build_turn_envelope(event: Any, *, source_kind: str = "inbound") -> TurnEnve
         timestamp_source=timestamp_source,
         source_kind=str(source_kind or "inbound").strip() or "inbound",
         degradation_reasons=tuple(degradation_reasons),
+        account_key=account_key,
     )
 
 
@@ -345,6 +358,7 @@ def build_principal_context(event: Any, owner_ids: Any) -> PrincipalContext:
     return resolve_principal(
         sender_id=envelope.sender_id,
         sender_key=envelope.sender_key,
+        account_key=envelope.account_key,
         chat_type=envelope.chat_type,
         owner_ids=owner_ids,
         verification_source="astrbot_event_sender_id",

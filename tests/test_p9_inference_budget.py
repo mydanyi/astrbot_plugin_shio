@@ -1,7 +1,26 @@
 import asyncio
 import copy
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+try:
+    from test_pipeline import (  # type: ignore[import-not-found]
+        FakeContext,
+        FakeEvent,
+        FakeProvider,
+        FakeStarTools,
+        main,
+    )
+except ModuleNotFoundError:
+    from astrbot_plugin_shio.tests.test_pipeline import (
+        FakeContext,
+        FakeEvent,
+        FakeProvider,
+        FakeStarTools,
+        main,
+    )
 
 from astrbot_plugin_shio.core.action_planner import (
     PlannedActionAuthority,
@@ -32,6 +51,10 @@ from astrbot_plugin_shio.core.inference_budget import (
     InferencePriority,
     InferencePurpose,
     InferenceBudgetAuthority,
+)
+from astrbot_plugin_shio.core.participation_semantic import (
+    ParticipationSemanticRequest,
+    ParticipationSemanticStatus,
 )
 
 
@@ -145,6 +168,13 @@ def _plan(
     return snapshot, _principal(scope), planned
 
 
+async def _complete_risk(budget: InferenceBudgetAuthority, turn: tuple) -> None:
+    """R12 fixture setup: the preflight is one-shot and releases before PRIMARY."""
+    permit = await budget.acquire_event(*turn, purpose=InferencePurpose.RISK)
+    if not await budget.release(permit):
+        raise AssertionError("risk permit did not release")
+
+
 class InferenceBudgetAuthorityTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.epochs = GenerationEpochRegistry(max_scopes=256, now_fn=lambda: 1000.0)
@@ -160,6 +190,212 @@ class InferenceBudgetAuthorityTests(unittest.IsolatedAsyncioTestCase):
             **kwargs,
         )
 
+    async def test_canonical_participation_request_gets_one_released_permit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            FakeStarTools.data_dir = Path(directory)
+            provider = FakeProvider([])
+            plugin = main.ShioPlugin(
+                FakeContext(provider),
+                {
+                    "persona_name": "亚托莉",
+                    "natural_name_wake_aliases": ["星汐"],
+                    "prefer_livingmemory_group_history": False,
+                    "natural_group_participation_enabled": True,
+                    "natural_group_participation_allowlist": [
+                        "synthetic-budget-group"
+                    ],
+                    "natural_group_participation_min_context_messages": 2,
+                },
+            )
+
+            def named_event(name: str, sender_id: str, text: str, suffix: str):
+                event = FakeEvent(
+                    sender_id,
+                    text,
+                    group_id="synthetic-budget-group",
+                )
+                event.message_id = f"synthetic-budget-{suffix}"
+                event.get_sender_name = lambda: name
+                return event
+
+            plugin.admit_ingress_event(
+                named_event(
+                    "山茶",
+                    "synthetic-shancha",
+                    "说明书第一行是处理器型号。",
+                    "shancha",
+                )
+            )
+            plugin.admit_ingress_event(
+                named_event(
+                    "明川",
+                    "synthetic-mingchuan",
+                    "白露说那一行字有点小。",
+                    "mingchuan",
+                )
+            )
+            white_dew = named_event(
+                "白露",
+                "synthetic-bailu",
+                "第一行写的啥",
+                "bailu",
+            )
+            plugin.admit_ingress_event(white_dew)
+            request = white_dew.get_extra(
+                main.SHIO_PARTICIPATION_SEMANTIC_REQUEST
+            )
+            self.assertIs(type(request), ParticipationSemanticRequest)
+
+            permit = await plugin.inference_budget.acquire_participation(
+                request,
+                plugin.participation_semantic_authority,
+            )
+            self.assertIs(permit.priority, InferencePriority.PARTICIPATION)
+            self.assertIs(permit.purpose, InferencePurpose.PARTICIPATION)
+            self.assertEqual(
+                permit.trace_metadata()["inference_purpose"],
+                "participation",
+            )
+            self.assertTrue(await plugin.inference_budget.release(permit))
+            self.assertEqual(
+                plugin.inference_budget.trace_metadata()[
+                    "inference_active_count"
+                ],
+                0,
+            )
+            with self.assertRaisesRegex(
+                InferenceBudgetError,
+                "call_budget_exhausted",
+            ):
+                await plugin.inference_budget.acquire_participation(
+                    request,
+                    plugin.participation_semantic_authority,
+                )
+            await plugin.terminate()
+
+    async def test_queued_participation_request_goes_stale_before_provider_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            FakeStarTools.data_dir = Path(directory)
+            plugin = main.ShioPlugin(
+                FakeContext(FakeProvider([])),
+                {
+                    "persona_name": "亚托莉",
+                    "natural_name_wake_aliases": ["星汐"],
+                    "prefer_livingmemory_group_history": False,
+                    "natural_group_participation_enabled": True,
+                    "natural_group_participation_allowlist": [
+                        "synthetic-holder-group",
+                        "synthetic-queue-group",
+                    ],
+                    "natural_group_participation_min_context_messages": 2,
+                    "inference_max_parallel": 1,
+                },
+            )
+
+            def named_event(
+                name: str,
+                sender_id: str,
+                text: str,
+                *,
+                group_id: str,
+                suffix: str,
+            ):
+                event = FakeEvent(sender_id, text, group_id=group_id)
+                event.message_id = f"synthetic-queued-{suffix}"
+                event.get_sender_name = lambda: name
+                return event
+
+            def issue_request(
+                *,
+                group_id: str,
+                first_name: str,
+                first_id: str,
+                first_text: str,
+                current_name: str,
+                current_id: str,
+                current_text: str,
+                suffix: str,
+            ):
+                plugin.admit_ingress_event(
+                    named_event(
+                        first_name,
+                        first_id,
+                        first_text,
+                        group_id=group_id,
+                        suffix=f"{suffix}-first",
+                    )
+                )
+                current = named_event(
+                    current_name,
+                    current_id,
+                    current_text,
+                    group_id=group_id,
+                    suffix=f"{suffix}-current",
+                )
+                plugin.admit_ingress_event(current)
+                request = current.get_extra(
+                    main.SHIO_PARTICIPATION_SEMANTIC_REQUEST
+                )
+                self.assertIs(type(request), ParticipationSemanticRequest)
+                return request
+
+            holder_request = issue_request(
+                group_id="synthetic-holder-group",
+                first_name="山茶",
+                first_id="synthetic-holder-shancha",
+                first_text="明川正在核对说明书。",
+                current_name="明川",
+                current_id="synthetic-holder-mingchuan",
+                current_text="第一行的型号还要再看一遍",
+                suffix="holder",
+            )
+            queued_request = issue_request(
+                group_id="synthetic-queue-group",
+                first_name="山茶",
+                first_id="synthetic-queue-shancha",
+                first_text="白露正在看说明书第一行。",
+                current_name="白露",
+                current_id="synthetic-queue-bailu",
+                current_text="第一行写的啥",
+                suffix="queue",
+            )
+            holder_permit = await plugin.inference_budget.acquire_participation(
+                holder_request,
+                plugin.participation_semantic_authority,
+            )
+            queued_provider = FakeProvider([])
+            queued_task = asyncio.create_task(
+                plugin.participation_semantic_authority.evaluate(
+                    queued_request,
+                    provider=queued_provider,
+                    inference_budget=plugin.inference_budget,
+                    performance_window=plugin.performance_window,
+                )
+            )
+            await asyncio.sleep(0)
+            self.assertEqual(plugin.inference_budget.waiting_count, 1)
+
+            plugin.admit_ingress_event(
+                named_event(
+                    "Danyi",
+                    "synthetic-queue-danyi",
+                    "明川已经把第二行也发出来了。",
+                    group_id="synthetic-queue-group",
+                    suffix="queue-newer",
+                )
+            )
+            self.assertTrue(await plugin.inference_budget.release(holder_permit))
+            outcome = await queued_task
+            self.assertIs(outcome.status, ParticipationSemanticStatus.STALE)
+            self.assertEqual(
+                outcome.reason_code,
+                "participation_semantic_stale_in_queue",
+            )
+            self.assertEqual(queued_provider.calls, [])
+            self.assertEqual(plugin.inference_budget.active_count, 0)
+            self.assertEqual(plugin.inference_budget.waiting_count, 0)
+            await plugin.terminate()
+
     async def test_direct_priority_overtakes_earlier_ordinary_waiter(self):
         budget = self._authority()
         holder = _plan(
@@ -171,6 +407,9 @@ class InferenceBudgetAuthorityTests(unittest.IsolatedAsyncioTestCase):
         direct = _plan(
             self.epochs, self.plans, scope="scope-direct", message="direct", direct=True
         )
+        await _complete_risk(budget, holder)
+        await _complete_risk(budget, ordinary)
+        await _complete_risk(budget, direct)
         holder_permit = await budget.acquire_event(
             *holder,
             purpose=InferencePurpose.PRIMARY,
@@ -213,11 +452,16 @@ class InferenceBudgetAuthorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await ordinary_task, "ordinary")
         self.assertEqual(entered, ["direct", "ordinary"])
 
-    async def test_primary_and_single_repair_are_the_only_event_calls(self):
+    async def test_risk_primary_and_single_repair_are_the_only_event_calls(self):
         budget = self._authority(max_active=2)
         turn = _plan(
             self.epochs, self.plans, scope="scope-a", message="message-a", direct=True
         )
+        with self.assertRaisesRegex(InferenceBudgetError, "risk_call_required"):
+            await budget.acquire_event(*turn, purpose=InferencePurpose.PRIMARY)
+        risk = await budget.acquire_event(*turn, purpose=InferencePurpose.RISK)
+        self.assertIs(risk.purpose, InferencePurpose.RISK)
+        await budget.release(risk)
         primary = await budget.acquire_event(*turn, purpose=InferencePurpose.PRIMARY)
         self.assertIs(type(primary), InferencePermit)
         self.assertIs(primary.priority, InferencePriority.DIRECT)
@@ -226,7 +470,11 @@ class InferenceBudgetAuthorityTests(unittest.IsolatedAsyncioTestCase):
         repair = await budget.acquire_event(*turn, purpose=InferencePurpose.REPAIR)
         await budget.release(repair)
 
-        for purpose in (InferencePurpose.PRIMARY, InferencePurpose.REPAIR):
+        for purpose in (
+            InferencePurpose.RISK,
+            InferencePurpose.PRIMARY,
+            InferencePurpose.REPAIR,
+        ):
             with self.subTest(purpose=purpose.value):
                 with self.assertRaisesRegex(InferenceBudgetError, "call_budget_exhausted"):
                     await budget.acquire_event(*turn, purpose=purpose)
@@ -242,6 +490,9 @@ class InferenceBudgetAuthorityTests(unittest.IsolatedAsyncioTestCase):
         extra = _plan(
             self.epochs, self.plans, scope="scope-extra", message="extra", direct=False
         )
+        await _complete_risk(budget, holder)
+        await _complete_risk(budget, blocked)
+        await _complete_risk(budget, extra)
         permit = await budget.acquire_event(*holder, purpose=InferencePurpose.PRIMARY)
         created = 0
 
@@ -281,6 +532,7 @@ class InferenceBudgetAuthorityTests(unittest.IsolatedAsyncioTestCase):
                 raise error_type("marker")
 
             with self.subTest(error_type=error_type.__name__):
+                await _complete_risk(budget, first)
                 with self.assertRaises(error_type):
                     await budget.run_event_call(
                         *first,
@@ -305,6 +557,8 @@ class InferenceBudgetAuthorityTests(unittest.IsolatedAsyncioTestCase):
         old = _plan(
             self.epochs, self.plans, scope="scope-old", message="old", direct=False
         )
+        await _complete_risk(budget, holder)
+        await _complete_risk(budget, old)
         permit = await budget.acquire_event(*holder, purpose=InferencePurpose.PRIMARY)
         created = 0
 
@@ -332,6 +586,7 @@ class InferenceBudgetAuthorityTests(unittest.IsolatedAsyncioTestCase):
         turn = _plan(
             self.epochs, self.plans, scope="scope-sensitive", message="message-sensitive", direct=True
         )
+        await _complete_risk(budget, turn)
         permit = await budget.acquire_event(*turn, purpose=InferencePurpose.PRIMARY)
         self.assertNotIn("scope-sensitive", repr(permit) + repr(permit.trace_metadata()))
         self.assertNotIn("message-sensitive", repr(permit) + repr(permit.trace_metadata()))
@@ -356,6 +611,8 @@ class InferenceBudgetAuthorityTests(unittest.IsolatedAsyncioTestCase):
         waiter_turn = _plan(
             self.epochs, self.plans, scope="scope-waiter", message="waiter", direct=False
         )
+        await _complete_risk(budget, holder)
+        await _complete_risk(budget, waiter_turn)
         permit = await budget.acquire_event(*holder, purpose=InferencePurpose.PRIMARY)
         waiter = asyncio.create_task(
             budget.acquire_event(*waiter_turn, purpose=InferencePurpose.PRIMARY)
@@ -384,6 +641,7 @@ class InferenceBudgetAuthorityTests(unittest.IsolatedAsyncioTestCase):
             message="holder",
             direct=True,
         )
+        await _complete_risk(budget, turn)
         permit = await budget.acquire_event(*turn, purpose=InferencePurpose.PRIMARY)
         _plan(
             self.epochs,
@@ -403,23 +661,142 @@ class InferenceBudgetAuthorityTests(unittest.IsolatedAsyncioTestCase):
         second = _plan(
             self.epochs, self.plans, scope="scope-next", message="new", direct=True
         )
-        permit = await budget.acquire_event(*first, purpose=InferencePurpose.PRIMARY)
-        await asyncio.sleep(0.02)
-        self.assertEqual(await budget.sweep_expired(), 1)
-        self.assertEqual(budget.active_count, 1)
-        with self.assertRaisesRegex(InferenceBudgetError, "active_timeout"):
-            await budget.acquire_event(*second, purpose=InferencePurpose.PRIMARY)
-        self.assertFalse(await budget.release(permit))
-        self.assertEqual(budget.active_count, 0)
-        next_permit = await budget.acquire_event(
-            *second,
-            purpose=InferencePurpose.PRIMARY,
+        clock = [100.0]
+        with patch(
+            "astrbot_plugin_shio.core.inference_budget._monotonic",
+            side_effect=lambda: clock[0],
+        ):
+            await _complete_risk(budget, first)
+            await _complete_risk(budget, second)
+            permit = await budget.acquire_event(
+                *first,
+                purpose=InferencePurpose.PRIMARY,
+            )
+            clock[0] = 100.02
+            self.assertEqual(await budget.sweep_expired(), 1)
+            self.assertEqual(budget.active_count, 1)
+            with self.assertRaisesRegex(InferenceBudgetError, "active_timeout"):
+                await budget.acquire_event(*second, purpose=InferencePurpose.PRIMARY)
+            self.assertFalse(await budget.release(permit))
+            self.assertEqual(budget.active_count, 0)
+            clock[0] = 101.0
+            next_permit = await budget.acquire_event(
+                *second,
+                purpose=InferencePurpose.PRIMARY,
+            )
+            self.assertTrue(await budget.release(next_permit))
+            self.assertFalse(await budget.release(next_permit))
+            self.assertEqual(
+                budget.trace_metadata()["inference_expired_count"],
+                1,
+            )
+            self.assertEqual(budget.active_count, 0)
+
+    async def test_timely_work_completion_owns_release_time_before_lock_delay(self):
+        budget = self._authority(active_timeout_seconds=1.0)
+        first = _plan(
+            self.epochs,
+            self.plans,
+            scope="scope-timely-completion",
+            message="first",
+            direct=True,
         )
-        self.assertTrue(await budget.release(next_permit))
-        self.assertEqual(
-            budget.trace_metadata()["inference_expired_count"],
-            1,
+        second = _plan(
+            self.epochs,
+            self.plans,
+            scope="scope-next-permit",
+            message="second",
+            direct=True,
         )
+        clock = [100.0]
+        work_started = asyncio.Event()
+        finish_work = asyncio.Event()
+        work_finished = asyncio.Event()
+        observed: list[InferencePermit] = []
+
+        async def work():
+            work_started.set()
+            await finish_work.wait()
+            work_finished.set()
+            return "done"
+
+        with patch(
+            "astrbot_plugin_shio.core.inference_budget._monotonic",
+            side_effect=lambda: clock[0],
+        ):
+            await _complete_risk(budget, first)
+            await _complete_risk(budget, second)
+            call = asyncio.create_task(
+                budget.run_event_call(
+                    *first,
+                    purpose=InferencePurpose.PRIMARY,
+                    work_factory=work,
+                    permit_observer=observed.append,
+                )
+            )
+            await work_started.wait()
+            self.assertEqual(len(observed), 1)
+            first_permit = observed[0]
+            self.assertEqual(budget.active_count, 1)
+
+            lock = budget._lock_for_loop()
+            async with lock:
+                queued_sweep = asyncio.create_task(budget.sweep_expired())
+                await asyncio.sleep(0)
+                self.assertFalse(queued_sweep.done())
+                clock[0] = 100.5
+                finish_work.set()
+                await work_finished.wait()
+                self.assertFalse(call.done())
+                clock[0] = 102.0
+
+            swept_after_timely_completion = await queued_sweep
+            try:
+                result = await call
+            except InferenceBudgetError as exc:
+                result = f"error:{exc}"
+            active_after_first = budget.active_count
+            first_metrics = budget.trace_metadata()
+            repeated_first_release = await budget.release(first_permit)
+
+            next_permit = await budget.acquire_event(
+                *second,
+                purpose=InferencePurpose.PRIMARY,
+            )
+            permits_are_distinct = next_permit is not first_permit
+            next_release = await budget.release(next_permit)
+            repeated_next_release = await budget.release(next_permit)
+            final_metrics = budget.trace_metadata()
+            self.assertEqual(
+                (
+                    result,
+                    swept_after_timely_completion,
+                    active_after_first,
+                    first_metrics["inference_expired_active_count"],
+                    first_metrics["inference_expired_count"],
+                    first_metrics["inference_completed_count"],
+                    repeated_first_release,
+                    permits_are_distinct,
+                    next_release,
+                    repeated_next_release,
+                    budget.active_count,
+                    final_metrics["inference_completed_count"],
+                ),
+                (
+                    "done",
+                    0,
+                    0,
+                    0,
+                    0,
+                    3,
+                    False,
+                    True,
+                    True,
+                    False,
+                    0,
+                    4,
+                ),
+            )
 
     def test_main_primary_repair_and_proactive_paths_use_budget_authority(self):
         source = Path(__file__).resolve().parents[1].joinpath("main.py").read_text(

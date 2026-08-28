@@ -14,6 +14,12 @@ from .group_scene import (
     PublicTopic,
     SceneEntrySource,
 )
+from .conversation_ledger import identity_metadata_integrity
+from .model_input_contract import (
+    CanonicalModelMessage,
+    canonical_model_messages_digest,
+    project_group_scene_model_messages,
+)
 from .persona import (
     ParticipationInterest,
     PersonaPackage,
@@ -74,6 +80,7 @@ def _persona_topic_snapshot(package: PersonaPackage) -> tuple[object, ...]:
 
 class ProactiveTopicSource(str, Enum):
     GROUP_PUBLIC_TOPIC = "group_public_topic"
+    GROUP_RECENT_TOPIC = "group_recent_topic"
     PERSONA_INTEREST = "persona_interest"
 
 
@@ -91,7 +98,7 @@ class ProactiveTopicPlan:
     source: ProactiveTopicSource
     topic_text: str = field(repr=False)
     topic_digest: str = field(repr=False)
-    recent_public_context: tuple[str, ...] = field(repr=False)
+    recent_public_context: tuple[CanonicalModelMessage, ...] = field(repr=False)
     public_context_digest: str = field(repr=False)
     interest_id: str
     scene_revision: int
@@ -155,10 +162,10 @@ class _PlanRecord:
     persona_snapshot: tuple[object, ...]
     source: ProactiveTopicSource
     public_topic: PublicTopic | None
-    interest: ParticipationInterest
+    interest: ParticipationInterest | None
     topic_text: str
     topic_digest: str
-    recent_public_context: tuple[str, ...]
+    recent_public_context: tuple[CanonicalModelMessage, ...]
     public_context_digest: str
     interest_id: str
     scene_revision: int
@@ -190,18 +197,23 @@ def _scene_topic_snapshot(scene: GroupSceneSnapshot) -> tuple[object, ...]:
             values = (
                 topic.source,
                 topic.conversation_revision,
+                topic.author_sender_key,
+                topic.target_sender_key,
+                topic.message_id,
+                topic.reply_to_message_id,
                 topic.content,
                 topic.content_digest,
+                identity_metadata_integrity(topic.identity_metadata),
             )
         except AttributeError as exc:
             raise ContractViolation("proactive_topic_scene_corrupt") from exc
         if (
             type(values[1]) is not int
             or values[1] < 1
-            or type(values[2]) is not str
-            or not values[2]
-            or type(values[3]) is not str
-            or _digest_text(values[2]) != values[3]
+            or any(type(value) is not str for value in values[2:8])
+            or not values[6]
+            or _digest_text(values[6]) != values[7]
+            or type(values[8]) is not tuple
         ):
             raise ContractViolation("proactive_topic_scene_corrupt")
         topics.append(values)
@@ -239,9 +251,9 @@ def _plan_snapshot(plan: ProactiveTopicPlan) -> tuple[object, ...]:
         or _digest_text(values[3]) != values[4]
         or type(values[5]) is not tuple
         or len(values[5]) < 2
-        or any(type(value) is not str or not value for value in values[5])
+        or any(type(value) is not CanonicalModelMessage for value in values[5])
         or type(values[6]) is not str
-        or _digest_text("\n".join(values[5])) != values[6]
+        or canonical_model_messages_digest(values[5]) != values[6]
         or type(values[7]) is not str
         or not values[7]
         or type(values[8]) is not int
@@ -323,6 +335,7 @@ class ProactiveTopicAuthority:
         scene: GroupSceneSnapshot,
         *,
         persona: PersonaPackage,
+        excluded_topic_digests: tuple[str, ...] = (),
     ) -> bool:
         """Preflight topic availability without consuming a policy decision.
 
@@ -330,32 +343,66 @@ class ProactiveTopicAuthority:
         cooldown/daily quota. Corrupt or cross-authority inputs still raise.
         """
 
+        return self.grounded_context_reason(
+            scene,
+            persona=persona,
+            excluded_topic_digests=excluded_topic_digests,
+        ) == "grounded_context_ready"
+
+    def grounded_context_reason(
+        self,
+        scene: GroupSceneSnapshot,
+        *,
+        persona: PersonaPackage,
+        excluded_topic_digests: tuple[str, ...] = (),
+    ) -> str:
+        """Return an exact content-free preflight reason for scheduler traces."""
+
         with self._lock:
             self._inspect_persona(persona)
             self._group_scenes.inspect_current_snapshot(scene)
             try:
-                self._selection(scene, persona)
+                self._selection(
+                    scene,
+                    persona,
+                    excluded_topic_digests=excluded_topic_digests,
+                )
                 self._recent_public_context(scene, persona)
             except ContractViolation as exc:
                 if str(exc) in {
                     "proactive_topic_context_too_shallow",
                     "proactive_topic_no_grounded_match",
+                    "proactive_topic_recently_used",
                     "proactive_topic_unavailable",
                 }:
-                    return False
+                    return str(exc)
                 raise
-            return True
+            return "grounded_context_ready"
 
     @staticmethod
     def _selection(
         scene: GroupSceneSnapshot,
         persona: PersonaPackage,
+        *,
+        excluded_topic_digests: tuple[str, ...] = (),
     ) -> tuple[
         ProactiveTopicSource,
         PublicTopic | None,
-        ParticipationInterest,
+        ParticipationInterest | None,
         str,
     ]:
+        if (
+            type(excluded_topic_digests) is not tuple
+            or len(excluded_topic_digests) > 4
+            or any(
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in excluded_topic_digests
+            )
+        ):
+            raise ContractViolation("proactive_topic_exclusions_invalid")
+        excluded = frozenset(excluded_topic_digests)
         interests = persona.participation_interests
         if not interests:
             raise ContractViolation("proactive_topic_unavailable")
@@ -371,6 +418,8 @@ class ProactiveTopicAuthority:
             tuple[float, int, int, PublicTopic, ParticipationInterest]
         ] = []
         for topic_index, topic in enumerate(recent_human_topics):
+            if topic.content_digest in excluded:
+                continue
             folded = topic.content.casefold()
             for interest in interests:
                 if any(keyword.casefold() in folded for keyword in interest.keywords):
@@ -391,35 +440,43 @@ class ProactiveTopicAuthority:
                 interest,
                 topic.content,
             )
+        fallback = next(
+            (
+                topic
+                for topic in reversed(recent_human_topics)
+                if topic.content_digest not in excluded
+                and len("".join(topic.content.split())) >= 4
+            ),
+            None,
+        )
+        if fallback is not None:
+            return (
+                ProactiveTopicSource.GROUP_RECENT_TOPIC,
+                fallback,
+                None,
+                fallback.content,
+            )
+        if any(topic.content_digest in excluded for topic in recent_human_topics):
+            raise ContractViolation("proactive_topic_recently_used")
         raise ContractViolation("proactive_topic_no_grounded_match")
 
     @staticmethod
     def _recent_public_context(
         scene: GroupSceneSnapshot,
         persona: PersonaPackage,
-    ) -> tuple[str, ...]:
-        labels: dict[str, str] = {}
-        lines: list[str] = []
-        total_chars = 0
-        for topic in scene.public_topics[-8:]:
-            if topic.source is SceneEntrySource.HUMAN_INBOUND:
-                label = labels.setdefault(
-                    topic.author_sender_key,
-                    f"群友{len(labels) + 1}",
-                )
-            elif topic.source is SceneEntrySource.SHIO_OUTBOUND:
-                label = persona.display_name
-            else:
-                continue
-            content = " ".join(topic.content.split())[:600]
-            line = f"{label}：{content}"
-            if not content or total_chars + len(line) > 4000:
-                continue
-            lines.append(line)
-            total_chars += len(line)
-        if len(lines) < 2:
+    ) -> tuple[CanonicalModelMessage, ...]:
+        messages = project_group_scene_model_messages(
+            scene,
+            assistant_display_name=persona.display_name,
+            source_kind="proactive_public_scene",
+            max_messages=8,
+            max_chars=4000,
+            max_message_chars=600,
+            selection_order="chronological",
+        )
+        if len(messages) < 2:
             raise ContractViolation("proactive_topic_context_too_shallow")
-        return tuple(lines)
+        return messages
 
     def select(
         self,
@@ -442,10 +499,21 @@ class ProactiveTopicAuthority:
             target = policy_decision.candidate.target
             if scene.scope_key != target.scope_key or scene.conversation_revision < 1:
                 raise ContractViolation("proactive_topic_scene_mismatch")
-            source, public_topic, interest, topic_text = self._selection(scene, persona)
+            recent_topic_digests, _ = self._policy_state.recent_delivery_digests(
+                platform_id=target.platform_id,
+                bot_id=target.bot_id,
+                group_id=target.group_id,
+            )
+            source, public_topic, interest, topic_text = self._selection(
+                scene,
+                persona,
+                excluded_topic_digests=recent_topic_digests,
+            )
             topic_digest = _digest_text(topic_text)
             recent_public_context = self._recent_public_context(scene, persona)
-            public_context_digest = _digest_text("\n".join(recent_public_context))
+            public_context_digest = canonical_model_messages_digest(
+                recent_public_context
+            )
             plan = object.__new__(ProactiveTopicPlan)
             for name, value in (
                 ("policy_decision", policy_decision),
@@ -455,7 +523,10 @@ class ProactiveTopicAuthority:
                 ("topic_digest", topic_digest),
                 ("recent_public_context", recent_public_context),
                 ("public_context_digest", public_context_digest),
-                ("interest_id", interest.id),
+                (
+                    "interest_id",
+                    interest.id if interest is not None else "general_public_topic",
+                ),
                 ("scene_revision", scene.conversation_revision),
                 ("model_authorized", False),
                 ("send_authorized", False),
@@ -478,7 +549,9 @@ class ProactiveTopicAuthority:
                 topic_digest=topic_digest,
                 recent_public_context=recent_public_context,
                 public_context_digest=public_context_digest,
-                interest_id=interest.id,
+                interest_id=(
+                    interest.id if interest is not None else "general_public_topic"
+                ),
                 scene_revision=scene.conversation_revision,
                 snapshot=snapshot,
             )
@@ -522,7 +595,7 @@ class ProactiveTopicAuthority:
                 record.public_topic is topic for topic in record.scene.public_topics
             ):
                 raise ContractViolation("proactive_topic_plan_corrupt")
-            if not any(
+            if record.interest is not None and not any(
                 record.interest is interest
                 for interest in record.persona.participation_interests
             ):
@@ -535,6 +608,18 @@ class ProactiveTopicAuthority:
 
     def inspect_scene(self, scene: GroupSceneSnapshot) -> GroupSceneSnapshot:
         return self._group_scenes.inspect_current_snapshot(scene)
+
+    def recent_delivery_digests(
+        self,
+        plan: ProactiveTopicPlan,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        record = self._inspect(plan, require_current=False)
+        target = record.target
+        return self._policy_state.recent_delivery_digests(
+            platform_id=target.platform_id,
+            bot_id=target.bot_id,
+            group_id=target.group_id,
+        )
 
     def _restart_groups(self) -> tuple[object, ...]:
         """Return code-owned restart targets from the bound canonical scene book."""

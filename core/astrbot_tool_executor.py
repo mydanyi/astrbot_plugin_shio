@@ -24,7 +24,11 @@ _ANYSEARCH_NAMES = {
     AcquisitionKind.EXTRACT: "anysearch_extract",
     AcquisitionKind.BATCH_SEARCH: "anysearch_batch_search",
 }
-SUPPORTED_SEALED_ACQUISITION_TOOL_NAMES = frozenset(_ANYSEARCH_NAMES.values())
+_ASTRBOT_KB_NAME = "astr_kb_search"
+_ASTRBOT_KB_MODULE = "astrbot.core.tools.knowledge_base_tools"
+SUPPORTED_SEALED_ACQUISITION_TOOL_NAMES = frozenset(
+    (*_ANYSEARCH_NAMES.values(), _ASTRBOT_KB_NAME)
+)
 _ANYSEARCH_SOURCE = "astrbot_plugin_anysearch"
 _MAX_SCHEMA_CHARS = 100_000
 
@@ -121,7 +125,12 @@ class _SealedEventProxy:
         return "SealedEventProxy(send_disabled=True)"
 
 
-def _sealed_run_context(run_context: Any, event: Any = None) -> Any:
+def _sealed_run_context(
+    run_context: Any,
+    event: Any = None,
+    *,
+    allow_trusted_read_context: bool = False,
+) -> Any:
     """Clone the small AstrBot run-context surface with an isolated event."""
 
     source_agent_context = getattr(run_context, "context", None)
@@ -132,10 +141,14 @@ def _sealed_run_context(run_context: Any, event: Any = None) -> Any:
         return run_context
     proxy = _SealedEventProxy(source_event)
     sealed_agent_context = SimpleNamespace(
-        # Local AnySearch execution and AstrBot's permission wrapper only need
-        # the isolated event.  Do not expose the live plugin Context, which can
-        # reach platform send APIs through a side channel.
-        context=None,
+        # AnySearch receives no plugin Context.  The one exact audited AstrBot
+        # knowledge-base tool needs Context.kb_manager/config for a scoped read;
+        # its event is still replaced with the no-send proxy below.
+        context=(
+            getattr(source_agent_context, "context", None)
+            if allow_trusted_read_context
+            else None
+        ),
         event=proxy,
         extra=copy.deepcopy(getattr(source_agent_context, "extra", {}) or {}),
     )
@@ -335,15 +348,28 @@ def _recompute_shape_digest(request: AcquisitionRequest) -> str:
 def _request_preflight(
     request: AcquisitionRequest,
 ) -> tuple[SealedExecutionStatus | None, dict[str, Any] | None]:
-    expected_name = _ANYSEARCH_NAMES.get(request.kind)
+    knowledge_base_request = request.kind is AcquisitionKind.KNOWLEDGE_BASE
+    expected_name = (
+        _ASTRBOT_KB_NAME
+        if knowledge_base_request
+        else _ANYSEARCH_NAMES.get(request.kind)
+    )
+    expected_capability = (
+        CapabilityClass.CHAT_RETRIEVAL
+        if knowledge_base_request
+        else CapabilityClass.PUBLIC_WEB_READ
+    )
+    expected_source = (
+        _ASTRBOT_KB_MODULE if knowledge_base_request else _ANYSEARCH_SOURCE
+    )
     if (
         expected_name is None
         or request.selection.tool_name != expected_name
-        or request.selection.capability is not CapabilityClass.PUBLIC_WEB_READ
+        or request.selection.capability is not expected_capability
         or request.selection.call_budget != 1
     ):
         return SealedExecutionStatus.REQUEST_NOT_ALLOWED, None
-    if request.selection.source != _ANYSEARCH_SOURCE:
+    if request.selection.source != expected_source:
         return SealedExecutionStatus.SOURCE_UNATTESTED, None
     try:
         if _recompute_shape_digest(request) != request.request_shape_digest:
@@ -353,7 +379,7 @@ def _request_preflight(
         return SealedExecutionStatus.REQUEST_TAMPERED, None
     if not isinstance(values, dict):
         return SealedExecutionStatus.REQUEST_TAMPERED, None
-    if request.kind is AcquisitionKind.SEARCH:
+    if request.kind in {AcquisitionKind.SEARCH, AcquisitionKind.KNOWLEDGE_BASE}:
         valid = (
             set(values) == {"query"}
             and isinstance(values.get("query"), str)
@@ -446,15 +472,27 @@ def _select_runtime_tool(
     except Exception:
         return SealedExecutionStatus.SOURCE_UNATTESTED, None
     descriptor = classification.descriptor
+    expected_classification = (
+        (CapabilityClass.CHAT_RETRIEVAL, SideEffectClass.SCOPED_READ)
+        if request.kind is AcquisitionKind.KNOWLEDGE_BASE
+        else (CapabilityClass.PUBLIC_WEB_READ, SideEffectClass.PUBLIC_READ)
+    )
     if (
         descriptor.name != request.selection.tool_name
-        or classification.capability is not CapabilityClass.PUBLIC_WEB_READ
-        or classification.side_effect is not SideEffectClass.PUBLIC_READ
+        or (classification.capability, classification.side_effect)
+        != expected_classification
     ):
         return SealedExecutionStatus.SOURCE_UNATTESTED, None
-    source_tokens = _source_tokens(f"{descriptor.origin}.{descriptor.module_path}")
-    if _ANYSEARCH_SOURCE not in source_tokens or not descriptor.module_path:
-        return SealedExecutionStatus.SOURCE_UNATTESTED, None
+    if request.kind is AcquisitionKind.KNOWLEDGE_BASE:
+        if (
+            descriptor.name != _ASTRBOT_KB_NAME
+            or descriptor.module_path.strip().lower() != _ASTRBOT_KB_MODULE
+        ):
+            return SealedExecutionStatus.SOURCE_UNATTESTED, None
+    else:
+        source_tokens = _source_tokens(f"{descriptor.origin}.{descriptor.module_path}")
+        if _ANYSEARCH_SOURCE not in source_tokens or not descriptor.module_path:
+            return SealedExecutionStatus.SOURCE_UNATTESTED, None
     return None, tool
 
 
@@ -699,6 +737,7 @@ def _production_adapters(
     plugin_context: Any,
     event: Any,
     timeout: float,
+    allow_trusted_read_context: bool,
 ) -> tuple[Any, Any, Any]:
     from astrbot.core.agent.run_context import ContextWrapper
     from astrbot.core.astr_agent_context import AstrAgentContext
@@ -715,7 +754,15 @@ def _production_adapters(
     # context and is not an authorization boundary.  The sealed reference-only
     # path deliberately omits it: a hook is able to send or mutate state before
     # an after-the-fact result check could run.
-    return FunctionToolExecutor.execute, None, _sealed_run_context(run_context, event)
+    return (
+        FunctionToolExecutor.execute,
+        None,
+        _sealed_run_context(
+            run_context,
+            event,
+            allow_trusted_read_context=allow_trusted_read_context,
+        ),
+    )
 
 
 async def execute_sealed_acquisition(
@@ -732,7 +779,7 @@ async def execute_sealed_acquisition(
     epoch_current: Callable[[DecisionBinding], bool] | None = None,
     schema_validator: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None,
 ) -> SealedExecutionOutcome:
-    """Execute one attested AnySearch request without exposing a tool loop.
+    """Execute one attested read-only request without exposing a tool loop.
 
     The brokered request is the only authority for the tool, arguments, source,
     binding, epoch, call budget, and deadline. The hook receives a disposable
@@ -792,6 +839,9 @@ async def execute_sealed_acquisition(
                 plugin_context=plugin_context,
                 event=event,
                 timeout=remaining,
+                allow_trusted_read_context=(
+                    request.kind is AcquisitionKind.KNOWLEDGE_BASE
+                ),
             )
             if hook is None:
                 hook = production_hook
@@ -926,6 +976,16 @@ async def execute_sealed_acquisition(
     result_status, content = _result_status(values[0])
     if result_status is not None:
         return _outcome(result_status, executed=True, result_count=1)
+    if request.kind is AcquisitionKind.KNOWLEDGE_BASE and all(
+        _text_value(item).strip().lower() == "no relevant knowledge found."
+        for item in content
+        if _text_value(item)
+    ):
+        return _outcome(
+            SealedExecutionStatus.RESULT_EMPTY,
+            executed=True,
+            result_count=1,
+        )
     try:
         batch = _build_batch(request, arguments, content)
     except Exception:

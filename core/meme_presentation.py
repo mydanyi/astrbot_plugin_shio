@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import inspect
 import math
 import re
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
 from .action_planner import PlannedAction, PlannedActionAuthority
@@ -49,6 +47,10 @@ _RECEIPT_SEAL = object()
 _TEXT_MEME_ALWAYS_BLOCK_RE = re.compile(
     r"(?:自杀|自残|伤害自己|去死|杀死|暴力|打人|攻击|辱骂|侮辱|骂人|骂|变态|"
     r"严重|紧急|危险|撑不住)",
+    re.IGNORECASE,
+)
+_SEMANTIC_MEME_HARD_SAFETY_RE = re.compile(
+    r"(?:自杀|自残|伤害自己|严重受伤|正在流血|紧急危险|立即报警|急救)",
     re.IGNORECASE,
 )
 _TEXT_MEME_LITERAL_SAFETY_RE = re.compile(
@@ -109,6 +111,74 @@ class MemeCategory(str, Enum):
     WORK = "work"
 
 
+_AUDITED_ATRI_CATEGORY_DESCRIPTIONS = {
+    MemeCategory.ANNOYED: "轻微嫌弃、无语、白眼或可爱吐槽，不用于真正攻击",
+    MemeCategory.ANGRY: "可爱的生气、抗议或不满，避免升级冲突",
+    MemeCategory.CONFUSED: "没听懂、需要解释或确认",
+    MemeCategory.SURPRISED: "明显意外、震惊或突然发现，不用于普通信息",
+    MemeCategory.SAD: "委屈、难过、想哭、挫折或需要安慰",
+    MemeCategory.AWKWARD: "尴尬、心虚、冒汗或不知道怎么接",
+    MemeCategory.AGREE: "收到、认可、确认或同意继续",
+    MemeCategory.REJECT: "明确拒绝、不赞成或让对方停下",
+    MemeCategory.HAPPY: "开心、满足、轻松或事情进展顺利",
+    MemeCategory.PROUD: "得意、自信、高性能或傲娇自夸",
+    MemeCategory.ENCOURAGE: "给对方加油、肯定能力或庆祝表现",
+    MemeCategory.REQUEST: "期待、拜托、撒娇请求或希望继续",
+    MemeCategory.CUTE: "卖萌、装傻或无害小动作",
+    MemeCategory.LOVE: "喜欢、感谢、比心、贴贴或亲近感",
+    MemeCategory.SHY: "收到夸奖、被说中心思或害羞脸红",
+    MemeCategory.THINKING: "正在思考、加载、记笔记或需要处理时间",
+    MemeCategory.FOOD: "吃东西、好吃、饮料、饥饿或美食",
+    MemeCategory.WORK: "工作、作业、加班、任务或认真处理",
+    MemeCategory.WATCHING: "围观、吃瓜、观察或探头确认",
+    MemeCategory.SLEEP: "困倦、晚安、休息、躺平或提醒睡觉",
+    MemeCategory.TEASE: "熟人间轻度调侃或搞怪，不对陌生人使用",
+    MemeCategory.RISKY_BANTER: "主人明确要求的高风险熟人玩笑，默认不要使用",
+}
+_PROACTIVE_CATEGORY_MARKER_RE = re.compile(
+    r"(?m)^[ \t]*&&(?P<category>[a-z_]+)&&[ \t]*$"
+)
+
+
+def proactive_meme_category_prompt() -> str:
+    """Return the audited Manager category contract for hidden proactive output."""
+
+    categories = "；".join(
+        f"{category.value}={_AUDITED_ATRI_CATEGORY_DESCRIPTIONS[category]}"
+        for category in MemeCategory
+    )
+    return (
+        "最后必须另起一行输出且只输出一个隐藏表情类别标记 &&category&&。"
+        "类别要同时符合最近公开群聊和你最终回复的真实情绪，不能固定使用 happy。"
+        "可选类别："
+        + categories
+        + "。这个标记不会作为聊天正文发送；不要解释标记，不要输出多个。"
+    )
+
+
+def extract_required_proactive_meme_category(
+    raw_output: str,
+) -> tuple[str, MemeCategory]:
+    """Separate one valid final-line Manager category marker from visible text."""
+
+    if type(raw_output) is not str:
+        raise ContractViolation("proactive_meme_marker_invalid")
+    matches = tuple(_PROACTIVE_CATEGORY_MARKER_RE.finditer(raw_output))
+    if len(matches) != 1:
+        raise ContractViolation("proactive_meme_marker_invalid")
+    match = matches[0]
+    if raw_output[match.end() :].strip():
+        raise ContractViolation("proactive_meme_marker_not_final")
+    try:
+        category = MemeCategory(match.group("category"))
+    except ValueError as exc:
+        raise ContractViolation("proactive_meme_category_invalid") from exc
+    visible = (raw_output[: match.start()] + raw_output[match.end() :]).strip()
+    if not visible or "&&" in visible:
+        raise ContractViolation("proactive_meme_visible_invalid")
+    return visible, category
+
+
 _REACTION_CATEGORIES = {
     "acknowledge": MemeCategory.AGREE,
     "light_reaction": MemeCategory.CUTE,
@@ -146,7 +216,7 @@ _MEME_ENCOURAGE_RE = re.compile(
     re.IGNORECASE,
 )
 _MEME_FOOD_RE = re.compile(
-    r"(?:吃饭|晚饭|早餐|午饭|夜宵|拉面|火锅|烧烤|奶茶|甜点|好吃|好香|饿了|美食)",
+    r"(?:吃饭|去吃|吃一碗|吃点|晚饭|早餐|午饭|夜宵|拉面|火锅|烧烤|奶茶|甜点|好吃|好香|饿了|美食)",
     re.IGNORECASE,
 )
 _MEME_HAPPY_RE = re.compile(
@@ -364,6 +434,80 @@ class MemeExecutionStatus(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class MemeAdapterReceipt:
+    """Exact result of the shared audited Meme Manager compatibility adapter."""
+
+    status: MemeExecutionStatus
+    attempt_count: int
+    success_count: int
+    reason_code: str
+    category: MemeCategory
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.status) is not MemeExecutionStatus
+            or type(self.category) is not MemeCategory
+            or type(self.attempt_count) is not int
+            or type(self.success_count) is not int
+            or self.attempt_count not in {0, 1}
+            or self.success_count not in {0, 1}
+            or self.success_count > self.attempt_count
+            or type(self.reason_code) is not str
+            or not self.reason_code
+        ):
+            raise ContractViolation("meme_adapter_receipt_invalid")
+
+    def trace_metadata(self) -> dict[str, str | int]:
+        return {
+            "meme_execution_status": self.status.value,
+            "meme_execution_attempt_count": self.attempt_count,
+            "meme_execution_success_count": self.success_count,
+            "meme_execution_reason_code": self.reason_code,
+            "meme_execution_category": self.category.value,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MemeSemanticReceipt:
+    status: MemeExecutionStatus
+    attempt_count: int
+    success_count: int
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.status) is not MemeExecutionStatus
+            or type(self.attempt_count) is not int
+            or type(self.success_count) is not int
+            or self.attempt_count not in {0, 1}
+            or self.success_count not in {0, 1}
+            or self.success_count > self.attempt_count
+            or type(self.reason_code) is not str
+            or not self.reason_code
+        ):
+            raise ContractViolation("meme_semantic_receipt_invalid")
+
+    def trace_metadata(self) -> dict[str, str | int]:
+        return {
+            "meme_execution_status": self.status.value,
+            "meme_execution_attempt_count": self.attempt_count,
+            "meme_execution_success_count": self.success_count,
+            "meme_execution_reason_code": self.reason_code,
+            "meme_selection_owner": "meme_manager_semantic",
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _MemeTransportReceipt:
+    """Private result shared by normal replies and proactive group output."""
+
+    status: MemeExecutionStatus
+    attempt_count: int
+    success_count: int
+    reason_code: str
+
+
+@dataclass(frozen=True, slots=True)
 class MemeComplementDecision:
     eligible: bool
     reason_code: str
@@ -386,6 +530,42 @@ class MemeComplementDecision:
                 self.category.value if self.category is not None else "none"
             ),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticMemeHandoffDecision:
+    eligible: bool
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        if type(self.eligible) is not bool:
+            raise ContractViolation("semantic_meme_handoff_eligibility_invalid")
+        _require_exact_text(self.reason_code, "semantic_meme_handoff_reason_invalid")
+
+    def trace_metadata(self) -> dict[str, str | bool]:
+        return {
+            "meme_complement_eligible": self.eligible,
+            "meme_complement_reason": self.reason_code,
+            "meme_selection_owner": "meme_manager_semantic",
+        }
+
+
+def decide_semantic_meme_handoff(
+    *,
+    current_message: str,
+    final_visible_text: str = "",
+) -> SemanticMemeHandoffDecision:
+    """Keep only hard safety in Shio; Manager owns probability and selection."""
+
+    current = str(current_message or "").strip()
+    visible = str(final_visible_text or "").strip()
+    if not current and not visible:
+        return SemanticMemeHandoffDecision(False, "empty_expression")
+    safety_text = "\n".join(value for value in (current, visible) if value)
+    literal = _BALANCED_QUOTED_TEXT_RE.sub(" ", safety_text)
+    if _SEMANTIC_MEME_HARD_SAFETY_RE.search(literal):
+        return SemanticMemeHandoffDecision(False, "hard_safety_context")
+    return SemanticMemeHandoffDecision(True, "manager_semantic_handoff")
 
 
 @dataclass(frozen=True, slots=True)
@@ -591,6 +771,91 @@ class MemeComplementCadence:
             self._records[key] = _MemeCadenceRecord(revision, safe_turns, 0)
             return MemeComplementDecision(False, "no_complementary_cue")
 
+    def decide_group_initiation(
+        self,
+        *,
+        scope_key: str,
+        conversation_revision: int,
+        current_message: str,
+        recent_public_messages: tuple[str, ...] = (),
+    ) -> MemeComplementDecision:
+        """Apply the same category and safety surface without a fake user plan."""
+
+        scope = str(scope_key or "").strip()
+        message = str(current_message or "").strip()
+        if (
+            not scope
+            or type(conversation_revision) is not int
+            or conversation_revision < 1
+            or type(recent_public_messages) is not tuple
+            or len(recent_public_messages) > 8
+            or any(type(value) is not str or len(value) > 500 for value in recent_public_messages)
+        ):
+            raise ContractViolation("meme_group_initiation_context_invalid")
+        category = select_meme_category(
+            kind=MemeExecutionKind.MEME_COMPLEMENT,
+            current_message=message,
+            social_act="continue_public_topic",
+            emotion_tags=(),
+            relationship_distance=RelationshipDistance.PEER,
+            recent_sender_messages=recent_public_messages,
+        )
+        if not self._enabled:
+            return MemeComplementDecision(False, "meme_complement_disabled")
+        if not message or len(message) > 160:
+            return MemeComplementDecision(False, "message_not_lightweight")
+        literal = _BALANCED_QUOTED_TEXT_RE.sub(" ", message)
+        key = (scope, "actor:proactive_group")
+        with self._lock:
+            current = self._records.get(key)
+            if current is not None and conversation_revision <= current.last_revision:
+                return MemeComplementDecision(False, "cadence_replayed")
+            if current is None:
+                if len(self._records) >= self._max_subjects:
+                    self._records.pop(next(iter(self._records)))
+                current = _MemeCadenceRecord(-1, 0, 0)
+            if (
+                _TEXT_MEME_ALWAYS_BLOCK_RE.search(message)
+                or _TEXT_MEME_LITERAL_SAFETY_RE.search(literal)
+            ):
+                self._records[key] = _MemeCadenceRecord(
+                    conversation_revision,
+                    0,
+                    0,
+                )
+                return MemeComplementDecision(False, "hard_safety_context")
+            if category is None:
+                self._records[key] = _MemeCadenceRecord(
+                    conversation_revision,
+                    min(current.safe_turns + 1, self._ordinary_threshold - 1),
+                    max(0, current.cooldown_remaining - 1),
+                )
+                return MemeComplementDecision(False, "unsupported_situation")
+            if _TEXT_MEME_REQUEST_RE.search(message) and category not in {
+                MemeCategory.CONFUSED,
+                MemeCategory.REQUEST,
+                MemeCategory.THINKING,
+            }:
+                self._records[key] = _MemeCadenceRecord(conversation_revision, 0, 0)
+                return MemeComplementDecision(False, "serious_or_request_context")
+            if current.cooldown_remaining:
+                self._records[key] = _MemeCadenceRecord(
+                    conversation_revision,
+                    0,
+                    current.cooldown_remaining - 1,
+                )
+                return MemeComplementDecision(False, "cadence_cooldown")
+            self._records[key] = _MemeCadenceRecord(
+                conversation_revision,
+                0,
+                self._cooldown_turns,
+            )
+            return MemeComplementDecision(
+                True,
+                "group_initiation_categorized_situation",
+                category,
+            )
+
     def trace_metadata(self) -> dict[str, int]:
         with self._lock:
             return {
@@ -634,13 +899,6 @@ def _require_exact_text(value: object, reason: str) -> str:
     return value
 
 
-def _require_digest(value: object, reason: str) -> str:
-    text = _require_exact_text(value, reason)
-    if len(text) != 64 or any(char not in "0123456789abcdef" for char in text):
-        raise ContractViolation(reason)
-    return text
-
-
 @dataclass(frozen=True, slots=True)
 class MemeManagerRuntimeProfile:
     plugin_name: str
@@ -651,9 +909,6 @@ class MemeManagerRuntimeProfile:
     metadata_qualname: str
     instance_module: str
     instance_qualname: str
-    class_source_digest: str
-    prepare_source_digest: str
-    send_source_digest: str
 
     def __post_init__(self) -> None:
         for name in (
@@ -667,16 +922,8 @@ class MemeManagerRuntimeProfile:
             "instance_qualname",
         ):
             _require_exact_text(getattr(self, name), "meme_runtime_profile_invalid")
-        for name in (
-            "class_source_digest",
-            "prepare_source_digest",
-            "send_source_digest",
-        ):
-            _require_digest(getattr(self, name), "meme_runtime_profile_invalid")
-
-
 def production_meme_manager_runtime_profile() -> MemeManagerRuntimeProfile:
-    """Return the audited FNOS Meme Manager 4.15.1 build descriptor."""
+    """Return the audited official Meme Manager 4.15.1 public API descriptor."""
 
     return MemeManagerRuntimeProfile(
         plugin_name="meme_manager",
@@ -687,28 +934,7 @@ def production_meme_manager_runtime_profile() -> MemeManagerRuntimeProfile:
         metadata_qualname="StarMetadata",
         instance_module="data.plugins.meme_manager.main",
         instance_qualname="MemeSender",
-        class_source_digest=(
-            "028188c6ac1ff0594d33367ae6beddb2b2583917a9774049b3b0a364ae6b2416"
-        ),
-        prepare_source_digest=(
-            "4867e3f8da3b6954b55ebe7da73e512d8a0b1211731346facff2fdc9209b23dc"
-        ),
-        send_source_digest=(
-            "4867e3f8da3b6954b55ebe7da73e512d8a0b1211731346facff2fdc9209b23dc"
-        ),
     )
-
-
-def _source_file_digest(value: object) -> str:
-    source_path = inspect.getsourcefile(value)
-    if type(source_path) is not str or not source_path:
-        raise ContractViolation("meme_runtime_source_unavailable")
-    path = Path(source_path)
-    try:
-        payload = path.read_bytes()
-    except (OSError, ValueError) as exc:
-        raise ContractViolation("meme_runtime_source_unavailable") from exc
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _method_shape(method: object) -> tuple[tuple[str, inspect._ParameterKind], ...]:
@@ -847,17 +1073,6 @@ class MemeManagerConformanceCollector:
             raise ContractViolation("meme_runtime_method_invalid")
         if _method_shape(send_method) != _EXPECTED_SEND_PARAMETERS:
             raise ContractViolation("meme_runtime_method_invalid")
-        digests = (
-            _source_file_digest(instance_type),
-            _source_file_digest(prepare_method),
-            _source_file_digest(send_method),
-        )
-        if digests != (
-            profile.class_source_digest,
-            profile.prepare_source_digest,
-            profile.send_source_digest,
-        ):
-            raise ContractViolation("meme_runtime_build_changed")
         return (
             metadata_type,
             instance_type,
@@ -868,7 +1083,6 @@ class MemeManagerConformanceCollector:
             module_path,
             prepare_method.__func__,
             send_method.__func__,
-            *digests,
         )
 
     def collect(self, context: object) -> MemeManagerConformanceResult:
@@ -916,11 +1130,6 @@ class MemeManagerConformanceCollector:
             )
         except ContractViolation as exc:
             reason = str(exc)
-            if reason == "meme_runtime_build_changed":
-                return self._failure(
-                    MemeManagerConformanceStatus.BUILD_CHANGED,
-                    "runtime_build_changed",
-                )
             if reason == "meme_runtime_disabled":
                 return self._failure(
                     MemeManagerConformanceStatus.DISABLED,
@@ -1928,6 +2137,167 @@ async def _cleanup_prepared_meme(
         return
 
 
+async def _execute_meme_manager_transport(
+    prepare_method: object,
+    send_method: object,
+    *,
+    event: object,
+    marker: str,
+    is_current: object,
+    timeout_seconds: float,
+) -> _MemeTransportReceipt:
+    """Execute the one-image Meme Manager compatibility path exactly once."""
+
+    try:
+        prepared = await asyncio.wait_for(
+            prepare_method(event, marker),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        return _MemeTransportReceipt(
+            MemeExecutionStatus.TIMED_OUT, 0, 0, "prepare_timeout"
+        )
+    except asyncio.CancelledError:
+        return _MemeTransportReceipt(
+            MemeExecutionStatus.FAILED, 0, 0, "prepare_cancelled"
+        )
+    except BaseException:
+        return _MemeTransportReceipt(
+            MemeExecutionStatus.FAILED, 0, 0, "prepare_failed"
+        )
+    if type(prepared) is not dict:
+        return _MemeTransportReceipt(
+            MemeExecutionStatus.FAILED, 0, 0, "prepared_shape_invalid"
+        )
+    images = prepared.get("images")
+    if type(images) is not list or len(images) > 1:
+        await _cleanup_prepared_meme(
+            send_method,
+            event,
+            prepared,
+            timeout_seconds=timeout_seconds,
+        )
+        return _MemeTransportReceipt(
+            MemeExecutionStatus.FAILED, 0, 0, "prepared_shape_invalid"
+        )
+    if not images:
+        await _cleanup_prepared_meme(
+            send_method,
+            event,
+            prepared,
+            timeout_seconds=timeout_seconds,
+        )
+        return _MemeTransportReceipt(
+            MemeExecutionStatus.SUPPRESSED, 0, 0, "no_matching_image"
+        )
+    try:
+        current_before_send = is_current()
+    except BaseException:
+        current_before_send = False
+    if current_before_send is not True:
+        await _cleanup_prepared_meme(
+            send_method,
+            event,
+            prepared,
+            timeout_seconds=timeout_seconds,
+        )
+        return _MemeTransportReceipt(
+            MemeExecutionStatus.STALE_BEFORE_SEND,
+            0,
+            0,
+            "generation_stale_before_send",
+        )
+    try:
+        result = await asyncio.wait_for(
+            send_method(
+                event,
+                prepared,
+                send_text=False,
+                send_images=True,
+            ),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        return _MemeTransportReceipt(
+            MemeExecutionStatus.TIMED_OUT, 1, 0, "send_timeout"
+        )
+    except asyncio.CancelledError:
+        return _MemeTransportReceipt(
+            MemeExecutionStatus.FAILED, 1, 0, "send_cancelled"
+        )
+    except BaseException:
+        return _MemeTransportReceipt(
+            MemeExecutionStatus.FAILED, 1, 0, "send_failed"
+        )
+    if (
+        type(result) is not dict
+        or type(result.get("sent_text")) is not bool
+        or result.get("sent_text") is not False
+        or type(result.get("sent_images_count")) is not int
+        or result.get("sent_images_count") not in {0, 1}
+    ):
+        return _MemeTransportReceipt(
+            MemeExecutionStatus.FAILED, 1, 0, "send_result_invalid"
+        )
+    if result["sent_images_count"] != 1:
+        return _MemeTransportReceipt(
+            MemeExecutionStatus.FAILED, 1, 0, "image_not_sent"
+        )
+    try:
+        current_after_send = is_current()
+    except BaseException:
+        current_after_send = False
+    if current_after_send is not True:
+        return _MemeTransportReceipt(
+            MemeExecutionStatus.STALE_AFTER_SEND,
+            1,
+            1,
+            "generation_stale_after_send",
+        )
+    return _MemeTransportReceipt(
+        MemeExecutionStatus.SUCCEEDED, 1, 1, "image_sent"
+    )
+
+
+async def execute_meme_manager_category(
+    collector: MemeManagerConformanceCollector,
+    evidence: MemeManagerRuntimeEvidence,
+    *,
+    category: MemeCategory,
+    event: object,
+    is_current: object,
+    timeout_seconds: float = 3.0,
+) -> MemeAdapterReceipt:
+    """Use audited compatibility methods for an already validated category."""
+
+    if type(collector) is not MemeManagerConformanceCollector:
+        raise ContractViolation("meme_conformance_collector_required")
+    collector.inspect(evidence)
+    if type(category) is not MemeCategory or not callable(is_current):
+        raise ContractViolation("meme_adapter_request_invalid")
+    if type(timeout_seconds) not in {int, float} or type(timeout_seconds) is bool:
+        raise ContractViolation("meme_execution_timeout_invalid")
+    timeout = float(timeout_seconds)
+    if not math.isfinite(timeout) or not 0.05 <= timeout <= 10.0:
+        raise ContractViolation("meme_execution_timeout_invalid")
+    _, prepare_method, send_method = collector._open(evidence)
+    receipt = await _execute_meme_manager_transport(
+        prepare_method,
+        send_method,
+        event=event,
+        marker=f"&&{category.value}&&",
+        is_current=is_current,
+        timeout_seconds=timeout,
+    )
+    return MemeAdapterReceipt(
+        receipt.status,
+        receipt.attempt_count,
+        receipt.success_count,
+        receipt.reason_code,
+        category,
+    )
+
+
 async def execute_meme_permit(
     authority: MemeExecutionAuthority,
     permit: MemeExecutionPermit,
@@ -1963,168 +2333,37 @@ async def execute_meme_permit(
             reason_code="unsupported_expression",
         )
     marker = f"&&{marker_name}&&"
-    try:
-        prepared = await asyncio.wait_for(
-            prepare_method(event, marker),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        return authority._complete(
-            permit,
-            status=MemeExecutionStatus.TIMED_OUT,
-            attempt_count=0,
-            success_count=0,
-            reason_code="prepare_timeout",
-        )
-    except asyncio.CancelledError:
-        return authority._complete(
-            permit,
-            status=MemeExecutionStatus.FAILED,
-            attempt_count=0,
-            success_count=0,
-            reason_code="prepare_cancelled",
-        )
-    except BaseException:
-        return authority._complete(
-            permit,
-            status=MemeExecutionStatus.FAILED,
-            attempt_count=0,
-            success_count=0,
-            reason_code="prepare_failed",
-        )
-    if type(prepared) is not dict:
-        return authority._complete(
-            permit,
-            status=MemeExecutionStatus.FAILED,
-            attempt_count=0,
-            success_count=0,
-            reason_code="prepared_shape_invalid",
-        )
-    images = prepared.get("images")
-    if type(images) is not list or len(images) > 1:
-        await _cleanup_prepared_meme(
-            send_method,
-            event,
-            prepared,
-            timeout_seconds=timeout,
-        )
-        return authority._complete(
-            permit,
-            status=MemeExecutionStatus.FAILED,
-            attempt_count=0,
-            success_count=0,
-            reason_code="prepared_shape_invalid",
-        )
-    if not images:
-        await _cleanup_prepared_meme(
-            send_method,
-            event,
-            prepared,
-            timeout_seconds=timeout,
-        )
-        return authority._complete(
-            permit,
-            status=MemeExecutionStatus.SUPPRESSED,
-            attempt_count=0,
-            success_count=0,
-            reason_code="no_matching_image",
-        )
-    try:
-        authority._validate_generation(generation, planned_action)
-    except ContractViolation:
-        await _cleanup_prepared_meme(
-            send_method,
-            event,
-            prepared,
-            timeout_seconds=timeout,
-        )
-        return authority._complete(
-            permit,
-            status=MemeExecutionStatus.STALE_BEFORE_SEND,
-            attempt_count=0,
-            success_count=0,
-            reason_code="generation_stale_before_send",
-        )
-    try:
-        result = await asyncio.wait_for(
-            send_method(
-                event,
-                prepared,
-                send_text=False,
-                send_images=True,
-            ),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        return authority._complete(
-            permit,
-            status=MemeExecutionStatus.TIMED_OUT,
-            attempt_count=1,
-            success_count=0,
-            reason_code="send_timeout",
-        )
-    except asyncio.CancelledError:
-        return authority._complete(
-            permit,
-            status=MemeExecutionStatus.FAILED,
-            attempt_count=1,
-            success_count=0,
-            reason_code="send_cancelled",
-        )
-    except BaseException:
-        return authority._complete(
-            permit,
-            status=MemeExecutionStatus.FAILED,
-            attempt_count=1,
-            success_count=0,
-            reason_code="send_failed",
-        )
-    if (
-        type(result) is not dict
-        or type(result.get("sent_text")) is not bool
-        or result.get("sent_text") is not False
-        or type(result.get("sent_images_count")) is not int
-        or result.get("sent_images_count") not in {0, 1}
-    ):
-        return authority._complete(
-            permit,
-            status=MemeExecutionStatus.FAILED,
-            attempt_count=1,
-            success_count=0,
-            reason_code="send_result_invalid",
-        )
-    sent = result["sent_images_count"]
-    if sent != 1:
-        return authority._complete(
-            permit,
-            status=MemeExecutionStatus.FAILED,
-            attempt_count=1,
-            success_count=0,
-            reason_code="image_not_sent",
-        )
-    try:
-        authority._validate_generation(generation, planned_action)
-    except ContractViolation:
-        return authority._complete(
-            permit,
-            status=MemeExecutionStatus.STALE_AFTER_SEND,
-            attempt_count=1,
-            success_count=1,
-            reason_code="generation_stale_after_send",
-        )
+    def generation_is_current() -> bool:
+        try:
+            authority._validate_generation(generation, planned_action)
+        except ContractViolation:
+            return False
+        return True
+
+    receipt = await _execute_meme_manager_transport(
+        prepare_method,
+        send_method,
+        event=event,
+        marker=marker,
+        is_current=generation_is_current,
+        timeout_seconds=timeout,
+    )
     return authority._complete(
         permit,
-        status=MemeExecutionStatus.SUCCEEDED,
-        attempt_count=1,
-        success_count=1,
-        reason_code="image_sent",
+        status=receipt.status,
+        attempt_count=receipt.attempt_count,
+        success_count=receipt.success_count,
+        reason_code=receipt.reason_code,
     )
 
 
 __all__ = [
+    "MemeAdapterReceipt",
     "MemeCategory",
     "MemeComplementCadence",
     "MemeComplementDecision",
+    "MemeSemanticReceipt",
+    "SemanticMemeHandoffDecision",
     "ExpressionIntentAuthority",
     "MemeExecutionReceipt",
     "MemeExecutionAuthority",
@@ -2138,7 +2377,11 @@ __all__ = [
     "MemeManagerRuntimeEvidence",
     "MemeManagerRuntimeProfile",
     "decide_text_meme_complement",
+    "decide_semantic_meme_handoff",
+    "extract_required_proactive_meme_category",
     "execute_meme_permit",
+    "execute_meme_manager_category",
+    "proactive_meme_category_prompt",
     "production_meme_manager_runtime_profile",
     "select_meme_category",
 ]

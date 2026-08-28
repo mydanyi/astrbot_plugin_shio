@@ -14,16 +14,20 @@ class PerformanceMetricsError(ValueError):
 class LatencyKind(str, Enum):
     LOCAL_ORCHESTRATION = "local_orchestration"
     INFERENCE_QUEUE = "inference_queue"
+    RISK_PROVIDER = "risk_provider"
     PRIMARY_PROVIDER = "primary_provider"
     REPAIR_PROVIDER = "repair_provider"
+    PARTICIPATION_PROVIDER = "participation_provider"
     PROACTIVE_PROVIDER = "proactive_provider"
     FIRST_BUBBLE = "first_bubble"
     FULL_REPLY = "full_reply"
 
 
 class ModelCallKind(str, Enum):
+    RISK = "risk"
     PRIMARY = "primary"
     REPAIR = "repair"
+    PARTICIPATION = "participation"
     PROACTIVE = "proactive"
 
 
@@ -39,8 +43,11 @@ class LatencySummary:
 @dataclass(frozen=True, slots=True)
 class PerformanceSnapshot:
     latencies: tuple[LatencySummary, ...]
+    risk_call_count: int
     primary_call_count: int
     repair_call_count: int
+    participation_call_count: int
+    participation_failure_count: int
     proactive_call_count: int
     model_failure_count: int
     max_samples_per_kind: int
@@ -63,8 +70,11 @@ class PerformanceSnapshot:
             "performance_schema_version": 1,
             "performance_window_bounded": self.window_bounded,
             "performance_max_samples_per_kind": self.max_samples_per_kind,
+            "model_risk_call_count": self.risk_call_count,
             "model_primary_call_count": self.primary_call_count,
             "model_repair_call_count": self.repair_call_count,
+            "model_participation_call_count": self.participation_call_count,
+            "model_participation_failure_count": self.participation_failure_count,
             "model_proactive_call_count": self.proactive_call_count,
             "model_failure_count": self.model_failure_count,
         }
@@ -93,6 +103,7 @@ class PerformanceWindow:
         "_max_samples_per_kind",
         "_samples",
         "_call_counts",
+        "_failure_counts",
         "_failure_count",
     )
 
@@ -109,6 +120,7 @@ class PerformanceWindow:
             for kind in LatencyKind
         }
         self._call_counts = {kind: 0 for kind in ModelCallKind}
+        self._failure_counts = {kind: 0 for kind in ModelCallKind}
         self._failure_count = 0
 
     def observe_latency(self, kind: LatencyKind, value_ms: float) -> None:
@@ -137,10 +149,15 @@ class PerformanceWindow:
         with self._lock:
             self._call_counts[kind] += 1
             self._failure_count += int(failed)
+            self._failure_counts[kind] += int(failed)
 
-    def record_model_failure(self) -> None:
+    def record_model_failure(self, kind: ModelCallKind | None = None) -> None:
+        if kind is not None and type(kind) is not ModelCallKind:
+            raise PerformanceMetricsError("performance_model_call_kind_invalid")
         with self._lock:
             self._failure_count += 1
+            if kind is not None:
+                self._failure_counts[kind] += 1
 
     def snapshot(self) -> PerformanceSnapshot:
         with self._lock:
@@ -156,8 +173,15 @@ class PerformanceWindow:
             )
             return PerformanceSnapshot(
                 latencies=latencies,
+                risk_call_count=self._call_counts[ModelCallKind.RISK],
                 primary_call_count=self._call_counts[ModelCallKind.PRIMARY],
                 repair_call_count=self._call_counts[ModelCallKind.REPAIR],
+                participation_call_count=self._call_counts[
+                    ModelCallKind.PARTICIPATION
+                ],
+                participation_failure_count=self._failure_counts[
+                    ModelCallKind.PARTICIPATION
+                ],
                 proactive_call_count=self._call_counts[ModelCallKind.PROACTIVE],
                 model_failure_count=self._failure_count,
                 max_samples_per_kind=self._max_samples_per_kind,

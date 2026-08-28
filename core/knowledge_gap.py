@@ -14,11 +14,27 @@ class KnowledgeGapError(ValueError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class ProactiveKnowledgeDecision:
+    capability: CapabilityClass | None
+    reason_code: str
+
+    @property
+    def requires_evidence(self) -> bool:
+        return self.capability is not None
+
+
 _DECLINE_EXTERNAL_RE = re.compile(
     r"(?:不要|别|不用|无需|不必).{0,10}(?:联网|上网|搜索|检索|查证|核实|查资料|查一下)"
 )
 _EXPLICIT_VERIFY_RE = re.compile(
-    r"(?:请|帮我|麻烦)?(?:联网|上网)?(?:查证|核实|验证|搜索一下|搜一下|查一下|查查|查资料)"
+    r"(?:请(?:你)?|帮我|麻烦(?:你)?|劳驾(?:你)?|你(?:能不能|可以)?)"
+    r"(?:联网|上网)?(?:帮我)?"
+    r"(?:查证|核实|验证|搜索一下|搜一下|查一下|查查|查资料)"
+    r"|(?:联网|上网).{0,6}"
+    r"(?:查证|核实|验证|搜索一下|搜一下|查一下|查查|查资料)"
+    r"|(?:^|[，,。；;！？!?\s])"
+    r"(?:查证|核实|验证|搜索一下|搜一下|查一下|查查|查资料)"
     r"|(?:给出|提供|附上).{0,10}(?:来源|出处|链接)"
 )
 _SLANG_RE = re.compile(
@@ -31,6 +47,10 @@ _TIME_SENSITIVE_RE = re.compile(
     r"(?:价格|汇率|天气|比分|股价|油价|新闻|政策|规定|版本|赛程|发布日期|谁|多少)"
     r"|(?:价格|汇率|天气|比分|股价|油价|新闻|政策|规定|版本|赛程|发布日期).{0,24}"
     r"(?:今天|今日|现在|目前|当前|本周|本月|今年)",
+    re.IGNORECASE,
+)
+_KNOWLEDGE_QUESTION_RE = re.compile(
+    r"(?:你|妳|您)?(?:知道|了解|听说过)(?![吗嘛么])[^?？\n]{1,48}(?:吗|嘛|么)[?？]?$",
     re.IGNORECASE,
 )
 
@@ -77,6 +97,7 @@ def _decision(
     seed: ContentIntentSeed,
     need: KnowledgeNeed,
     *reason_codes: str,
+    capability: CapabilityClass = CapabilityClass.PUBLIC_WEB_READ,
 ) -> KnowledgeGapDecision:
     if need is KnowledgeNeed.NONE:
         return KnowledgeGapDecision(
@@ -91,7 +112,7 @@ def _decision(
         binding=seed.binding,
         need=need,
         requires_evidence=True,
-        requested_capability=CapabilityClass.PUBLIC_WEB_READ,
+        requested_capability=capability,
         max_tool_calls=1,
         reason_codes=tuple(reason_codes),
     )
@@ -146,6 +167,7 @@ def decide_knowledge_gap(
             content_seed,
             KnowledgeNeed.UNKNOWN_TERM,
             "unknown_term_marker_present",
+            capability=CapabilityClass.CHAT_RETRIEVAL,
         )
     if (
         content_seed.intent.kind.value == "answer"
@@ -155,6 +177,13 @@ def decide_knowledge_gap(
             content_seed,
             KnowledgeNeed.TIME_SENSITIVE,
             "time_sensitive_fact_requested",
+        )
+    if _KNOWLEDGE_QUESTION_RE.search(message):
+        return _decision(
+            content_seed,
+            KnowledgeNeed.UNKNOWN_TERM,
+            "knowledge_base_question_present",
+            capability=CapabilityClass.CHAT_RETRIEVAL,
         )
     if (
         suggestion is not None
@@ -166,12 +195,36 @@ def decide_knowledge_gap(
             KnowledgeNeed.UNKNOWN_TERM,
             "soft_unknown_term_accepted",
             *suggestion.reason_codes,
+            capability=CapabilityClass.CHAT_RETRIEVAL,
         )
     return _decision(content_seed, KnowledgeNeed.NONE, "no_external_evidence_needed")
+
+
+def decide_proactive_knowledge_need(topic_text: str) -> ProactiveKnowledgeDecision:
+    """Classify one public topic without inventing a query or a user principal."""
+
+    message = str(topic_text or "").strip()
+    if not message:
+        raise KnowledgeGapError("proactive_knowledge_topic_required")
+    if _DECLINE_EXTERNAL_RE.search(message):
+        return ProactiveKnowledgeDecision(None, "external_evidence_declined")
+    if _TIME_SENSITIVE_RE.search(message) or _EXPLICIT_VERIFY_RE.search(message):
+        return ProactiveKnowledgeDecision(
+            CapabilityClass.PUBLIC_WEB_READ,
+            "proactive_public_verification_needed",
+        )
+    if _SLANG_RE.search(message) or _KNOWLEDGE_QUESTION_RE.search(message):
+        return ProactiveKnowledgeDecision(
+            CapabilityClass.CHAT_RETRIEVAL,
+            "proactive_stable_knowledge_needed",
+        )
+    return ProactiveKnowledgeDecision(None, "proactive_no_external_evidence_needed")
 
 
 __all__ = [
     "KnowledgeGapError",
     "KnowledgeGapSuggestion",
+    "ProactiveKnowledgeDecision",
     "decide_knowledge_gap",
+    "decide_proactive_knowledge_need",
 ]

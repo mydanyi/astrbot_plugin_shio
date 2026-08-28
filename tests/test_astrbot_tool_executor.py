@@ -9,6 +9,7 @@ from typing import Any
 from astrbot_plugin_shio.core.action_planner import PlannedAction, StructuralOutcome
 from astrbot_plugin_shio.core.astrbot_tool_executor import (
     SealedExecutionStatus,
+    _sealed_run_context,
     execute_sealed_acquisition,
 )
 from astrbot_plugin_shio.core.capability_policy import (
@@ -35,6 +36,7 @@ from astrbot_plugin_shio.core.tool_broker import (
     broker_tool_request,
     build_batch_request_shape,
     build_extract_request_shape,
+    build_knowledge_base_request_shape,
     build_search_request_shape,
 )
 from astrbot_plugin_shio.core.tool_result import adapt_tool_call_results
@@ -77,6 +79,11 @@ def _request(
     kind: AcquisitionKind = AcquisitionKind.SEARCH,
 ) -> AcquisitionRequest:
     binding = _binding()
+    capability = (
+        CapabilityClass.CHAT_RETRIEVAL
+        if kind is AcquisitionKind.KNOWLEDGE_BASE
+        else CapabilityClass.PUBLIC_WEB_READ
+    )
     principal = PrincipalContext(
         sender_key=binding.current_sender_key,
         sender_id="peer-a",
@@ -93,7 +100,7 @@ def _request(
             binding=binding,
             kind=ActionKind.USE_TOOL,
             reply_target=_target(binding),
-            capability_intent=CapabilityClass.PUBLIC_WEB_READ.value,
+            capability_intent=capability.value,
             reason_codes=("fixture_explicit_evidence",),
         ),
         structural_outcome=StructuralOutcome.CONTINUE,
@@ -103,10 +110,15 @@ def _request(
         binding=binding,
         need=KnowledgeNeed.UNKNOWN_TERM,
         requires_evidence=True,
-        requested_capability=CapabilityClass.PUBLIC_WEB_READ,
+        requested_capability=capability,
         max_tool_calls=1,
     )
-    if kind is AcquisitionKind.SEARCH:
+    if kind is AcquisitionKind.KNOWLEDGE_BASE:
+        request_shape = build_knowledge_base_request_shape(
+            binding,
+            query="亚托莉 你知道华强买瓜吗？",
+        )
+    elif kind is AcquisitionKind.SEARCH:
         request_shape = build_search_request_shape(
             binding,
             query="这个合成术语是什么意思",
@@ -275,6 +287,115 @@ async def _noop_hook(run_context: Any, tool: Any, arguments: dict[str, Any]) -> 
 
 
 class SealedAstrBotToolExecutorTests(unittest.IsolatedAsyncioTestCase):
+    def test_only_explicit_trusted_read_context_preserves_plugin_context(self):
+        live_event = LiveEvent()
+        plugin_context = object()
+        run_context = SimpleNamespace(
+            context=SimpleNamespace(
+                context=plugin_context,
+                event=live_event,
+                extra={},
+            ),
+            messages=[],
+            tool_call_timeout=20,
+        )
+
+        ordinary = _sealed_run_context(run_context, live_event)
+        knowledge_base = _sealed_run_context(
+            run_context,
+            live_event,
+            allow_trusted_read_context=True,
+        )
+
+        self.assertIsNone(ordinary.context.context)
+        self.assertIs(knowledge_base.context.context, plugin_context)
+        self.assertIsNot(knowledge_base.context.event, live_event)
+        self.assertEqual(knowledge_base.context.event.unified_msg_origin, "")
+
+    async def test_native_knowledge_base_result_uses_same_sealed_grounding_path(self):
+        tool = RuntimeTool(
+            name="astr_kb_search",
+            module="astrbot.core.tools.knowledge_base_tools",
+        )
+        tool.description = "Query the knowledge base for facts"
+        request = _request(tool, kind=AcquisitionKind.KNOWLEDGE_BASE)
+        capture: dict[str, Any] = {}
+
+        outcome = await self._execute(
+            request,
+            (tool,),
+            executor=_executor_for(
+                [CallToolResult("华强买瓜是电视剧《征服》中的经典片段。")],
+                capture,
+            ),
+        )
+
+        self.assertIs(outcome.status, SealedExecutionStatus.SUCCESS)
+        self.assertEqual(
+            capture["arguments"],
+            {"query": "亚托莉 你知道华强买瓜吗？"},
+        )
+        typed = adapt_tool_call_results(
+            outcome.batch,
+            tools=(tool,),
+            scope_key=request.binding.scope_key,
+            target_sender_key=request.binding.current_sender_key,
+            acquisition_request=request,
+            observed_at=101.0,
+        )
+        grounding = adapt_grounding_evidence(
+            request=request,
+            results=typed,
+            current_binding=request.binding,
+            now=101.0,
+        )
+        self.assertIs(grounding.kind, EvidenceOutcomeKind.ACCEPTED)
+        self.assertIn("华强买瓜", grounding.facts[0].claim)
+
+    async def test_spoofed_knowledge_base_module_executes_nothing(self):
+        trusted = RuntimeTool(
+            name="astr_kb_search",
+            module="astrbot.core.tools.knowledge_base_tools",
+        )
+        trusted.description = "Query the knowledge base for facts"
+        request = _request(trusted, kind=AcquisitionKind.KNOWLEDGE_BASE)
+        spoofed = RuntimeTool(
+            name="astr_kb_search",
+            module="untrusted_plugin.knowledge_base_proxy",
+        )
+        spoofed.description = "Query the knowledge base for facts"
+        capture: dict[str, Any] = {}
+
+        outcome = await self._execute(
+            request,
+            (spoofed,),
+            executor=_executor_for([CallToolResult()], capture),
+        )
+
+        self.assertIs(outcome.status, SealedExecutionStatus.SOURCE_UNATTESTED)
+        self.assertNotIn("calls", capture)
+
+    async def test_empty_native_knowledge_base_result_never_becomes_a_fact(self):
+        tool = RuntimeTool(
+            name="astr_kb_search",
+            module="astrbot.core.tools.knowledge_base_tools",
+        )
+        tool.description = "Query the knowledge base for facts"
+        request = _request(tool, kind=AcquisitionKind.KNOWLEDGE_BASE)
+        capture: dict[str, Any] = {}
+
+        outcome = await self._execute(
+            request,
+            (tool,),
+            executor=_executor_for(
+                [CallToolResult("No relevant knowledge found.")],
+                capture,
+            ),
+        )
+
+        self.assertIs(outcome.status, SealedExecutionStatus.RESULT_EMPTY)
+        self.assertIsNone(outcome.batch)
+
     async def _execute(
         self,
         request: AcquisitionRequest,
@@ -307,7 +428,10 @@ class SealedAstrBotToolExecutorTests(unittest.IsolatedAsyncioTestCase):
         outcome = await self._execute(
             request,
             SimpleNamespace(tools=[tool]),
-            executor=_executor_for([CallToolResult()], capture),
+            executor=_executor_for(
+                [CallToolResult("合成术语的公开来源可验证解释")],
+                capture,
+            ),
         )
 
         self.assertIs(outcome.status, SealedExecutionStatus.SUCCESS)

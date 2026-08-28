@@ -37,6 +37,18 @@ from astrbot_plugin_shio.core.participation_reaction import (
 )
 
 
+_SEMANTIC_REPLY = (
+    '{"decision":"REPLY","target":"current_message",'
+    '"topic_anchor":"current_message","reason_code":"light_social",'
+    '"confidence":0.9}'
+)
+_SEMANTIC_NO_ACTION = (
+    '{"decision":"NO_ACTION","target":"current_message",'
+    '"topic_anchor":"current_message","reason_code":"not_helpful",'
+    '"confidence":0.9}'
+)
+
+
 class P5ParticipationReactionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -48,31 +60,51 @@ class P5ParticipationReactionTests(unittest.IsolatedAsyncioTestCase):
                 "persona_name": "亚托莉",
                 "natural_name_wake_aliases": ["亚托莉", "萝卜子"],
                 "prefer_livingmemory_group_history": False,
+                "natural_group_participation_enabled": True,
+                "natural_group_participation_allowlist": ["p5-react-group"],
+                "natural_group_participation_min_context_messages": 2,
             },
         )
         self.turn = 0
+        prior = FakeEvent(
+            "peer-b",
+            "刚才聊到萝卜子了",
+            group_id="p5-react-group",
+        )
+        prior.message_id = "p5-react-prior"
+        with patch("astrbot_plugin_shio.main.time.monotonic", return_value=90.0):
+            self.plugin.admit_ingress_event(prior)
 
     async def asyncTearDown(self) -> None:
         self.temp.cleanup()
 
     def _event(self, message: str, *, direct: bool = False) -> FakeEvent:
         self.turn += 1
-        event = FakeEvent("peer-a", message, group_id=f"p5-react-{self.turn}")
+        event = FakeEvent("peer-a", message, group_id="p5-react-group")
         event.message_id = f"p5-react-message-{self.turn}"
         event.is_at_or_wake_command = direct
         return event
 
-    def _admit(self, message: str, *, direct: bool = False):
+    async def _admit(
+        self,
+        message: str,
+        *,
+        direct: bool = False,
+        semantic_output: str = _SEMANTIC_REPLY,
+    ):
         event = self._event(message, direct=direct)
         with patch("astrbot_plugin_shio.main.time.monotonic", return_value=100.0):
             result = self.plugin.admit_ingress_event(event)
         self.assertIsNotNone(result)
+        if event.get_extra(main.SHIO_PARTICIPATION_SEMANTIC_REQUEST) is not None:
+            self.provider.outputs.append(semantic_output)
+            await self.plugin._resolve_participation_semantic(event)
         reaction = event.get_extra(main.SHIO_PARTICIPATION_REACTION)
         self.assertIs(type(reaction), ParticipationReactionDecision)
         return event, reaction
 
     async def test_light_about_self_can_react_without_text_model_or_tool(self):
-        event, reaction = self._admit("我觉得萝卜子这个表情好可爱哈哈")
+        event, reaction = await self._admit("我觉得萝卜子这个表情好可爱哈哈")
         self.assertIs(reaction.decision.level, ParticipationLevel.REACT_ONLY)
         self.assertEqual(reaction.expression_intent, "light_reaction")
         self.assertTrue(event.is_at_or_wake_command)
@@ -91,7 +123,7 @@ class P5ParticipationReactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.system_prompt, "")
         self.assertEqual(request.prompt, "")
         self.assertEqual(tuple(request.func_tool.tools), ())
-        self.assertEqual(self.provider.calls, [])
+        self.assertEqual(len(self.provider.calls), 1)
 
     async def test_direct_serious_open_group_and_wait_never_become_react(self):
         cases = (
@@ -108,16 +140,35 @@ class P5ParticipationReactionTests(unittest.IsolatedAsyncioTestCase):
         for name, message, direct, expected in cases:
             with self.subTest(name=name):
                 FakeStarTools.data_dir = Path(self.temp.name) / f"case-{name}"
-                plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {
+                provider = FakeProvider([])
+                plugin = main.ShioPlugin(FakeContext(provider), {
                     "persona_name": "亚托莉",
                     "natural_name_wake_aliases": ["亚托莉", "萝卜子"],
                     "prefer_livingmemory_group_history": False,
+                    "natural_group_participation_enabled": True,
+                    "natural_group_participation_allowlist": [f"p5-react-{name}"],
+                    "natural_group_participation_min_context_messages": 2,
                 })
+                prior = FakeEvent(
+                    "peer-b",
+                    "刚才的话题还没说完",
+                    group_id=f"p5-react-{name}",
+                )
+                prior.message_id = f"p5-react-{name}-prior"
                 event = FakeEvent("peer-a", message, group_id=f"p5-react-{name}")
                 event.message_id = f"p5-react-{name}"
                 event.is_at_or_wake_command = direct
+                with patch("astrbot_plugin_shio.main.time.monotonic", return_value=90.0):
+                    plugin.admit_ingress_event(prior)
                 with patch("astrbot_plugin_shio.main.time.monotonic", return_value=100.0):
                     plugin.admit_ingress_event(event)
+                if event.get_extra(main.SHIO_PARTICIPATION_SEMANTIC_REQUEST) is not None:
+                    provider.outputs.append(
+                        _SEMANTIC_NO_ACTION
+                        if name == "unrelated"
+                        else _SEMANTIC_REPLY
+                    )
+                    await plugin._resolve_participation_semantic(event)
                 reaction = event.get_extra(main.SHIO_PARTICIPATION_REACTION)
                 self.assertIs(reaction.decision.level, expected)
                 self.assertNotEqual(reaction.decision.level, ParticipationLevel.REACT_ONLY)
@@ -155,8 +206,8 @@ class P5ParticipationReactionTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await plugin.terminate()
 
-    def test_exact_cadence_only_copy_cross_runtime_and_mutation_fail_closed(self):
-        _, reaction = self._admit("我觉得萝卜子这个表情好可爱哈哈")
+    async def test_exact_cadence_only_copy_cross_runtime_and_mutation_fail_closed(self):
+        _, reaction = await self._admit("我觉得萝卜子这个表情好可爱哈哈")
         authority = self.plugin.participation_reaction_authority
         self.assertIs(authority.inspect(reaction), reaction)
 

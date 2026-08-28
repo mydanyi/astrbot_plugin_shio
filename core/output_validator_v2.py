@@ -8,18 +8,29 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import NamedTuple
 
+from .answer_obligation import inspect_answer_obligation
+from .answer_obligation import AttributionRisk
 from .contracts import SemanticAtomKind
 from .context_assembler import AssembledContext
 from .conversation_ledger import (
     LedgerRole,
+    _matches_identity_literal,
     acknowledges_unavailable_group_context,
     has_verified_public_group_context,
     is_explicit_group_context_request,
 )
-from .current_question_anchor import AnchorCoverage, CurrentQuestionAnchor
+from .current_question_anchor import (
+    AnchorCoverage,
+    CurrentQuestionAnchor,
+    QuestionRelation,
+    extract_question_relations,
+)
 from .dialogue_quality import find_dialogue_repetition
 from .persona import CatchphraseRule, LanguagePreferences, PersonaPackage
-from .reply_composer import ReplyComposerRequest, ReplyComposerResult
+from .reply_composer import (
+    ReplyComposerRequest,
+    ReplyComposerResult,
+)
 from .response_guard import (
     contains_internal_reasoning,
     contains_nonowner_identity_confusion,
@@ -76,6 +87,7 @@ class OutputValidationContext:
     grounding_facts: tuple[str, ...] = ()
     forbidden_fact_fragments: tuple[str, ...] = ()
     context_reference_fragments: tuple[str, ...] = ()
+    raw_identity_ids: tuple[str, ...] = ()
 
     def __repr__(self) -> str:
         return (
@@ -101,6 +113,7 @@ def _validation_context_snapshot(
         context.grounding_facts,
         context.forbidden_fact_fragments,
         context.context_reference_fragments,
+        context.raw_identity_ids,
     )
 
 
@@ -160,6 +173,35 @@ def _derived_validation_fragments(
         dict.fromkeys((*replyer_fragments, *screened_facts))
     )
     return grounding, forbidden, context_references
+
+
+def _structured_raw_identity_ids(request: ReplyComposerRequest) -> tuple[str, ...]:
+    """Return only source-record IDs; never reconstruct identity from keys."""
+    assembled = request.assembled_context
+    if type(assembled) is not AssembledContext:
+        return ()
+    records = (
+        *assembled.planner_records,
+        *((assembled.current_record,) if assembled.current_record is not None else ()),
+    )
+    return tuple(dict.fromkeys(
+        value
+        for record in records
+        for value in (
+            str(getattr(record, "sender_id", "") or "").strip(),
+            str(getattr(record, "referenced_sender_id", "") or "").strip(),
+            *(str(item or "").strip() for item in getattr(record, "mention_sender_ids", ())),
+            str(getattr(record, "bot_id", "") or "").strip(),
+        )
+        if value
+    ))
+
+
+def _explicit_identity_id_query(text: str) -> bool:
+    normalized = str(text or "").casefold()
+    return ("账号" in normalized or "帐户" in normalized or "账户" in normalized or "id" in normalized) and (
+        "问" in normalized or "是" in normalized or "多少" in normalized or "告诉" in normalized or "什么" in normalized
+    )
 
 
 def _build_validation_context_vault():
@@ -224,6 +266,7 @@ def _build_validation_context_vault():
             composer_request,
             semantic_contract,
         )
+        raw_identity_ids = _structured_raw_identity_ids(composer_request)
         with lock:
             nonlocal records
             prune_locked()
@@ -245,6 +288,7 @@ def _build_validation_context_vault():
                 "grounding_facts": grounding_facts,
                 "forbidden_fact_fragments": forbidden_fact_fragments,
                 "context_reference_fragments": context_reference_fragments,
+                "raw_identity_ids": raw_identity_ids,
             }
             for name, value in exact_values.items():
                 object.__setattr__(context, name, value)
@@ -383,11 +427,22 @@ class OutputValidationReport:
             return OutputDisposition.BLOCK
         return OutputDisposition.REPAIR_ONCE
 
-    def trace_metadata(self) -> dict[str, int | bool]:
-        metadata: dict[str, int | bool] = {
+    def trace_metadata(self) -> dict[str, str | int | bool]:
+        metadata: dict[str, str | int | bool] = {
+            "validation_issue_count": len(self.issues),
+            "validation_primary_issue_code": (
+                self.issue_codes[0] if self.issue_codes else "none"
+            ),
+            "validation_disposition_code": self.disposition.value,
             "anchor_coverage_available": self.anchor_coverage is not None,
             "anchor_context_drift_detected": (
                 "current_question_context_drift" in self.issue_codes
+            ),
+            "grounding_evidence_drift_detected": (
+                "grounding_evidence_drift" in self.issue_codes
+            ),
+            "relation_context_drift_detected": (
+                "current_question_relation_drift" in self.issue_codes
             ),
         }
         if self.anchor_coverage is not None:
@@ -422,7 +477,100 @@ def _result_snapshot(result: ReplyComposerResult) -> tuple[object, ...]:
         result.bubbles,
         result.reply_shape,
         result.rewrites_performed,
+        repr(result.typed_attribution),
     )
+
+
+def _requires_typed_attribution(request: ReplyComposerRequest) -> bool:
+    """Use canonical sender ownership only; never infer an actor from prose."""
+
+    return request.attribution_risk is not AttributionRisk.NONE
+
+
+def _validate_typed_attribution(
+    *, request: ReplyComposerRequest, result: ReplyComposerResult
+) -> tuple[str, ...]:
+    """Validate R11 provider segments against this request's canonical history."""
+
+    if not _requires_typed_attribution(request):
+        return ()
+    payload = result.typed_attribution
+    if type(payload) is not dict:
+        return ("typed_attribution_missing",)
+    segments = payload.get("segments")
+    if type(segments) is not list or not segments:
+        return ("typed_attribution_segments_missing",)
+    evidence = {
+        f"history-{index}": message
+        for index, message in enumerate(request.model_messages, start=1)
+        if message.source_message_id and message.platform_id and message.sender_id
+    }
+    current = getattr(request, "current_model_message", None)
+    if (
+        current is not None
+        and current.source_message_id
+        and current.platform_id
+        and current.sender_id
+    ):
+        evidence["current"] = current
+    protected_pronouns = {"我", "你", "他", "她", "它", "TA", "ta"}
+    protected_literals: set[str] = set(protected_pronouns)
+    for record in evidence.values():
+        display = getattr(getattr(record, "identity_metadata", None), "display", None)
+        for value in (
+            getattr(display, "value", ""),
+            getattr(record, "platform_id", ""),
+            getattr(record, "sender_id", ""),
+            getattr(record, "account_key", ""),
+            getattr(record, "sender_key", ""),
+        ):
+            if type(value) is str and value:
+                protected_literals.add(value)
+    seen: set[tuple[str, str, str, tuple[str, ...]]] = set()
+    for segment in segments:
+        if type(segment) is not dict:
+            return ("typed_attribution_segment_invalid",)
+        actor_platform_id = segment.get("actor_platform_id")
+        actor_sender_id = segment.get("actor_sender_id")
+        predicate = segment.get("predicate")
+        polarity = segment.get("polarity")
+        scope = segment.get("scope")
+        evidence_ids = segment.get("evidence_message_ids")
+        if (
+            not all(type(value) is str and value.strip() for value in (
+                actor_platform_id, actor_sender_id, predicate, polarity, scope
+            ))
+            or polarity not in {"affirmed", "denied"}
+            or scope not in {"history", "current"}
+            or type(evidence_ids) is not list
+            or not evidence_ids
+            or any(type(value) is not str or not value for value in evidence_ids)
+            or len(set(evidence_ids)) != len(evidence_ids)
+        ):
+            return ("typed_attribution_segment_invalid",)
+        if (
+            any(token in predicate for token in protected_pronouns)
+            or _matches_identity_literal(predicate, protected_literals)
+        ):
+            return ("typed_attribution_predicate_actor_slot",)
+        key = (actor_platform_id, actor_sender_id, predicate, tuple(evidence_ids))
+        if key in seen:
+            return ("typed_attribution_segment_duplicate",)
+        seen.add(key)
+        records = tuple(evidence.get(message_id) for message_id in evidence_ids)
+        if any(record is None for record in records):
+            return ("typed_attribution_evidence_out_of_scope",)
+        if any(
+            record.platform_id != actor_platform_id
+            or record.sender_id != actor_sender_id
+            for record in records
+        ):
+            return ("typed_attribution_actor_mismatch",)
+        if scope == "current" and any(message_id != "current" for message_id in evidence_ids):
+            return ("typed_attribution_evidence_out_of_scope",)
+        if scope == "history" and any(message_id == "current" for message_id in evidence_ids):
+            return ("typed_attribution_evidence_out_of_scope",)
+    return ()
 
 
 def _validation_report_snapshot(
@@ -724,6 +872,63 @@ def _normalize_fragment(value: str) -> str:
     return re.sub(r"\s+", "", str(value or "")).casefold()
 
 
+_GROUNDING_TEXT_RE = re.compile(r"[a-z0-9\u3400-\u9fff]+", re.IGNORECASE)
+
+
+def _normalize_grounding_text(value: str) -> str:
+    """Keep only comparable CJK/alphanumeric text for a conservative check."""
+
+    return "".join(_GROUNDING_TEXT_RE.findall(str(value or "").casefold()))
+
+
+def _character_ngrams(value: str, *, size: int = 2) -> frozenset[str]:
+    normalized = _normalize_grounding_text(value)
+    if len(normalized) < size:
+        return frozenset()
+    return frozenset(
+        normalized[index : index + size]
+        for index in range(len(normalized) - size + 1)
+    )
+
+
+def _has_obvious_grounding_evidence_drift(
+    visible_text: str,
+    facts: tuple[str, ...],
+    *,
+    answer_language: str,
+) -> bool:
+    """Detect only large lexical departures from accepted Chinese evidence.
+
+    This is intentionally not an entailment oracle.  It catches the production
+    failure mode where a renderer mentions the queried entity but invents an
+    unrelated explanation.  Short evidence and cross-language answers remain
+    fail-open because lexical coverage would be unreliable there.
+    """
+
+    if str(answer_language or "").strip().casefold() not in {
+        "zh",
+        "zh-cn",
+        "zh-hans",
+    }:
+        return False
+    evidence = _normalize_grounding_text("\n".join(facts))
+    visible = _normalize_grounding_text(visible_text)
+    if (
+        len(evidence) < 24
+        or len(visible) < 10
+        or not re.search(r"[\u3400-\u9fff]", evidence)
+        or not re.search(r"[\u3400-\u9fff]", visible)
+    ):
+        return False
+    visible_grams = _character_ngrams(visible)
+    evidence_grams = _character_ngrams(evidence)
+    if len(visible_grams) < 8 or not evidence_grams:
+        return False
+    overlap = len(visible_grams.intersection(evidence_grams))
+    coverage = overlap / len(visible_grams)
+    return overlap < 3 or coverage < 0.14
+
+
 def _copies_noncurrent_context(
     visible_text: str,
     fragments: tuple[str, ...],
@@ -740,17 +945,65 @@ def _copies_noncurrent_context(
     return False
 
 
+_EXPLICIT_OLD_CURRENT_CONTRAST_RE = re.compile(
+    r"(?:之前|刚才|上一(?:条|次)).{0,28}(?:现在|这次|而你(?:现在)?问)",
+    re.IGNORECASE,
+)
+
+
+def _relation_targets(
+    relations: tuple[QuestionRelation, ...],
+) -> frozenset[tuple[str, str]]:
+    return frozenset(
+        (relation.operator_code, relation.right_operand)
+        for relation in relations
+        if relation.right_operand
+    )
+
+
+def _has_current_question_relation_drift(
+    anchor: CurrentQuestionAnchor,
+    visible_text: str,
+    context_fragments: tuple[str, ...],
+) -> bool:
+    """Detect a recent relation target copied into a changed current question."""
+
+    current_targets = _relation_targets(anchor.relation_assertions)
+    if not current_targets or _EXPLICIT_OLD_CURRENT_CONTRAST_RE.search(visible_text):
+        return False
+    candidate_targets = _relation_targets(extract_question_relations(visible_text))
+    if not candidate_targets:
+        return False
+    context_targets = frozenset(
+        target
+        for fragment in context_fragments
+        for target in _relation_targets(extract_question_relations(fragment))
+    )
+    stale_targets = candidate_targets.intersection(context_targets).difference(
+        current_targets
+    )
+    if not stale_targets:
+        return False
+    return any(
+        stale_operator == current_operator
+        and stale_operand != current_operand
+        for stale_operator, stale_operand in stale_targets
+        for current_operator, current_operand in current_targets
+    )
+
+
 def _request_repetition_inputs(
     request: ReplyComposerRequest,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[tuple[str, str], ...]]:
     assembled = request.assembled_context
+    records = (
+        assembled.replyer_thread[-12:]
+        if type(assembled) is AssembledContext
+        else ()
+    )
     recent_replies = tuple(
         record.content
-        for record in (
-            assembled.replyer_thread[-6:]
-            if type(assembled) is AssembledContext
-            else ()
-        )
+        for record in records
         if record.role is LedgerRole.ASSISTANT
         and type(record.content) is str
         and record.content.strip()
@@ -767,7 +1020,25 @@ def _request_repetition_inputs(
         )
         if type(rule) is CatchphraseRule and type(rule.text) is str
     )
-    return recent_replies, role_phrases
+    recent_exchanges: list[tuple[str, str]] = []
+    latest_user_message = ""
+    for record in records:
+        if (
+            record.role is LedgerRole.USER
+            and record.message_id != request.target_message_id
+            and type(record.content) is str
+            and record.content.strip()
+        ):
+            latest_user_message = record.content
+        elif (
+            record.role is LedgerRole.ASSISTANT
+            and latest_user_message
+            and type(record.content) is str
+            and record.content.strip()
+        ):
+            recent_exchanges.append((latest_user_message, record.content))
+            latest_user_message = ""
+    return recent_replies[-6:], role_phrases, tuple(recent_exchanges[-6:])
 
 
 def _compute_reply_composer_output_validation(
@@ -837,6 +1108,19 @@ def _compute_reply_composer_output_validation(
             "原始生成正文与解析结果摘要不一致",
             severity=OutputIssueSeverity.BLOCKING,
         )
+    for typed_issue in _validate_typed_attribution(
+        request=request,
+        result=result,
+    ):
+        _issue(
+            issues,
+            typed_issue,
+            "人物归因缺少当前 canonical 历史可验证的 typed evidence",
+            # The existing single repair is allowed to replace a malformed
+            # provider envelope with an honest uncertainty; final-send still
+            # receives no pass ticket unless the repaired claim is verified.
+            severity=OutputIssueSeverity.REPAIRABLE,
+        )
     if semantic_phase is SemanticGuardPhase.REPAIR:
         if repair_permit_valid is not True:
             _issue(
@@ -857,6 +1141,18 @@ def _compute_reply_composer_output_validation(
             issues,
             "empty_visible_reply",
             "确定性解析后没有可见回复",
+        )
+    disclosed_raw_ids = tuple(
+        raw_id
+        for raw_id in context.raw_identity_ids
+        if _matches_identity_literal(visible, (raw_id,))
+    )
+    if disclosed_raw_ids and not _explicit_identity_id_query(context.current_message):
+        _issue(
+            issues,
+            "raw_identity_id_visible_without_explicit_query",
+            "当前请求未明确询问账号或机器人 ID，默认可见回复不得展示结构化原始 ID",
+            severity=OutputIssueSeverity.BLOCKING,
         )
     if (
         request.target_message_id != context.expected_target_message_id
@@ -913,6 +1209,49 @@ def _compute_reply_composer_output_validation(
                     "current_question_context_drift",
                     "回复完全落在旧上下文且未覆盖当前高置信语义锚点",
                 )
+            if visible and _has_current_question_relation_drift(
+                context_anchor,
+                visible,
+                context.context_reference_fragments,
+            ):
+                _issue(
+                    issues,
+                    "current_question_relation_drift",
+                    "回复复用了旧问题的比较对象，没有围绕本轮已变化的关系目标作答",
+                )
+    if visible.strip():
+        obligation = inspect_answer_obligation(
+            current_message=context.current_message,
+            visible_text=visible,
+            context_messages=tuple(
+                message.content for message in request.model_messages
+            ),
+            capability_snapshot=request.capability_snapshot,
+            action_role_assertions=(
+                context_anchor.action_role_assertions
+                if isinstance(context_anchor, CurrentQuestionAnchor)
+                else ()
+            ),
+            model_messages=request.model_messages,
+            current_sender_key=request.target_sender_key,
+            typed_attribution=result.typed_attribution,
+        )
+        obligation_details = {
+            "answer_obligation_question_echo": "回复只换一种说法复述了当前问题，没有给出答案",
+            "answer_obligation_clarification_drift": "回复用新实体改写了可直接回答的短追问",
+            "answer_obligation_capability_evasion": "回复没有按代码拥有的真实能力状态回答能力问题",
+            "answer_obligation_physical_boundary": "回复让人格幻想覆盖了必须先说明的现实或物理边界",
+            "answer_obligation_multi_action_drift": "回复没有回应当前日常话语中的多个核心动作",
+            "answer_obligation_action_role_drift": "回复交换了当前互动中的施事者与受事者",
+            "answer_obligation_action_completion_invented": "回复把当前尚未发生的互动编成了已经完成",
+            "answer_obligation_history_speaker_attribution": "回复把其他已验证群友的历史行为错误归给当前发言者",
+        }
+        for issue_code in obligation.issue_codes:
+            _issue(
+                issues,
+                issue_code,
+                obligation_details.get(issue_code, "回复没有履行当前问题的直接回答义务"),
+            )
     if contains_tool_protocol(raw):
         _issue(issues, "tool_protocol_leak", "原始生成包含内部工具或通道协议")
     if contains_internal_reasoning(raw) or HIDDEN_REASONING_CHANNEL_RE.search(raw):
@@ -961,12 +1300,13 @@ def _compute_reply_composer_output_validation(
             "明确请求群聊回顾但没有可验证的前文，回复必须说明无法可靠概括",
         )
 
-    recent_replies, role_phrases = _request_repetition_inputs(request)
+    recent_replies, role_phrases, recent_exchanges = _request_repetition_inputs(request)
     if find_dialogue_repetition(
         visible,
         recent_replies,
         current_message=context.current_message,
         role_phrases=role_phrases,
+        recent_exchanges=recent_exchanges,
     ):
         _issue(
             issues,
@@ -1025,6 +1365,21 @@ def _compute_reply_composer_output_validation(
         _issue(issues, "unsupported_personal_experience", "声称了无可信事实支持的自身经历")
     if contains_unsupported_market_claim(visible, context.grounding_facts):
         _issue(issues, "unsupported_current_fact", "输出了无可信事实支持的当前行情断言")
+    typed_grounding_facts = tuple(
+        fact.claim
+        for fact in context.semantic_contract.content_intent.grounding_facts
+        if type(fact.claim) is str and fact.claim.strip()
+    )
+    if _has_obvious_grounding_evidence_drift(
+        visible,
+        typed_grounding_facts,
+        answer_language=context.semantic_contract.content_intent.answer_language,
+    ):
+        _issue(
+            issues,
+            "grounding_evidence_drift",
+            "回复的事实解释明显偏离本轮已验证的检索证据",
+        )
 
     normalized = visible.casefold()
     for fragment in context.forbidden_fact_fragments:

@@ -55,7 +55,7 @@ def _target(binding: DecisionBinding, *, reference: str = "") -> ReplyTarget:
 
 def _memory(binding: DecisionBinding, content: str) -> MemoryPolicyResult:
     fact = ProvenancedFact(
-        subject_key=binding.current_sender_key,
+        subject_key="platform:test|account:current",
         scope="personal",
         content=content,
         source_kind="livingmemory",
@@ -66,6 +66,7 @@ def _memory(binding: DecisionBinding, content: str) -> MemoryPolicyResult:
     decision = MemoryDecision(
         binding=binding,
         mode=MemoryMode.RECENT_ONLY,
+        current_account_key="platform:test|account:current",
         selected_facts=(fact,),
         max_results=1,
         reason_codes=("recent_context_available",),

@@ -441,7 +441,9 @@ class TurnScopeCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("self.scope_concurrency = TurnScopeCoordinator", source)
         self.assertIn("self.scope_concurrency.run_proactive", source)
-        self.assertGreaterEqual(source.count("self.scope_concurrency.run_event"), 5)
+        # Direct/natural Meme selection belongs to Manager's normal hook and
+        # no longer creates a fifth Shio-owned post-send async path.
+        self.assertGreaterEqual(source.count("self.scope_concurrency.run_event"), 4)
         self.assertIn("kind=ScopeWorkKind.REACT", source)
         self.assertIn("ScopeWorkKind.ACTION", source)
         self.assertIn("ScopeWorkKind.DIRECT", source)

@@ -5,6 +5,8 @@ from collections.abc import Iterable
 from difflib import SequenceMatcher
 from typing import Any
 
+from .current_question_anchor import extract_question_relations
+
 
 REPETITION_VIOLATION = "与近期机器人回复高度重复"
 CATCHPHRASE_REPETITION_VIOLATION = "连续复用同一角色口癖"
@@ -17,6 +19,8 @@ _REQUESTED_REPEAT_RE = re.compile(
 _VISIBLE_CHARS_RE = re.compile(r"[^\w\u3400-\u9fff]+", flags=re.UNICODE)
 _CLAUSE_SPLIT_RE = re.compile(r"[，,。！？!?；;\n]+")
 _HAN_RE = re.compile(r"[\u3400-\u9fff]")
+_NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_.])\d+(?:\.\d+)?(?![A-Za-z0-9_.])")
+_LEADING_MENTION_RE = re.compile(r"^\s*@[^\s，,。；;！？?]{1,32}\s+")
 
 
 def normalize_dialogue_text(text: str) -> str:
@@ -55,6 +59,47 @@ def dialogue_structure_signature(text: str) -> tuple[str, ...]:
     return tuple(value for value in (first, second) if value)
 
 
+def questions_are_materially_equivalent(left: str, right: str) -> bool:
+    """Compare user turns without collapsing changed numbers or relations."""
+
+    left_text = _LEADING_MENTION_RE.sub("", str(left or "").strip())
+    right_text = _LEADING_MENTION_RE.sub("", str(right or "").strip())
+    left_normalized = normalize_dialogue_text(left_text)
+    right_normalized = normalize_dialogue_text(right_text)
+    if not left_normalized or not right_normalized:
+        return False
+    if left_normalized == right_normalized:
+        return True
+    if SequenceMatcher(None, left_normalized, right_normalized).ratio() < 0.94:
+        return False
+    left_numbers = tuple(_NUMBER_RE.findall(left_text))
+    right_numbers = tuple(_NUMBER_RE.findall(right_text))
+    if left_numbers != right_numbers:
+        return False
+    left_relations = tuple(
+        relation.signature for relation in extract_question_relations(left_text)
+    )
+    right_relations = tuple(
+        relation.signature for relation in extract_question_relations(right_text)
+    )
+    return left_relations == right_relations
+
+
+def _same_question_answer_pair(
+    previous_answer: str,
+    current_message: str,
+    recent_exchanges: Iterable[tuple[str, str]] | None,
+) -> bool:
+    previous_normalized = normalize_dialogue_text(previous_answer)
+    for user_message, assistant_reply in tuple(recent_exchanges or ()):
+        if (
+            normalize_dialogue_text(assistant_reply) == previous_normalized
+            and questions_are_materially_equivalent(current_message, user_message)
+        ):
+            return True
+    return False
+
+
 def recent_assistant_replies(
     contexts: Iterable[dict[str, Any]] | None,
     limit: int = 6,
@@ -75,6 +120,7 @@ def find_dialogue_repetition(
     *,
     current_message: str = "",
     role_phrases: Iterable[str] | None = None,
+    recent_exchanges: Iterable[tuple[str, str]] | None = None,
 ) -> str:
     """Return a quality violation only for strong, conversational repetition."""
 
@@ -89,7 +135,16 @@ def find_dialogue_repetition(
         (reply, normalize_dialogue_text(reply))
         for reply in recent
     ]
-    for previous, normalized in reversed(previous_values):
+    comparison_values = [
+        (previous, normalized)
+        for previous, normalized in previous_values
+        if not _same_question_answer_pair(
+            previous,
+            current_message,
+            recent_exchanges,
+        )
+    ]
+    for previous, normalized in reversed(comparison_values):
         if len(normalized) < 6:
             continue
         if current == normalized:
@@ -108,12 +163,12 @@ def find_dialogue_repetition(
     if current_signature and len(current_signature[0]) >= 3:
         matching_openings = sum(
             dialogue_structure_signature(previous) == current_signature
-            for previous in recent[-4:]
+            for previous, _ in comparison_values[-4:]
         )
         if matching_openings >= 2:
             return REPETITION_VIOLATION
 
-    for _, normalized in previous_values:
+    for _, normalized in comparison_values:
         shared = SequenceMatcher(None, current, normalized).find_longest_match(
             0,
             len(current),
@@ -140,7 +195,7 @@ def find_dialogue_repetition(
         normalized_phrase = normalize_dialogue_text(catchphrase)
         if len(normalized_phrase) < 3 or normalized_phrase not in current:
             continue
-        if any(normalized_phrase in normalized for _, normalized in previous_values):
+        if any(normalized_phrase in normalized for _, normalized in comparison_values):
             return CATCHPHRASE_REPETITION_VIOLATION
     return ""
 

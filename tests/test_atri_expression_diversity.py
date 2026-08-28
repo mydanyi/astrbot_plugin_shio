@@ -184,7 +184,8 @@ class AtriExpressionDiversityTests(unittest.TestCase):
             praise.hidden_reveal_behavior_ids,
             mistake.hidden_reveal_behavior_ids,
         )
-        self.assertIn("soften_and_accept", praise.trajectory_steps)
+        self.assertIn("openly_pleased_reaction", praise.trajectory_steps)
+        self.assertIn("accept_or_invite_more", praise.trajectory_steps)
         self.assertIn("clear_correction", mistake.trajectory_steps)
         self.assertIn("repair_current_answer", mistake.trajectory_steps)
 

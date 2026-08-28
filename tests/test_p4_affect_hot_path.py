@@ -216,8 +216,8 @@ class P4AffectHotPathTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIs(context.cause, AffectCause.POSITIVE_SOCIAL)
         self.assertGreater(context.intensity, 0.0)
-        self.assertIn('"continuous_affect"', composer.user_prompt)
-        self.assertIn('"cause":"positive_social"', composer.user_prompt)
+        self.assertIn('"continuous_affect"', composer.system_prompt)
+        self.assertIn('"cause":"positive_social"', composer.system_prompt)
         self.assertNotIn("peer-a", repr(context) + repr(context.trace_metadata()))
 
     async def test_neutral_turn_keeps_bounded_carryover_but_current_trigger(self):

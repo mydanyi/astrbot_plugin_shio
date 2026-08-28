@@ -165,10 +165,10 @@ def _classification(
         )
     if kind is AddressKind.UNCERTAIN:
         return (
-            OpportunityAttentionLevel.WAIT,
+            OpportunityAttentionLevel.CANDIDATE,
             False,
-            False,
-            ("uncertain_attention_wait",),
+            True,
+            ("untargeted_uncertain_attention_candidate",),
         )
     raise ContractViolation("opportunity_attention_address_kind_invalid")
 

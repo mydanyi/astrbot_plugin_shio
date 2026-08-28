@@ -16,7 +16,9 @@ class PerformanceWindowTests(unittest.TestCase):
         for value in (10.0, 20.0, 30.0, 40.0, 50.0):
             window.observe_latency(LatencyKind.LOCAL_ORCHESTRATION, value)
         window.record_model_call(ModelCallKind.PRIMARY)
+        window.record_model_call(ModelCallKind.RISK)
         window.record_model_call(ModelCallKind.REPAIR, failed=True)
+        window.record_model_call(ModelCallKind.PARTICIPATION, failed=True)
         window.record_model_call(ModelCallKind.PROACTIVE)
 
         snapshot = window.snapshot()
@@ -26,9 +28,12 @@ class PerformanceWindowTests(unittest.TestCase):
         self.assertEqual(local.p95_ms, 50.0)
         self.assertEqual(local.max_ms, 50.0)
         self.assertEqual(snapshot.primary_call_count, 1)
+        self.assertEqual(snapshot.risk_call_count, 1)
         self.assertEqual(snapshot.repair_call_count, 1)
+        self.assertEqual(snapshot.participation_call_count, 1)
+        self.assertEqual(snapshot.participation_failure_count, 1)
         self.assertEqual(snapshot.proactive_call_count, 1)
-        self.assertEqual(snapshot.model_failure_count, 1)
+        self.assertEqual(snapshot.model_failure_count, 2)
 
     def test_all_required_latency_kinds_have_content_free_snapshot(self):
         window = PerformanceWindow(max_samples_per_kind=8)
@@ -52,6 +57,9 @@ class PerformanceWindowTests(unittest.TestCase):
         snapshot = reopened.snapshot()
         self.assertEqual(snapshot.latency(LatencyKind.FULL_REPLY).sample_count, 0)
         self.assertEqual(snapshot.primary_call_count, 0)
+        self.assertEqual(snapshot.risk_call_count, 0)
+        self.assertEqual(snapshot.participation_call_count, 0)
+        self.assertEqual(snapshot.participation_failure_count, 0)
         self.assertEqual(snapshot.model_failure_count, 0)
 
     def test_invalid_numeric_and_enum_inputs_fail_closed(self):
@@ -90,20 +98,31 @@ class PerformanceWindowTests(unittest.TestCase):
         self.assertEqual(snapshot.primary_call_count, 800)
         self.assertTrue(snapshot.window_bounded)
 
-    def test_main_records_primary_repair_proactive_and_send_metrics(self):
+    def test_main_records_primary_repair_participation_proactive_and_send_metrics(self):
         source = Path(__file__).resolve().parents[1].joinpath("main.py").read_text(
             encoding="utf-8"
+        )
+        participation_source = (
+            Path(__file__)
+            .resolve()
+            .parents[1]
+            .joinpath("core", "participation_semantic.py")
+            .read_text(encoding="utf-8")
         )
         self.assertIn("PerformanceWindow", source)
         self.assertIn("LatencyKind.LOCAL_ORCHESTRATION", source)
         self.assertIn("LatencyKind.INFERENCE_QUEUE", source)
         self.assertIn("LatencyKind.PRIMARY_PROVIDER", source)
+        self.assertIn("LatencyKind.RISK_PROVIDER", source)
+        self.assertIn("ModelCallKind.RISK", source)
         self.assertIn("LatencyKind.REPAIR_PROVIDER", source)
+        self.assertIn("LatencyKind.PARTICIPATION_PROVIDER", participation_source)
         self.assertIn("LatencyKind.PROACTIVE_PROVIDER", source)
         self.assertIn("LatencyKind.FIRST_BUBBLE", source)
         self.assertIn("LatencyKind.FULL_REPLY", source)
         self.assertIn("ModelCallKind.PRIMARY", source)
         self.assertIn("ModelCallKind.REPAIR", source)
+        self.assertIn("ModelCallKind.PARTICIPATION", participation_source)
         self.assertIn("ModelCallKind.PROACTIVE", source)
 
 

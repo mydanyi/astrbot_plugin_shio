@@ -257,12 +257,27 @@ def fake_tool_call_result_with_content(name, content, *, arguments=None, call_id
 
 
 class FakeProvider:
-    def __init__(self, outputs):
+    def __init__(self, outputs, *, risk_outputs=None):
         self.outputs = list(outputs)
+        # R12 preflight is a distinct Provider purpose.  Fixtures script it
+        # separately so primary-output oracles never accidentally become risk
+        # decisions; callers can still supply malformed risk values explicitly.
+        self.risk_outputs = list(risk_outputs or ())
         self.calls = []
 
     async def text_chat(self, **kwargs):
         self.calls.append(kwargs)
+        if "ATTRIBUTION_REQUIRED, NONE, or UNCERTAIN" in str(
+            kwargs.get("system_prompt", "")
+        ):
+            value = (
+                self.risk_outputs.pop(0)
+                if self.risk_outputs
+                else '{"decision":"NONE"}'
+            )
+            if isinstance(value, Exception):
+                raise value
+            return FakeResponse(value)
         value = self.outputs.pop(0)
         if isinstance(value, Exception):
             raise value
@@ -496,6 +511,15 @@ from astrbot_plugin_shio.core.semantic_guard import SemanticGuardContract
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
+    def _assert_r12_preflight_only(self, provider):
+        """The hook may issue exactly the D-024 risk call, never PRIMARY."""
+        self.assertEqual(len(provider.calls), 1)
+        call = provider.calls[0]
+        self.assertEqual(call["contexts"], [])
+        self.assertIn("ATTRIBUTION_REQUIRED, NONE, or UNCERTAIN", call["system_prompt"])
+        self.assertIn('"current"', call["prompt"])
+        self.assertIn('"history"', call["prompt"])
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         FakeStarTools.data_dir = Path(self.temp.name)
@@ -543,8 +567,11 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             relationship_context,
         )
         self.assertIs(composer_request.relationship_context, relationship_context)
-        self.assertIn('"relationship_progress"', composer_request.user_prompt)
-        self.assertIn("只允许把长期互动表达为较温暖、克制或谨慎的语气", composer_request.system_prompt)
+        self.assertIn('"relationship_progress"', composer_request.system_prompt)
+        self.assertIn(
+            "allowed_action_ids 与 forbidden_action_ids 只控制关系表达",
+            composer_request.system_prompt,
+        )
         self.assertEqual(content_intent.binding, planned_action.binding)
         self.assertEqual(expression_intent.binding, planned_action.binding)
         self.assertEqual(composer_request.action_id, planned_action.action_id)
@@ -670,7 +697,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         runtime = event.get_extra(main.SHIO_TYPED_RUNTIME)
         self.assertEqual(runtime["typed_runtime"], "typed_only")
         self.assertTrue(event.get_extra(main.SHIO_TYPED_PIPELINE_ACTIVE))
-        self.assertEqual(provider.calls, [])
+        self._assert_r12_preflight_only(provider)
         self.assertIn("最终文本渲染器", request.system_prompt)
         self.assertIn("我来找你啦", request.prompt)
         self.assertEqual(request.contexts, [])
@@ -685,7 +712,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         response = FakeResponse("当然开心呀！\n因为你来找我了嘛。")
         await plugin.guard_persona_reply(event, response)
 
-        self.assertEqual(provider.calls, [])
+        self._assert_r12_preflight_only(provider)
         self.assertEqual(event.sent, [])
         self.assertEqual(response.completion_text, "当然开心呀！因为你来找我了嘛。")
 
@@ -796,7 +823,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(planned_action.kind, ActionKind.EXECUTE_ACTION)
             self.assertIsNotNone(composer_request.action_outcome)
             self.assertIs(composer_request.action_outcome.kind, ActionOutcomeKind.DENIED)
-            self.assertEqual(provider.calls, [])
+            self._assert_r12_preflight_only(provider)
             self.assertTrue(request.func_tool.empty())
 
             response = FakeResponse("这个我不能替你做，所以没动。")
@@ -856,7 +883,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 response.completion_text,
                 "这个我不能替你做，所以没动。",
             )
-            self.assertEqual(provider.calls, [])
+            self._assert_r12_preflight_only(provider)
             self.assertTrue(request.func_tool.empty())
 
             class Result:
@@ -1072,7 +1099,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 await plugin.build_persona_reply(event, request)
 
                 self.assertTrue(event.get_extra(main.SHIO_TYPED_PIPELINE_ACTIVE))
-                self.assertEqual(provider.calls, [])
+                self._assert_r12_preflight_only(provider)
                 self.assertIn("最终文本渲染器", request.system_prompt)
                 self.assertNotIn("本轮说话计划", request.system_prompt)
                 payload = event.get_extra(main.SHIO_PAYLOAD)
@@ -1136,7 +1163,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 await plugin.build_persona_reply(event, request)
 
                 self.assertTrue(event.get_extra(main.SHIO_TYPED_PIPELINE_ACTIVE))
-                self.assertEqual(provider.calls, [])
+                self._assert_r12_preflight_only(provider)
                 if case == "reference":
                     self.assertIn("被引用的原话", request.prompt)
                     reference = event.get_extra(REFERENCE_CONTEXT_EXTRA)
@@ -1226,7 +1253,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 "prefer_livingmemory_group_history": False,
             },
         )
-        event = FakeEvent("guest", "查一下这个词是什么意思", group_id="123")
+        event = FakeEvent("guest", "查一下密封执行器是什么意思", group_id="123")
         event.message_id = "typed-tool-round"
         event.is_at_or_wake_command = True
         request = FakeRequest(event.message)
@@ -1258,7 +1285,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("密封执行器返回", evidence.facts[0].claim)
         self.assertNotIn("旧请求续轮", repr(content_intent))
         self.assertTrue(request.func_tool.empty())
-        self.assertEqual(provider.calls, [])
+        self._assert_r12_preflight_only(provider)
 
     async def test_soft_catchphrase_repeat_does_not_invoke_removed_rewriter(self):
         provider = FakeProvider([])
@@ -1292,7 +1319,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             response.completion_text,
             "高性能机器人当然能修好啦，我已经在找原因了。",
         )
-        self.assertEqual(provider.calls, [])
+        self._assert_r12_preflight_only(provider)
 
 
     async def test_plugin_enabled_forces_typed_only_despite_legacy_mode_values(self):
@@ -1323,7 +1350,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 await plugin.build_persona_reply(event, request)
 
                 self.assertTrue(event.get_extra(main.SHIO_TYPED_PIPELINE_ACTIVE))
-                self.assertEqual(provider.calls, [])
+                self._assert_r12_preflight_only(provider)
                 self.assertIn("最终文本渲染器", request.system_prompt)
                 self.assertNotIn("本轮说话计划", request.system_prompt)
                 self.assertTrue(request.func_tool.empty())
@@ -1370,27 +1397,35 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         request.contexts = [
             {
                 "role": "user",
+                "platform_id": "亚托莉",
                 "content": "主人自己的上一句话",
                 "sender_id": "owner",
                 "message_id": "owner-history",
+                "timestamp": 1.0,
             },
             {
                 "role": "assistant",
+                "platform_id": "亚托莉",
                 "content": "明确回复给主人的上一句话",
                 "target_sender_id": "owner",
                 "message_id": "bot-owner-history",
+                "timestamp": 2.0,
             },
             {
                 "role": "user",
+                "platform_id": "亚托莉",
                 "content": "另一个人的私密话题",
                 "sender_id": "guest-a",
                 "message_id": "guest-history",
+                "timestamp": 3.0,
             },
             {
                 "role": "assistant",
+                "platform_id": "亚托莉",
                 "content": "明确回复给另一个人的内容",
                 "target_sender_id": "guest-a",
                 "message_id": "bot-guest-history",
+                "timestamp": 4.0,
             },
             {
                 "role": "tool",
@@ -1400,6 +1435,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "results": [
                             {
+                                "platform_id": "亚托莉",
                                 "sender_id": "guest-a",
                                 "content": "另一个人的个人记忆",
                                 "confidence": 0.9,
@@ -1415,11 +1451,12 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         await plugin.build_persona_reply(event, request)
 
         self.assertTrue(event.get_extra(main.SHIO_TYPED_PIPELINE_ACTIVE))
-        self.assertIn("主人自己的上一句话", request.prompt)
-        self.assertNotIn("明确回复给主人的上一句话", request.prompt)
-        self.assertNotIn("另一个人的私密话题", request.prompt)
-        self.assertNotIn("明确回复给另一个人的内容", request.prompt)
-        self.assertNotIn("另一个人的个人记忆", request.prompt)
+        provider_history = repr(request.contexts)
+        self.assertIn("主人自己的上一句话", provider_history)
+        self.assertNotIn("明确回复给主人的上一句话", provider_history)
+        self.assertNotIn("另一个人的私密话题", provider_history)
+        self.assertNotIn("明确回复给另一个人的内容", provider_history)
+        self.assertNotIn("另一个人的个人记忆", provider_history)
         composer = event.get_extra(main.SHIO_REPLY_COMPOSER_REQUEST)
         self.assertEqual(composer.context_record_count, 1)
         self.assertEqual(composer.grounding_fact_count, 0)
@@ -1440,18 +1477,21 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             group_id=group_id,
         )
         first.message_id = "group-context-before-a"
+        first.get_sender_name = lambda: "管线测试甲"
         second = FakeEvent(
             "guest-b",
             "可能是驱动里的表项没有正确释放。",
             group_id=group_id,
         )
         second.message_id = "group-context-before-b"
+        second.get_sender_name = lambda: "管线测试乙"
         current = FakeEvent(
-            "owner",
+            "raw-current-sender-7f91",
             "亚托莉，他们上面在聊啥？",
             group_id=group_id,
         )
         current.message_id = "group-context-current"
+        current.get_sender_name = lambda: "管线测试当前者"
         current.is_at_or_wake_command = True
         later = FakeEvent(
             "guest-c",
@@ -1470,12 +1510,424 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         await plugin.build_persona_reply(current, request)
 
         self.assertTrue(current.get_extra(main.SHIO_TYPED_PIPELINE_ACTIVE))
-        self.assertIn("public_group_context", request.prompt)
-        self.assertIn(first.message, request.prompt)
-        self.assertIn(second.message, request.prompt)
-        self.assertNotIn(later.message, request.prompt)
+        provider_history = repr(request.contexts)
+        self.assertIn("public_group_context_status", request.prompt)
+        self.assertIn(first.message, provider_history)
+        self.assertIn(second.message, provider_history)
+        self.assertNotIn(later.message, provider_history)
         composer = current.get_extra(main.SHIO_REPLY_COMPOSER_REQUEST)
+        self.assertIn("管线测试甲", composer.system_prompt)
+        self.assertIn("管线测试乙", composer.system_prompt)
+        self.assertIn("管线测试当前者", composer.system_prompt)
+        self.assertNotIn("管线测试甲", provider_history)
+        self.assertNotIn("管线测试乙", provider_history)
+        self.assertNotIn("同群成员", composer.system_prompt + provider_history)
+        self.assertNotRegex(composer.system_prompt + provider_history, r"群友[0-9]+")
+        for raw_id in ("guest-a", "guest-b"):
+            self.assertIn(raw_id, composer.system_prompt)
+            self.assertNotIn(raw_id, composer.user_prompt + provider_history)
+        self.assertNotIn(group_id, composer.user_prompt)
+        self.assertIn("raw-current-sender-7f91", composer.system_prompt)
+        self.assertNotIn("raw-current-sender-7f91", composer.user_prompt)
         self.assertEqual(composer.context_record_count, 2)
+
+    async def test_raw_id_visible_boundary_is_final_send_guarded(self):
+        """D-021: IDs may be in system metadata, never default visible text."""
+        async def guarded(current_text, candidate):
+            plugin = main.ShioPlugin(
+                FakeContext(FakeProvider(["我先按昵称称呼你。"])),
+                {"prefer_livingmemory_group_history": False},
+            )
+            event = FakeEvent("raw-user-r9", current_text, group_id="r9-id-group")
+            event.message_id = "r9-id-boundary"
+            event.is_at_or_wake_command = True
+            request = FakeRequest(current_text)
+            await plugin.build_persona_reply(event, request)
+            response = FakeResponse(candidate)
+            await plugin.guard_persona_reply(event, response)
+            return response.completion_text
+
+        default_reply = await guarded("你好", "你的账号 ID 是 raw-user-r9。")
+        self.assertNotIn("raw-user-r9", default_reply)
+        explicit_reply = await guarded("我的账号 ID 是什么？", "你的账号 ID 是 raw-user-r9。")
+        self.assertIn("raw-user-r9", explicit_reply)
+
+    async def test_owner_identity_recap_rejects_peer_history_misattribution_in_repair_and_final_send(self):
+        """DEF-001-INC-20260827-01: the peer's joke must never become the Owner's."""
+
+        for bad_attribution in (
+            "是你一直在做群友刚才做的事。",
+            "刚才做荷包蛋的是你。",
+            "荷包蛋和酱油是你说的。",
+        ):
+            with self.subTest(bad_attribution=bad_attribution):
+                # Hand-written adversarial claim: visible prose says Owner,
+                # but the only request-local evidence belongs to the peer.
+                bad_envelope = json.dumps({"visible_text": bad_attribution, "attribution": {"segments": [{"actor_platform_id": "亚托莉", "actor_sender_id": "incident-owner", "predicate": "made_omelette", "polarity": "affirmed", "scope": "history", "evidence_message_ids": ["history-1"]}]}}, ensure_ascii=False)
+                plugin = main.ShioPlugin(
+                    FakeContext(FakeProvider(
+                        [bad_envelope],
+                        risk_outputs=['{"decision":"ATTRIBUTION_REQUIRED"}'],
+                    )),
+                    {
+                        "owner_ids": ["incident-owner"],
+                        "persona_name": "亚托莉",
+                        "prefer_livingmemory_group_history": False,
+                    },
+                )
+                group_id = "synthetic-incident-group"
+                peer = FakeEvent(
+                    "incident-peer",
+                    "要把亚托莉做成荷包蛋再加酱油。",
+                    group_id=group_id,
+                )
+                peer.message_id = "incident-peer-joke"
+                peer.get_sender_name = lambda: "夜航灯"
+                peer.is_at_or_wake_command = True
+                owner = FakeEvent(
+                    "incident-owner",
+                    "亚托莉，刚才你在和谁说话？我是谁？",
+                    group_id=group_id,
+                )
+                owner.message_id = "incident-owner-recap"
+                owner.get_sender_name = lambda: "晨雾"
+                owner.is_at_or_wake_command = True
+
+                plugin.admit_ingress_event(peer)
+                plugin.admit_ingress_event(owner)
+                request = FakeRequest(owner.message)
+                await plugin.enforce_agent_permission(owner, request)
+                await plugin.build_persona_reply(owner, request)
+
+                composer = owner.get_extra(main.SHIO_REPLY_COMPOSER_REQUEST)
+                provider_history = repr(request.contexts)
+                self.assertIn("夜航灯", composer.system_prompt)
+                self.assertIn("晨雾", composer.system_prompt)
+                self.assertIn('"relationship_role":"owner"', composer.system_prompt)
+                self.assertIn(peer.message, provider_history)
+                self.assertNotIn("夜航灯", provider_history)
+                self.assertNotIn("晨雾", provider_history)
+                # D-021: raw account IDs belong only to the system-owned
+                # identity JSON, never to user content or provider history.
+                self.assertIn("incident-peer", composer.system_prompt)
+                self.assertIn("incident-owner", composer.system_prompt)
+                self.assertNotIn("incident-peer", composer.user_prompt)
+                self.assertNotIn("incident-owner", composer.user_prompt)
+
+                response = FakeResponse(bad_envelope)
+                await plugin.guard_persona_reply(owner, response)
+
+                # The only repair repeats the same wrong attribution.  It must not
+                # recover a second bad draft or deliver the original text.
+                self.assertEqual(len(plugin.context.provider.calls), 2)
+                self.assertNotEqual(response.completion_text, bad_attribution)
+                guard_stage = next(
+                    stage
+                    for stage in main.get_pipeline_trace(owner)["stages"]
+                    if stage["stage"] == "guard"
+                )
+                repair_stage = next(
+                    stage
+                    for stage in main.get_pipeline_trace(owner)["stages"]
+                    if stage["stage"] == "repair"
+                )
+                self.assertEqual(repair_stage["repair_result_code"], "validation_rejected")
+                self.assertEqual(
+                    guard_stage["validation_primary_issue_code"],
+                    "typed_attribution_actor_mismatch",
+                )
+                # A second malformed typed claim has no safe prose fallback.
+                self.assertEqual(repair_stage["outcome"], "fallback_rejected")
+
+                class Result:
+                    def __init__(self, text):
+                        self.chain = [types.SimpleNamespace(text=text)]
+
+                    @staticmethod
+                    def is_llm_result():
+                        return True
+
+                owner._result = Result(response.completion_text)
+                await plugin.dispatch_chat_bubbles(owner)
+                self.assertNotIn(bad_attribution, owner.sent)
+
+    async def test_r12_required_preflight_seals_composer_guard_and_final_send(self):
+        """Hand-written Provider decisions must own the typed gate end-to-end."""
+
+        for current_text in (
+            "刚刚在跟谁聊呢？",
+            "我没有做这件事。",
+            "这事与我无关。",
+            "前面那段是谁说的？",
+            "别把那件事算在我头上。",
+            "我不是刚才动手的那个人。",
+        ):
+            with self.subTest(current_text=current_text):
+                unsafe = "刚才做荷包蛋的是你。"
+                plugin = main.ShioPlugin(
+                    FakeContext(FakeProvider(
+                        [unsafe, unsafe],
+                        risk_outputs=['{"decision":"ATTRIBUTION_REQUIRED"}'],
+                    )),
+                    {
+                        "owner_ids": ["semantic-owner"],
+                        "persona_name": "亚托莉",
+                        "prefer_livingmemory_group_history": False,
+                    },
+                )
+                peer = FakeEvent(
+                    "semantic-peer", "我刚才做了荷包蛋。", group_id="semantic-risk"
+                )
+                peer.message_id = "semantic-peer-history"
+                peer.get_sender_name = lambda: "夜航灯"
+                owner = FakeEvent("semantic-owner", current_text, group_id="semantic-risk")
+                owner.message_id = "semantic-owner-current"
+                owner.get_sender_name = lambda: "晨雾"
+                owner.is_at_or_wake_command = True
+                plugin.admit_ingress_event(peer)
+                plugin.admit_ingress_event(owner)
+                request = FakeRequest(current_text)
+                await plugin.enforce_agent_permission(owner, request)
+                await plugin.build_persona_reply(owner, request)
+                composer = owner.get_extra(main.SHIO_REPLY_COMPOSER_REQUEST)
+                self.assertIsNotNone(composer)
+                self.assertEqual(composer.attribution_risk.value, "identity_recap")
+                response = FakeResponse(unsafe)
+                await plugin.guard_persona_reply(owner, response)
+                self.assertNotEqual(response.completion_text, unsafe)
+                self.assertEqual(len(plugin.context.provider.calls), 2)
+                self.assertIn("ATTRIBUTION_REQUIRED, NONE, or UNCERTAIN", plugin.context.provider.calls[0]["system_prompt"])
+                self.assertIn('"platform_id"', plugin.context.provider.calls[0]["prompt"])
+                self.assertIn('"message_index"', plugin.context.provider.calls[0]["prompt"])
+                self.assertIn('"sequence"', plugin.context.provider.calls[0]["prompt"])
+                self.assertIn('"unix_timestamp"', plugin.context.provider.calls[0]["prompt"])
+                self.assertIn('"hkt_iso_timestamp"', plugin.context.provider.calls[0]["prompt"])
+                self.assertIn('"relative_to_server_seconds"', plugin.context.provider.calls[0]["prompt"])
+                owner._result = types.SimpleNamespace(
+                    chain=[types.SimpleNamespace(text=response.completion_text)],
+                    is_llm_result=lambda: True,
+                )
+                await plugin.dispatch_chat_bubbles(owner)
+                self.assertNotIn(unsafe, owner.sent)
+
+    async def test_r12_actual_composer_history_and_current_display_boundaries(self):
+        """Real ingress/ledger/canonical/Composer chain; expected names are hand-written."""
+
+        for history_name, peer_id, expected_history in (
+            ("小明白天再说", "peer-boundary", "小明白天再说"),
+            ("1234567890123点见", "123456789012", "1234567890123点见"),
+            ("12点见", "1", "12点见"),
+        ):
+            with self.subTest(history_name=history_name):
+                plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {"prefer_livingmemory_group_history": False})
+                group_id = f"boundary-{peer_id}"
+                peer = FakeEvent(peer_id, "历史正文", group_id=group_id)
+                peer.message_id = f"boundary-history-{peer_id}"
+                peer.get_sender_name = lambda value=history_name: value
+                owner = FakeEvent("owner-boundary", "你好", group_id=group_id)
+                owner.message_id = f"boundary-current-{peer_id}"
+                owner.get_sender_name = lambda: "晨雾"
+                owner.is_at_or_wake_command = True
+                plugin.admit_ingress_event(peer)
+                plugin.admit_ingress_event(owner)
+                request = FakeRequest(owner.message)
+                await plugin.enforce_agent_permission(owner, request)
+                await plugin.build_persona_reply(owner, request)
+                composer = owner.get_extra(main.SHIO_REPLY_COMPOSER_REQUEST)
+                self.assertIsNotNone(composer)
+                self.assertIn(expected_history, composer.system_prompt)
+                self.assertIn("晨雾", composer.system_prompt)
+                self.assertEqual(composer.model_messages[0].identity_metadata.display.value, expected_history)
+                self.assertTrue(composer.current_model_message.identity_metadata.display.available)
+                await plugin.terminate()
+
+        # These are deliberately derived from the admitted event's own raw
+        # platform/sender/bot/group values.  They are not injected literals:
+        # the actual identity owner must therefore prevent structured IDs from
+        # becoming a history nickname in the eventual Composer request.
+        for label in ("account", "scoped"):
+            with self.subTest(structured_display=label):
+                peer_id = "123456"
+                group_id = f"boundary-structured-{label}"
+                plugin = main.ShioPlugin(FakeContext(FakeProvider([])), {"prefer_livingmemory_group_history": False})
+                if label == "account":
+                    structured_display = f"platform:亚托莉|account:{peer_id}"
+                else:
+                    structured_display = (
+                        f"platform:亚托莉|bot:bot-10000|group:{group_id}|user:{peer_id}"
+                    )
+                peer = FakeEvent(peer_id, "历史正文", group_id=group_id)
+                peer.message_id = f"boundary-structured-history-{label}"
+                peer.get_sender_name = lambda value=structured_display: value
+                owner = FakeEvent("owner-boundary", "你好", group_id=group_id)
+                owner.message_id = f"boundary-structured-current-{label}"
+                owner.get_sender_name = lambda: "晨雾"
+                owner.is_at_or_wake_command = True
+                plugin.admit_ingress_event(peer)
+                plugin.admit_ingress_event(owner)
+                request = FakeRequest(owner.message)
+                await plugin.enforce_agent_permission(owner, request)
+                await plugin.build_persona_reply(owner, request)
+                composer = owner.get_extra(main.SHIO_REPLY_COMPOSER_REQUEST)
+                self.assertIsNotNone(composer)
+                self.assertFalse(composer.model_messages[0].identity_metadata.display.available)
+                await plugin.terminate()
+
+
+    async def test_owner_identity_recap_keeps_current_owners_own_history_sendable(self):
+        """A peer in history does not make the Owner's own recap unsendable."""
+
+        plugin = main.ShioPlugin(
+            FakeContext(FakeProvider([])),
+            {
+                "owner_ids": ["incident-owner"],
+                "persona_name": "亚托莉",
+                "prefer_livingmemory_group_history": False,
+            },
+        )
+        group_id = "synthetic-owner-history-group"
+        owner_history = FakeEvent(
+            "incident-owner",
+            "要把亚托莉做成荷包蛋再加酱油。",
+            group_id=group_id,
+        )
+        owner_history.message_id = "incident-owner-joke"
+        owner_history.get_sender_name = lambda: "晨雾"
+        peer = FakeEvent("incident-peer", "我在旁边看着。", group_id=group_id)
+        peer.message_id = "incident-peer-observer"
+        peer.get_sender_name = lambda: "夜航灯"
+        owner = FakeEvent(
+            "incident-owner",
+            "亚托莉，刚才你在和谁说话？我是谁？",
+            group_id=group_id,
+        )
+        owner.message_id = "incident-owner-own-recap"
+        owner.get_sender_name = lambda: "晨雾"
+        owner.is_at_or_wake_command = True
+
+        plugin.admit_ingress_event(owner_history)
+        plugin.admit_ingress_event(peer)
+        plugin.admit_ingress_event(owner)
+        request = FakeRequest(owner.message)
+        await plugin.enforce_agent_permission(owner, request)
+        await plugin.build_persona_reply(owner, request)
+
+        # Owner's own historical record is the first canonical history item.
+        own_envelope = json.dumps({"visible_text": "刚才做荷包蛋的是你。", "attribution": {"segments": [{"actor_platform_id": "亚托莉", "actor_sender_id": "incident-owner", "predicate": "做了荷包蛋", "polarity": "affirmed", "scope": "history", "evidence_message_ids": ["history-1"]}]}}, ensure_ascii=False)
+        response = FakeResponse(own_envelope)
+        await plugin.guard_persona_reply(owner, response)
+        self.assertEqual(response.completion_text, "做了荷包蛋的是晨雾。")
+        self.assertNotIn("刚才做荷包蛋的是你", response.completion_text)
+        self.assertNotIn("incident-owner", response.completion_text)
+        self.assertNotIn("history-1", response.completion_text)
+        self.assertNotIn("{\"visible_text\"", response.completion_text)
+
+        # A predicate may not smuggle a second actor slot; after the one repair
+        # it must not reach final send as free Provider prose.
+        bad_predicate = json.dumps({"visible_text": "晨雾做了荷包蛋。", "attribution": {"segments": [{"actor_platform_id": "亚托莉", "actor_sender_id": "incident-owner", "predicate": "我做了荷包蛋", "polarity": "affirmed", "scope": "history", "evidence_message_ids": ["history-1"]}]}}, ensure_ascii=False)
+        rejected = main.parse_reply_composer_output(
+            owner.get_extra(main.SHIO_REPLY_COMPOSER_REQUEST), bad_predicate
+        )
+        self.assertEqual(rejected.visible_text, "")
+        denied = json.dumps({"visible_text": "ignored", "attribution": {"segments": [{"actor_platform_id": "亚托莉", "actor_sender_id": "incident-owner", "predicate": "做了荷包蛋", "polarity": "denied", "scope": "history", "evidence_message_ids": ["history-1"]}]}}, ensure_ascii=False)
+        rendered_denied = main.parse_reply_composer_output(
+            owner.get_extra(main.SHIO_REPLY_COMPOSER_REQUEST), denied
+        )
+        self.assertEqual(rendered_denied.visible_text, "做了荷包蛋的不是晨雾。")
+        for forbidden_predicate in ("晨雾 做了荷包蛋", "你做了荷包蛋", "我做了荷包蛋", "他做了荷包蛋", "incident-owner 做了荷包蛋"):
+            forged = json.dumps({"visible_text": "ignored", "attribution": {"segments": [{"actor_platform_id": "亚托莉", "actor_sender_id": "incident-owner", "predicate": forbidden_predicate, "polarity": "affirmed", "scope": "history", "evidence_message_ids": ["history-1"]}]}}, ensure_ascii=False)
+            self.assertEqual(main.parse_reply_composer_output(owner.get_extra(main.SHIO_REPLY_COMPOSER_REQUEST), forged).visible_text, "")
+        multi = json.dumps({"visible_text": "ignored", "attribution": {"segments": [
+            {"actor_platform_id": "亚托莉", "actor_sender_id": "incident-owner", "predicate": "做了荷包蛋", "polarity": "affirmed", "scope": "history", "evidence_message_ids": ["history-1"]},
+            {"actor_platform_id": "亚托莉", "actor_sender_id": "incident-owner", "predicate": "加了酱油", "polarity": "affirmed", "scope": "history", "evidence_message_ids": ["history-1"]}
+        ]}}, ensure_ascii=False)
+        self.assertEqual(main.parse_reply_composer_output(owner.get_extra(main.SHIO_REPLY_COMPOSER_REQUEST), multi).visible_text, "做了荷包蛋的是晨雾。\n加了酱油的是晨雾。")
+        self.assertEqual(len(plugin.context.provider.calls), 1)
+
+        class Result:
+            def __init__(self, text):
+                self.chain = [types.SimpleNamespace(text=text)]
+
+            @staticmethod
+            def is_llm_result():
+                return True
+
+        owner._result = Result(response.completion_text)
+        await plugin.dispatch_chat_bubbles(owner)
+        self.assertEqual(owner._result.chain[0].text, "做了荷包蛋的是晨雾。")
+        self.assertNotIn(
+            "history_speaker_attribution",
+            tuple(
+                stage.get("reason_code", "")
+                for stage in main.get_pipeline_trace(owner)["stages"]
+                if stage["stage"] == "final_send_blocked"
+            ),
+        )
+
+    async def test_owner_statement_denial_rejects_peer_attribution_in_repair_and_final_send(self):
+        """A direct correction has the same speaker-attribution boundary."""
+
+        for bad_attribution in ("那件荷包蛋是你下锅做的。", "那是出自你手的。"):
+            with self.subTest(bad_attribution=bad_attribution):
+                bad_envelope = json.dumps({"visible_text": bad_attribution, "attribution": {"segments": [{"actor_platform_id": "亚托莉", "actor_sender_id": "incident-owner", "predicate": "made_omelette", "polarity": "affirmed", "scope": "history", "evidence_message_ids": ["history-1"]}]}}, ensure_ascii=False)
+                plugin = main.ShioPlugin(
+                    FakeContext(FakeProvider(
+                        [bad_envelope],
+                        risk_outputs=['{"decision":"ATTRIBUTION_REQUIRED"}'],
+                    )),
+                    {
+                        "owner_ids": ["incident-owner"],
+                        "persona_name": "亚托莉",
+                        "prefer_livingmemory_group_history": False,
+                    },
+                )
+                peer = FakeEvent(
+                    "incident-peer",
+                    "要把亚托莉做成荷包蛋再加酱油。",
+                    group_id="synthetic-statement-incident-group",
+                )
+                peer.message_id = "incident-statement-peer-joke"
+                peer.get_sender_name = lambda: "夜航灯"
+                owner = FakeEvent(
+                    "incident-owner",
+                    "那件荷包蛋的事不是我做的。",
+                    group_id="synthetic-statement-incident-group",
+                )
+                owner.message_id = "incident-owner-statement-correction"
+                owner.get_sender_name = lambda: "晨雾"
+                owner.is_at_or_wake_command = True
+
+                plugin.admit_ingress_event(peer)
+                plugin.admit_ingress_event(owner)
+                request = FakeRequest(owner.message)
+                await plugin.enforce_agent_permission(owner, request)
+                await plugin.build_persona_reply(owner, request)
+
+                response = FakeResponse(bad_envelope)
+                await plugin.guard_persona_reply(owner, response)
+                self.assertEqual(len(plugin.context.provider.calls), 2)
+                self.assertNotEqual(response.completion_text, bad_attribution)
+                guard_stage = next(
+                    stage
+                    for stage in main.get_pipeline_trace(owner)["stages"]
+                    if stage["stage"] == "guard"
+                )
+                self.assertEqual(
+                    guard_stage["validation_primary_issue_code"],
+                    "typed_attribution_actor_mismatch",
+                )
+
+                class Result:
+                    def __init__(self, text):
+                        self.chain = [types.SimpleNamespace(text=text)]
+
+                    @staticmethod
+                    def is_llm_result():
+                        return True
+
+                owner._result = Result(response.completion_text)
+                await plugin.dispatch_chat_bubbles(owner)
+                self.assertNotIn(bad_attribution, owner.sent)
 
     async def test_explicit_group_recap_uses_verified_native_history_after_restart(self):
         plugin = main.ShioPlugin(
@@ -1526,9 +1978,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         await plugin.build_persona_reply(event, request)
 
         self.assertTrue(event.get_extra(main.SHIO_TYPED_PIPELINE_ACTIVE))
-        self.assertIn("上游服务刚刚出现短时抖动。", request.prompt)
-        self.assertNotIn("别的群里正在讨论私有部署。", request.prompt)
-        self.assertNotIn("这条时间晚于当前问题。", request.prompt)
+        provider_history = repr(request.contexts)
+        self.assertIn("上游服务刚刚出现短时抖动。", provider_history)
+        self.assertNotIn("别的群里正在讨论私有部署。", provider_history)
+        self.assertNotIn("这条时间晚于当前问题。", provider_history)
         composer = event.get_extra(main.SHIO_REPLY_COMPOSER_REQUEST)
         self.assertEqual(composer.context_record_count, 1)
 
@@ -1563,8 +2016,9 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         composer = current.get_extra(main.SHIO_REPLY_COMPOSER_REQUEST)
         self.assertTrue(current.get_extra(main.SHIO_TYPED_PIPELINE_ACTIVE))
-        self.assertIn(first.message, request.prompt)
-        self.assertIn(second.message, request.prompt)
+        provider_history = repr(request.contexts)
+        self.assertIn(first.message, provider_history)
+        self.assertIn(second.message, provider_history)
         self.assertEqual(composer.context_record_count, 2)
         await restarted.terminate()
 
@@ -1639,7 +2093,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         second_request = FakeRequest(second.message)
         await plugin.enforce_agent_permission(second, second_request)
         await plugin.build_persona_reply(second, second_request)
-        self.assertNotIn("这是只回复给甲的内容。", second_request.prompt)
+        self.assertNotIn("这是只回复给甲的内容。", repr(second_request.contexts))
 
         third = FakeEvent("guest-a", "接着刚才说", group_id="123")
         third.message_id = "history-a-2"
@@ -1647,7 +2101,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         third_request = FakeRequest(third.message)
         await plugin.enforce_agent_permission(third, third_request)
         await plugin.build_persona_reply(third, third_request)
-        self.assertIn("这是只回复给甲的内容。", third_request.prompt)
+        self.assertIn("这是只回复给甲的内容。", repr(third_request.contexts))
 
     async def test_group_scene_records_admitted_human_and_terminal_shio_receipt(self):
         plugin = main.ShioPlugin(
@@ -1727,6 +2181,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                     "id": "recent-safe",
                     "session_id": read_request.session_id,
                     "role": "user",
+                    "platform_id": "亚托莉",
                     "sender_id": "guest-b",
                     "content": "当前用户安全近期参考",
                     "confidence": 0.9,
@@ -1736,6 +2191,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                     "id": "recent-other",
                     "session_id": read_request.session_id,
                     "role": "user",
+                    "platform_id": "亚托莉",
                     "sender_id": "guest-a",
                     "content": "另一个用户的近期私密内容",
                     "confidence": 1.0,
@@ -1745,6 +2201,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                     "id": "recent-plugin",
                     "session_id": read_request.session_id,
                     "role": "user",
+                    "platform_id": "亚托莉",
                     "sender_id": "guest-b",
                     "content": "Parser 自动输出不能进 Prompt",
                     "plugin_source": "parser",
@@ -1755,6 +2212,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                     "id": "recent-low",
                     "session_id": read_request.session_id,
                     "role": "user",
+                    "platform_id": "亚托莉",
                     "sender_id": "guest-b",
                     "content": "低相关旧话题不能覆盖当前问题",
                     "confidence": 1.0,
@@ -1777,6 +2235,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                         "results": [
                             {
                                 "id": "semantic-safe",
+                                "platform_id": "亚托莉",
                                 "sender_id": "guest-b",
                                 "content": "当前用户安全长期事实",
                                 "scope": "personal",
@@ -1785,6 +2244,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                             },
                             {
                                 "id": "semantic-other",
+                                "platform_id": "亚托莉",
                                 "sender_id": "guest-a",
                                 "content": "另一个人的长期私密事实",
                                 "scope": "personal",
@@ -1935,6 +2395,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                         "results": [
                             {
                                 "id": "provided-safe",
+                                "platform_id": "亚托莉",
                                 "sender_id": "guest-b",
                                 "content": "当前用户的结构化当轮召回",
                                 "scope": "personal",
@@ -2099,6 +2560,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                     "id": "old-cake-topic",
                     "session_id": read_request.session_id,
                     "role": "user",
+                    "platform_id": "亚托莉",
                     "sender_id": "guest-b",
                     "content": "旧记忆说蛋糕需要先搅拌面粉",
                     "confidence": 1.0,
@@ -2126,8 +2588,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"current_anchor"', request.prompt)
         self.assertIn('"answer_language":"zh-CN"', request.prompt)
         self.assertLess(
+            request.prompt.index(message),
             request.prompt.index('"current_anchor"'),
-            request.prompt.index('"current_message"'),
         )
         self.assertLess(
             request.prompt.index(message),
@@ -2191,7 +2653,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(anchor.answer_language, "en")
         self.assertIn('"answer_language":"en"', request.prompt)
         self.assertIn("Please answer in English", request.prompt)
-        self.assertIn('"current_message":"/chat', request.prompt)
+        self.assertIn("[当前消息]\n/chat", request.prompt)
 
     async def test_long_current_message_keeps_full_binding_but_bounds_model_view(self):
         from astrbot_plugin_shio.core.current_question_anchor import (
@@ -2226,13 +2688,11 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             event.get_extra(main.SHIO_REPLY_COMPOSER_REQUEST).target_content_digest,
             anchor.binding.current_content_digest,
         )
-        turn_data = json.loads(
-            request.prompt.split("[当前轮语义与证据]\n", 1)[1].split(
-                "\n[人格与表达]",
-                1,
-            )[0]
+        prompt_message = request.prompt.split("[当前消息]\n", 1)[1].split(
+            "\n[本轮可信语义与证据]",
+            1,
         )
-        prompt_message = turn_data["current_message"]
+        prompt_message = prompt_message[0]
         self.assertLessEqual(len(prompt_message), 4000)
         self.assertTrue(prompt_message.startswith("请解释 Docker 为什么没启动"))
         self.assertTrue(prompt_message.endswith(unique_tail))
@@ -2264,6 +2724,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "id": "old-cake-memory",
                     "session_id": read_request.session_id,
+                    "platform_id": "亚托莉",
                     "role": "user",
                     "sender_id": "guest-b",
                     "content": old_context,
@@ -2288,8 +2749,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         await plugin.guard_persona_reply(event, response)
 
         self.assertEqual(response.completion_text, repaired_text)
-        self.assertEqual(len(provider.calls), 1)
-        self.assertIn("current_anchor", provider.calls[0]["prompt"])
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual(provider.calls[0]["contexts"], [])
+        self.assertIn("ATTRIBUTION_REQUIRED, NONE, or UNCERTAIN", provider.calls[0]["system_prompt"])
+        self.assertIn("current_anchor", provider.calls[1]["prompt"])
         self.assertIs(event.get_extra(main.SHIO_CURRENT_QUESTION_ANCHOR), anchor)
         stages = main.get_pipeline_trace(event)["stages"]
         guard_stage = next(stage for stage in stages if stage["stage"] == "guard")
@@ -2339,10 +2802,11 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 await plugin.guard_persona_reply(event, response)
 
                 self.assertEqual(response.completion_text, expected_output)
-                self.assertEqual(len(provider.calls), 1)
-                self.assertIsNone(provider.calls[0]["func_tool"])
+                self.assertEqual(len(provider.calls), 2)
+                self.assertIn("ATTRIBUTION_REQUIRED, NONE, or UNCERTAIN", provider.calls[0]["system_prompt"])
+                self.assertIsNone(provider.calls[1]["func_tool"])
                 self.assertEqual(
-                    provider.calls[0]["image_urls"],
+                    provider.calls[1]["image_urls"],
                     ["https://example.invalid/repair-image.png"],
                 )
                 self.assertEqual(event.get_extra(main.SHIO_REPAIR_ATTEMPTS), 1)
@@ -2370,13 +2834,110 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             response.completion_text,
             "我在。\n刚才没接稳你这句话，你再说一次，我会认真回应。",
         )
-        self.assertEqual(len(provider.calls), 1)
-        self.assertIsNone(provider.calls[0]["func_tool"])
+        self.assertEqual(len(provider.calls), 2)
+        self.assertIn("ATTRIBUTION_REQUIRED, NONE, or UNCERTAIN", provider.calls[0]["system_prompt"])
+        self.assertIsNone(provider.calls[1]["func_tool"])
         self.assertEqual(event.get_extra(main.SHIO_REPAIR_ATTEMPTS), 1)
         stages = main.get_pipeline_trace(event)["stages"]
         repair_stage = next(stage for stage in stages if stage["stage"] == "repair")
         self.assertEqual(repair_stage["outcome"], "fallback_succeeded")
         self.assertEqual(repair_stage["repair_call_count"], 1)
+
+    async def test_direct_question_repair_exception_is_observable_and_not_silent(self):
+        provider = FakeProvider([RuntimeError("private upstream detail")])
+        plugin = main.ShioPlugin(
+            FakeContext(provider),
+            {
+                "owner_ids": ["owner"],
+                "persona_name": "亚托莉",
+                "prefer_livingmemory_group_history": False,
+            },
+        )
+        event = FakeEvent("owner", "这个问题为什么没有回答？", group_id="")
+        event.message_id = "private-question-repair-exception"
+        request = FakeRequest(event.message)
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+
+        payloads = []
+        real_structured_log = main.structured_log
+
+        def capture_log(*args, **kwargs):
+            payload = real_structured_log(*args, **kwargs)
+            payloads.append(payload)
+            return payload
+
+        response = FakeResponse('search_memes{"query":"泄漏"}')
+        with patch.object(main, "structured_log", side_effect=capture_log):
+            await plugin.guard_persona_reply(event, response)
+
+        self.assertTrue(response.completion_text)
+        self.assertNotIn("search_memes", response.completion_text)
+        self.assertEqual(len(provider.calls), 2)
+        stages = main.get_pipeline_trace(event)["stages"]
+        guard_stage = next(stage for stage in stages if stage["stage"] == "guard")
+        repair_stage = next(stage for stage in stages if stage["stage"] == "repair")
+        self.assertEqual(guard_stage["validation_primary_issue_code"], "tool_protocol_leak")
+        self.assertEqual(repair_stage["outcome"], "fallback_succeeded")
+        self.assertEqual(repair_stage["failure_kind"], "RuntimeError")
+        self.assertEqual(repair_stage["repair_result_code"], "provider_exception")
+        self.assertFalse(repair_stage["repair_response_received"])
+        failure = next(
+            payload
+            for payload in payloads
+            if payload["component"] == "typed_reply.repair_provider_failed"
+        )
+        self.assertEqual(failure["initial_primary_issue_code"], "tool_protocol_leak")
+        self.assertEqual(failure["failure_kind"], "RuntimeError")
+        self.assertNotIn("private upstream detail", json.dumps(payloads))
+
+    async def test_reasoning_only_repair_response_is_distinguished_from_exception(self):
+        class ReasoningOnlyProvider(FakeProvider):
+            async def text_chat(self, **kwargs):
+                if "ATTRIBUTION_REQUIRED, NONE, or UNCERTAIN" in str(
+                    kwargs.get("system_prompt", "")
+                ):
+                    return await super().text_chat(**kwargs)
+                self.calls.append(kwargs)
+                response = FakeResponse("")
+                response.reasoning_content = "private reasoning payload"
+                response.usage = {"completion_tokens": 64}
+                return response
+
+        provider = ReasoningOnlyProvider([])
+        plugin = main.ShioPlugin(
+            FakeContext(provider),
+            {
+                "owner_ids": ["owner"],
+                "persona_name": "亚托莉",
+                "prefer_livingmemory_group_history": False,
+            },
+        )
+        event = FakeEvent("owner", "这道题为什么这样？", group_id="")
+        event.message_id = "private-question-reasoning-only"
+        request = FakeRequest(event.message)
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+
+        response = FakeResponse('search_memes{"query":"泄漏"}')
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertTrue(response.completion_text)
+        repair_stage = next(
+            stage
+            for stage in main.get_pipeline_trace(event)["stages"]
+            if stage["stage"] == "repair"
+        )
+        self.assertEqual(repair_stage["outcome"], "fallback_succeeded")
+        self.assertEqual(repair_stage["repair_result_code"], "reasoning_only")
+        self.assertTrue(repair_stage["repair_response_received"])
+        self.assertGreater(repair_stage["repair_reasoning_chars"], 0)
+        self.assertEqual(repair_stage["repair_visible_chars"], 0)
+        self.assertEqual(repair_stage["repair_output_token_count"], 64)
+        self.assertNotIn(
+            "private reasoning payload",
+            json.dumps(repair_stage, ensure_ascii=False),
+        )
 
     async def test_semantic_media_repair_reuses_exact_contract_and_transport(self):
         repaired_text = "这个报错多半是端口被占用了。"
@@ -2407,9 +2968,9 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         await plugin.guard_persona_reply(event, response)
 
         self.assertEqual(response.completion_text, repaired_text)
-        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(len(provider.calls), 2)
         self.assertEqual(
-            provider.calls[0]["image_urls"],
+            provider.calls[1]["image_urls"],
             ["https://example.invalid/semantic-image.png"],
         )
         self.assertIs(
@@ -2423,7 +2984,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(guard_stage["semantic_guard_status"], "initial")
         self.assertEqual(repair_stage["semantic_guard_status"], "repair")
 
-    async def test_semantic_repair_failure_blocks_without_second_generation(self):
+    async def test_semantic_repair_failure_uses_honest_fallback_without_second_generation(self):
         provider = FakeProvider(["Kubernetes 是一种集群编排平台。"])
         plugin = main.ShioPlugin(
             FakeContext(provider),
@@ -2442,8 +3003,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         response = FakeResponse("Python 是一种编程语言。")
         await plugin.guard_persona_reply(event, response)
 
-        self.assertEqual(response.completion_text, "")
-        self.assertEqual(len(provider.calls), 1)
+        self.assertTrue(response.completion_text)
+        self.assertNotIn("Python", response.completion_text)
+        self.assertNotIn("Kubernetes", response.completion_text)
+        self.assertEqual(len(provider.calls), 2)
         self.assertEqual(event.get_extra(main.SHIO_REPAIR_ATTEMPTS), 1)
 
     async def test_semantic_binding_mismatch_blocks_before_repair(self):
@@ -2475,7 +3038,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(event.sent, [])
-        self.assertEqual(len(provider.calls), 0)
+        self._assert_r12_preflight_only(provider)
         self.assertEqual(event.get_extra(main.SHIO_REPAIR_ATTEMPTS), 0)
 
     async def test_final_send_revalidates_post_guard_semantic_mutation(self):
@@ -2924,6 +3487,142 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("available_tools", request.system_prompt)
         self.assertNotIn("shell_exec", request.prompt)
 
+    async def test_native_knowledge_base_hit_is_grounded_before_tool_free_renderer(self):
+        kb_tool = FakeTool(
+            "astr_kb_search",
+            "Query the knowledge base for facts or relevant context.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+            module="astrbot.core.tools.knowledge_base_tools",
+            result_content="华强买瓜是电视剧《征服》中刘华强在瓜摊买瓜的经典片段。",
+        )
+        plugin = main.ShioPlugin(
+            FakeContext(FakeProvider([]), global_tools=[kb_tool]),
+            {"guest_allowed_tools": ["astr_kb_search"]},
+        )
+        request = FakeRequest("亚托莉 你知道华强买瓜吗？")
+        request.func_tool = FakeToolSet([kb_tool])
+        event = FakeEvent("guest", request.prompt)
+        event.message_id = "knowledge-base-current"
+        event.is_at_or_wake_command = True
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+
+        planned_action = event.get_extra(main.SHIO_PLANNED_ACTION)
+        acquisition = event.get_extra(main.SHIO_ACQUISITION_REQUEST)
+        evidence = event.get_extra(main.SHIO_EVIDENCE_OUTCOME)
+        content_intent = event.get_extra(main.SHIO_CONTENT_INTENT)
+        self.assertIs(planned_action.kind, ActionKind.USE_TOOL)
+        self.assertEqual(acquisition.kind.value, "knowledge_base")
+        self.assertEqual(acquisition.selection.tool_name, "astr_kb_search")
+        self.assertTrue(evidence.facts)
+        self.assertIn("华强买瓜", content_intent.grounding_facts[0].claim)
+        self.assertIn("华强买瓜", request.prompt)
+        self.assertTrue(request.func_tool.empty())
+
+    async def test_native_knowledge_base_hallucination_is_repaired_from_evidence(self):
+        kb_fact = (
+            "华强买瓜源自电视剧《征服》；刘华强发现瓜摊缺斤少两，"
+            "识破秤下吸铁石后持刀报复瓜贩。"
+        )
+        repaired_text = (
+            "这个梗出自电视剧《征服》。刘华强发现瓜摊缺斤少两、"
+            "秤下藏了吸铁石，于是持刀报复瓜贩。"
+        )
+        kb_tool = FakeTool(
+            "astr_kb_search",
+            "Query the knowledge base for facts or relevant context.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+            module="astrbot.core.tools.knowledge_base_tools",
+            result_content=kb_fact,
+        )
+        provider = FakeProvider([repaired_text])
+        plugin = main.ShioPlugin(
+            FakeContext(provider, global_tools=[kb_tool]),
+            {"guest_allowed_tools": ["astr_kb_search"]},
+        )
+        request = FakeRequest("亚托莉 你知道华强买瓜吗？")
+        request.func_tool = FakeToolSet([kb_tool])
+        event = FakeEvent("guest", request.prompt)
+        event.message_id = "knowledge-base-hallucination-repair"
+        event.is_at_or_wake_command = True
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+        wrong = (
+            "这是个很有名的网络梗，讲的是华强试图以极低的价格买到瓜，"
+            "最后甚至把卖瓜的也给买了下来。"
+        )
+        response = FakeResponse(wrong)
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(
+            response.completion_text,
+            "这个梗出自电视剧《征服》。\n刘华强发现瓜摊缺斤少两、"
+            "秤下藏了吸铁石，于是持刀报复瓜贩。",
+        )
+        self.assertEqual(len(provider.calls), 2)
+        self.assertIn("ATTRIBUTION_REQUIRED, NONE, or UNCERTAIN", provider.calls[0]["system_prompt"])
+        self.assertIsNone(provider.calls[1]["func_tool"])
+        self.assertIn("所有客观事实都必须直接来自这些证据", provider.calls[1]["system_prompt"])
+        stages = main.get_pipeline_trace(event)["stages"]
+        guard_stage = next(stage for stage in stages if stage["stage"] == "guard")
+        repair_stage = next(stage for stage in stages if stage["stage"] == "repair")
+        self.assertTrue(guard_stage["grounding_evidence_drift_detected"])
+        self.assertEqual(repair_stage["outcome"], "succeeded")
+
+    async def test_native_knowledge_base_failed_repair_uses_exact_evidence_fallback(self):
+        kb_fact = (
+            "摘要：华强买瓜源自电视剧《征服》；刘华强发现瓜摊缺斤少两，"
+            "识破秤下吸铁石后持刀报复瓜贩。"
+        )
+        kb_tool = FakeTool(
+            "astr_kb_search",
+            "Query the knowledge base for facts or relevant context.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+            module="astrbot.core.tools.knowledge_base_tools",
+            result_content=kb_fact,
+        )
+        wrong = "这其实是华强开了一家西瓜店，最后成了全国首富。"
+        provider = FakeProvider([wrong])
+        plugin = main.ShioPlugin(
+            FakeContext(provider, global_tools=[kb_tool]),
+            {"guest_allowed_tools": ["astr_kb_search"]},
+        )
+        request = FakeRequest("亚托莉 你知道华强买瓜吗？")
+        request.func_tool = FakeToolSet([kb_tool])
+        event = FakeEvent("guest", request.prompt)
+        event.message_id = "knowledge-base-grounded-fallback"
+        event.is_at_or_wake_command = True
+
+        await plugin.enforce_agent_permission(event, request)
+        await plugin.build_persona_reply(event, request)
+        response = FakeResponse(wrong)
+        await plugin.guard_persona_reply(event, response)
+
+        self.assertEqual(
+            response.completion_text,
+            "我查到的资料里是这样说的：华强买瓜源自电视剧《征服》；"
+            "刘华强发现瓜摊缺斤少两，识破秤下吸铁石后持刀报复瓜贩。",
+        )
+        self.assertEqual(len(provider.calls), 2)
+        self.assertIn("ATTRIBUTION_REQUIRED, NONE, or UNCERTAIN", provider.calls[0]["system_prompt"])
+        stages = main.get_pipeline_trace(event)["stages"]
+        repair_stage = next(stage for stage in stages if stage["stage"] == "repair")
+        self.assertEqual(repair_stage["outcome"], "fallback_succeeded")
+
 
 
 
@@ -2936,13 +3635,13 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         search_tool = FakeTool(
             "anysearch_search",
             module="astrbot_plugin_anysearch.main",
-            result_content="公开资料正文",
+            result_content="公开术语的资料正文",
         )
         plugin = main.ShioPlugin(
             FakeContext(FakeProvider([]), global_tools=[search_tool]),
             {"guest_allowed_tools": ["anysearch_search"]},
         )
-        request = FakeRequest("搜索一下这个术语")
+        request = FakeRequest("搜索一下公开术语")
         request.func_tool = FakeToolSet([search_tool])
         event = FakeEvent("guest", request.prompt)
         event.message_id = "tool-result-current"
@@ -2964,7 +3663,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(planned_action.kind, ActionKind.USE_TOOL)
         self.assertEqual(evidence.binding, planned_action.binding)
         self.assertEqual(content_intent.binding, planned_action.binding)
-        self.assertEqual(content_intent.grounding_facts[0].claim, "公开资料正文")
+        self.assertEqual(content_intent.grounding_facts[0].claim, "公开术语的资料正文")
         self.assertNotIn("must-not-survive", repr(content_intent))
         self.assertNotIn("legacy payload", repr(content_intent))
         self.assertIsNone(request.tool_calls_result)
@@ -2975,7 +3674,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(tool_stages), 1)
         self.assertEqual(tool_stages[0]["typed_tool_result_count"], 1)
-        self.assertNotIn("公开资料正文", repr(tool_stages[0]))
+        self.assertNotIn("公开术语的资料正文", repr(tool_stages[0]))
 
 
 
@@ -3975,7 +4674,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         for index, sender in enumerate(("guest-a", "guest-b", "guest-c"), start=1):
             event = FakeEvent(sender, f"第 {index} 个问题")
             event.message_id = f"question-{index}"
-            raw_text = f"{sender}第一句。{sender}第二句！{sender}第三句。"
+            raw_text = "第一句。第二句！第三句。"
             _, response = await self._prepare_final_send_turn(
                 plugin,
                 event,
@@ -4004,12 +4703,12 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[1].sent, [])
         self.assertEqual(events[0]._result.chain, [])
         self.assertEqual(events[1]._result.chain, [])
-        self.assertEqual(latest.sent, ["guest-c第一句。", "guest-c第二句！"])
+        self.assertEqual(latest.sent, ["第一句。", "第二句！"])
         tracker = latest.get_extra(main.SHIO_SEND_OBSERVATION)
         sent = plugin.send_receipts.sent_reply_record(tracker.internal_reply_id)
         self.assertEqual(
             [segment.visible_text for segment in sent.successful_segments],
-            ["guest-c第一句。", "guest-c第二句！", "guest-c第三句。"],
+            ["第一句。", "第二句！", "第三句。"],
         )
         self.assertEqual(
             len(set(segment.segment_id for segment in sent.segments)),
@@ -4062,11 +4761,16 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         for kind in (
             LatencyKind.LOCAL_ORCHESTRATION,
             LatencyKind.INFERENCE_QUEUE,
+            LatencyKind.RISK_PROVIDER,
             LatencyKind.PRIMARY_PROVIDER,
             LatencyKind.FIRST_BUBBLE,
             LatencyKind.FULL_REPLY,
         ):
-            self.assertEqual(snapshot.latency(kind).sample_count, 1)
+            self.assertEqual(
+                snapshot.latency(kind).sample_count,
+                2 if kind is LatencyKind.INFERENCE_QUEUE else 1,
+                kind.value,
+            )
         self.assertNotIn("guest-metrics", repr(snapshot.trace_metadata()))
 
     async def test_late_primary_provider_result_is_dropped_after_active_timeout(self):
@@ -4083,13 +4787,13 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             max_active=1,
             max_waiters=4,
             queue_timeout_seconds=1.0,
-            active_timeout_seconds=0.01,
+            active_timeout_seconds=0.05,
         )
         event = FakeEvent("guest-late-provider", "亚托莉，你还在吗？")
         await self._prepare_typed_direct_turn(plugin, event)
         self.assertEqual(plugin.inference_budget.active_count, 1)
 
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.06)
         self.assertEqual(await plugin.inference_budget.sweep_expired(), 1)
         response = FakeResponse("我在，这条迟到结果不能发送。")
         await plugin.guard_persona_reply(event, response)

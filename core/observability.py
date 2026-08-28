@@ -71,6 +71,13 @@ _SAFE_STRING_KEYS = {
     "action",
     "outcome",
     "trigger",
+    "primary_provider_owner",
+    "proactive_provider_owner",
+    "meme_selection_owner",
+    "meme_complement_reason",
+    "meme_complement_category",
+    "meme_execution_category",
+    "proactive_meme_category",
 }
 _SAFE_STRING_SUFFIXES = (
     "_status",
@@ -130,7 +137,10 @@ def sanitize_trace_metadata(
         lowered = key.lower()
         if not key:
             continue
-        if any(part in lowered for part in _SECRET_KEY_PARTS):
+        if (
+            any(part in lowered for part in _SECRET_KEY_PARTS)
+            and not lowered.endswith("_token_count")
+        ):
             continue
         if lowered in _RAW_ID_KEYS or lowered in _CONTENT_KEYS:
             continue

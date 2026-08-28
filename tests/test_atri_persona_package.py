@@ -50,6 +50,9 @@ class AtriPersonaPackageTests(unittest.TestCase):
                     "emotionally_sincere",
                     "care_through_action",
                     "soft_stubbornness",
+                    "humanlike_lived_presence",
+                    "openhearted_affirmation",
+                    "direct_wants_and_preferences",
                 ),
                 "relations": (
                     "primary_bond",
@@ -70,11 +73,13 @@ class AtriPersonaPackageTests(unittest.TestCase):
                     "primary_bond_intimacy",
                 ),
                 "sources": (
-                    "core_prompt_v10",
+                    "core_prompt_current",
+                    "atri_official_character",
                     "atri_lore_canon",
                     "atri_lore_continuation",
                     "voice_card",
                     "expression_asset",
+                    "atri_original_dialogue_corpus",
                 ),
             },
         )

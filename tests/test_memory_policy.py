@@ -23,6 +23,7 @@ from astrbot_plugin_shio.core.conversation_event import (
 from astrbot_plugin_shio.core.identity import (
     PrincipalContext,
     TurnEnvelope,
+    build_account_key,
     build_scope_key,
     build_sender_key,
 )
@@ -59,6 +60,7 @@ def accepted_turn(*, chat_type: str = "group", owner: bool = False):
         message_id=f"message-{chat_type}-{'owner' if owner else 'peer'}",
         scope_key=scope_key,
         sender_key=sender_key,
+        account_key=build_account_key("test-platform", sender_id),
         sender_id=sender_id,
         platform_id="test-platform",
         bot_id="test-bot",
@@ -77,6 +79,7 @@ def accepted_turn(*, chat_type: str = "group", owner: bool = False):
         is_owner=owner,
         relationship_role="owner" if owner else f"{chat_type}_peer",
         verification_source="synthetic_structural_id",
+        account_key=build_account_key("test-platform", sender_id),
     )
     revision_book = ConversationRevisionBook()
     ingress = build_ingress_event(
@@ -106,6 +109,7 @@ def recent_row(event, content: str, **overrides):
         "role": "user",
         "content": content,
         "sender_id": event.envelope.sender_id,
+        "platform_id": event.envelope.platform_id,
         "timestamp": 90.0,
         "confidence": 0.9,
         "relevance": 0.9,
@@ -118,6 +122,10 @@ def recent_row(event, content: str, **overrides):
 def provided_request(results, *, extra_text: str = "", prompt: str = "当前问题"):
     contexts = []
     if results is not None:
+        results = [
+            {**row, **({"platform_id": "test-platform"} if row.get("sender_id") and not row.get("platform_id") else {})}
+            for row in results
+        ]
         contexts.append(
             {
                 "role": "tool",
@@ -448,6 +456,7 @@ class MemoryPolicyTests(unittest.IsolatedAsyncioTestCase):
                 },
                 {
                     "id": "low-public",
+                    "session_id": event.envelope.session_id,
                     "content": "低相关群背景",
                     "scope": "group",
                     "confidence": 0.9,
@@ -463,6 +472,7 @@ class MemoryPolicyTests(unittest.IsolatedAsyncioTestCase):
                 },
                 {
                     "id": "safe-public",
+                    "session_id": event.envelope.session_id,
                     "content": "高相关公共事实",
                     "scope": "group",
                     "confidence": 0.9,

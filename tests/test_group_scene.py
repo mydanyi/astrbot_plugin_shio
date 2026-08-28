@@ -6,6 +6,10 @@ import json
 import unittest
 
 from astrbot_plugin_shio.core.context_assembler import ReplyTarget
+from astrbot_plugin_shio.core.conversation_ledger import (
+    build_inbound_identity_metadata,
+    build_participant_display,
+)
 from astrbot_plugin_shio.core.contracts import (
     IngressDecision,
     IngressDisposition,
@@ -49,6 +53,8 @@ def _committed_event(
     content: str,
     sender_kind: SenderKind = SenderKind.HUMAN,
     plugin_source: PluginSource = PluginSource.NONE,
+    reply_to_message_id: str = "",
+    reply_to_sender_id: str = "",
 ) -> ConversationEvent:
     scope_key = _scope(group)
     sender_key = _sender(scope_key, sender)
@@ -62,8 +68,8 @@ def _committed_event(
         bot_id="shio",
         chat_type="group",
         group_id=group,
-        reply_to_message_id="",
-        reply_to_sender_id="",
+        reply_to_message_id=reply_to_message_id,
+        reply_to_sender_id=reply_to_sender_id,
         timestamp=100.0 + revision_book.current(scope_key),
         timestamp_source="fixture",
         source_kind="inbound",
@@ -152,6 +158,61 @@ def _sent_reply(
 
 
 class GroupSceneTests(unittest.TestCase):
+    def test_human_topic_keeps_real_name_reply_and_mentions_separate_from_body(self):
+        revisions = ConversationRevisionBook()
+        event = _committed_event(
+            revisions,
+            group="group-identity",
+            sender="guest-a",
+            message="msg-related",
+            content="场景纯正文",
+            reply_to_message_id="msg-prior",
+            reply_to_sender_id="guest-b",
+        )
+        referenced_key = _sender(event.envelope.scope_key, "guest-b")
+        metadata = build_inbound_identity_metadata(
+            display_name="场景测试发言者",
+            display_name_source="event_sender",
+            referenced_sender=build_participant_display(
+                referenced_key,
+                display_name="场景测试引用者",
+                display_name_source="reply_component",
+            ),
+            mention_targets=(
+                build_participant_display(
+                    _sender(event.envelope.scope_key, "guest-c"),
+                    display_name="场景测试提及甲",
+                    display_name_source="mention_component",
+                ),
+                build_participant_display(
+                    _sender(event.envelope.scope_key, "guest-d"),
+                    display_name="场景测试提及乙",
+                    display_name_source="mention_component",
+                ),
+            ),
+            has_reply_edge=True,
+        )
+        scene = GroupSceneBook()
+
+        result = scene.record_human(
+            event,
+            decision=_decision(event),
+            public_content="场景纯正文",
+            identity_metadata=metadata,
+        )
+
+        topic = result.snapshot.public_topics[-1]
+        self.assertEqual(topic.content, "场景纯正文")
+        self.assertEqual(topic.author_display_name, "场景测试发言者")
+        self.assertEqual(topic.reply_to_message_id, "msg-prior")
+        self.assertEqual(topic.referenced_sender_key, referenced_key)
+        self.assertEqual(
+            [target.display.value for target in topic.mention_targets],
+            ["场景测试提及甲", "场景测试提及乙"],
+        )
+        self.assertEqual(topic.addressing_status, "reply_and_mentions")
+        self.assertNotIn("场景测试发言者", topic.content)
+
     def test_accept_human_separates_public_topic_from_personal_facts(self):
         revisions = ConversationRevisionBook()
         event = _committed_event(

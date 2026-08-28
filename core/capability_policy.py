@@ -209,8 +209,9 @@ def build_guest_capability_policy(
 ) -> CapabilityPolicy:
     """Build the P3-02 guest policy from trusted structural identity only.
 
-    Owner policies use a separate builder. Natural group participation is a
-    supported text-only mode; every external capability still fails closed.
+    Owner policies use a separate builder. Natural group participation may use
+    the same sealed public-read capabilities as a direct guest reply; every
+    write, execution, device and personal-memory capability still fails closed.
     """
 
     mode = str(conversation_mode or "direct_reply").strip().lower()
@@ -227,7 +228,8 @@ def build_guest_capability_policy(
         reasons.append("identity_unverified")
 
     guest_verified = not reasons
-    external_tools_allowed = guest_verified and mode == "direct_reply"
+    public_reads_allowed = guest_verified and mode in {"direct_reply", "group_join"}
+    local_presentation_allowed = guest_verified and mode == "direct_reply"
     return CapabilityPolicy(
         principal_key=principal.sender_key,
         policy_kind="guest",
@@ -238,9 +240,9 @@ def build_guest_capability_policy(
         # Text conversation remains available even when external capabilities
         # fail closed; callers must still avoid attributing unverified identity.
         chat_read=True,
-        public_web_read=external_tools_allowed,
-        chat_retrieval=external_tools_allowed,
-        local_presentation=external_tools_allowed,
+        public_web_read=public_reads_allowed,
+        chat_retrieval=public_reads_allowed,
+        local_presentation=local_presentation_allowed,
         media_generation=False,
         memory_write=False,
         artifact_read=False,
@@ -248,8 +250,8 @@ def build_guest_capability_policy(
         shell_exec=False,
         device_control=False,
         agent_full=False,
-        max_external_tool_calls=2 if external_tools_allowed else 0,
-        max_local_presentation_calls=1 if external_tools_allowed else 0,
+        max_external_tool_calls=(1 if mode == "group_join" else 2) if public_reads_allowed else 0,
+        max_local_presentation_calls=1 if local_presentation_allowed else 0,
         requires_explicit_tool_name=True,
         explicitly_configured_tools=_configured_tool_names(configured_tool_names),
         degradation_reasons=tuple(reasons),
@@ -279,7 +281,8 @@ def build_owner_capability_policy(
         reasons.append("unsupported_conversation_mode")
 
     owner_verified = not reasons
-    external_tools_allowed = owner_verified and mode == "direct_reply"
+    public_reads_allowed = owner_verified and mode in {"direct_reply", "group_join"}
+    privileged_tools_allowed = owner_verified and mode == "direct_reply"
     return CapabilityPolicy(
         principal_key=principal.sender_key,
         policy_kind="owner",
@@ -288,20 +291,22 @@ def build_owner_capability_policy(
         verification_source=principal.verification_source,
         conversation_mode=mode,
         chat_read=True,
-        public_web_read=external_tools_allowed,
-        chat_retrieval=external_tools_allowed,
-        local_presentation=external_tools_allowed,
-        media_generation=external_tools_allowed,
-        memory_write=external_tools_allowed,
-        artifact_read=external_tools_allowed,
-        artifact_write=external_tools_allowed,
-        shell_exec=external_tools_allowed,
-        device_control=external_tools_allowed,
-        agent_full=external_tools_allowed,
+        public_web_read=public_reads_allowed,
+        chat_retrieval=public_reads_allowed,
+        local_presentation=privileged_tools_allowed,
+        media_generation=privileged_tools_allowed,
+        memory_write=privileged_tools_allowed,
+        artifact_read=privileged_tools_allowed,
+        artifact_write=privileged_tools_allowed,
+        shell_exec=privileged_tools_allowed,
+        device_control=privileged_tools_allowed,
+        agent_full=privileged_tools_allowed,
         # -1 means Shio does not add a call-count limit beyond AstrBot's own
         # owner Agent loop and provider constraints.
-        max_external_tool_calls=-1 if external_tools_allowed else 0,
-        max_local_presentation_calls=-1 if external_tools_allowed else 0,
+        max_external_tool_calls=(
+            -1 if privileged_tools_allowed else 1 if public_reads_allowed else 0
+        ),
+        max_local_presentation_calls=-1 if privileged_tools_allowed else 0,
         requires_explicit_tool_name=False,
         explicitly_configured_tools=frozenset(),
         degradation_reasons=tuple(reasons),

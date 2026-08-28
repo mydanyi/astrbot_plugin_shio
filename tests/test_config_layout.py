@@ -23,6 +23,7 @@ except ModuleNotFoundError:
 from astrbot_plugin_shio.scripts.migrate_v054_config import (
     GROUPS,
     NEW_PARTICIPATION_DEFAULTS,
+    NEW_PROACTIVE_DEFAULTS,
     migrate,
 )
 
@@ -47,9 +48,33 @@ class ConfigLayoutTests(unittest.TestCase):
         })
         self.assertEqual(sum(map(len, GROUPS.values())), 57)
 
+    def test_both_active_conversation_flows_expose_complete_rules(self):
+        participation = self.schema["participation_settings"]["items"]
+        proactive = self.schema["proactive_settings"]["items"]
+
+        self.assertEqual(
+            participation["natural_group_participation_rules"]["type"],
+            "text",
+        )
+        self.assertIn(
+            "普通成员",
+            participation["natural_group_participation_rules"]["default"],
+        )
+        self.assertEqual(
+            proactive["proactive_initiation_rules"]["type"],
+            "text",
+        )
+        self.assertIn(
+            "没有可靠",
+            proactive["proactive_initiation_rules"]["default"],
+        )
+
     def test_legacy_values_migrate_without_reactivating_either_proactive_flow(self):
         new_only = {
             *NEW_PARTICIPATION_DEFAULTS,
+            *NEW_PROACTIVE_DEFAULTS,
+            "natural_group_participation_rules",
+            "proactive_initiation_rules",
             "natural_group_participation_allowlist",
         }
         legacy = {
@@ -86,14 +111,102 @@ class ConfigLayoutTests(unittest.TestCase):
             ],
             60,
         )
+        self.assertNotIn("meme_settings", migrated)
+        self.assertIn(
+            "普通成员",
+            migrated["participation_settings"][
+                "natural_group_participation_rules"
+            ],
+        )
+        self.assertIn(
+            "没有可靠",
+            migrated["proactive_settings"]["proactive_initiation_rules"],
+        )
+
+    def test_legacy_rule_aliases_migrate_once_without_becoming_runtime_keys(self):
+        new_only = {
+            *NEW_PARTICIPATION_DEFAULTS,
+            *NEW_PROACTIVE_DEFAULTS,
+            "natural_group_participation_rules",
+            "proactive_initiation_rules",
+            "natural_group_participation_allowlist",
+        }
+        legacy = {
+            key: field["default"]
+            for section in self.schema.values()
+            for key, field in section["items"].items()
+            if key not in new_only
+        }
+        legacy["ambient_participation_rules"] = "旧自然规则"
+        legacy["quiet_topic_rules"] = "旧冷场规则"
+
+        migrated = migrate(legacy)
+
         self.assertEqual(
-            migrated["meme_settings"]["meme_complement_cadence_turns"],
-            1,
+            migrated["participation_settings"][
+                "natural_group_participation_rules"
+            ],
+            "旧自然规则",
         )
         self.assertEqual(
-            migrated["meme_settings"]["meme_complement_cooldown_turns"],
-            1,
+            migrated["proactive_settings"]["proactive_initiation_rules"],
+            "旧冷场规则",
         )
+        self.assertNotIn("ambient_participation_rules", migrated)
+        self.assertNotIn("quiet_topic_rules", migrated)
+
+    def test_grouped_v0524_config_adds_new_proactive_minimum(self):
+        grouped = {
+            group: {
+                key: self.schema[group]["items"][key]["default"]
+                for key in keys
+                if key
+                not in {
+                    "natural_group_participation_rules",
+                    "proactive_initiation_rules",
+                    "proactive_min_bubbles",
+                }
+            }
+            for group, keys in GROUPS.items()
+        }
+
+        migrated = migrate(grouped)
+
+        self.assertEqual(sum(map(len, migrated.values())), 57)
+        self.assertEqual(
+            migrated["proactive_settings"]["proactive_min_bubbles"],
+            2,
+        )
+        self.assertIn(
+            "普通成员",
+            migrated["participation_settings"][
+                "natural_group_participation_rules"
+            ],
+        )
+        self.assertIn(
+            "没有可靠",
+            migrated["proactive_settings"]["proactive_initiation_rules"],
+        )
+
+    def test_grouped_config_drops_only_the_deprecated_shio_meme_owner(self):
+        grouped = {
+            group: {
+                key: self.schema[group]["items"][key]["default"]
+                for key in keys
+            }
+            for group, keys in GROUPS.items()
+        }
+        grouped["meme_settings"] = {
+            "meme_complement_enabled": False,
+            "meme_complement_cadence_turns": 7,
+            "meme_complement_cooldown_turns": 9,
+        }
+
+        migrated = migrate(grouped)
+
+        self.assertNotIn("meme_settings", migrated)
+        self.assertEqual(tuple(migrated), tuple(GROUPS))
+        self.assertEqual(sum(map(len, migrated.values())), 57)
 
     def test_runtime_reads_grouped_config_first_and_keeps_flat_fallback(self):
         with tempfile.TemporaryDirectory() as root:

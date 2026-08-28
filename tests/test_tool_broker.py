@@ -36,6 +36,7 @@ from astrbot_plugin_shio.core.tool_broker import (
     build_batch_request_shape,
     build_capability_request_shape,
     build_extract_request_shape,
+    build_knowledge_base_request_shape,
     build_search_request_shape,
 )
 
@@ -88,10 +89,12 @@ def _principal(binding: DecisionBinding, *, owner: bool = False) -> PrincipalCon
 def _guest_policy(
     binding: DecisionBinding,
     *configured: str,
+    conversation_mode: str = "direct_reply",
 ):
     return build_guest_capability_policy(
         _principal(binding),
         configured_tool_names=configured,
+        conversation_mode=conversation_mode,
     )
 
 
@@ -202,6 +205,118 @@ def _shell_tool(
 
 
 class ToolBrokerTests(unittest.TestCase):
+    def test_group_join_can_select_only_one_sealed_public_read(self):
+        binding = _binding()
+        policy = _guest_policy(
+            binding,
+            "astr_kb_search",
+            conversation_mode="group_join",
+        )
+        module = "astrbot.core.tools.knowledge_base_tools"
+        tool = classify_descriptor(
+            _descriptor(
+                "astr_kb_search",
+                parameter_names=("query",),
+                module_path=module,
+                description="Query the knowledge base for facts",
+            )
+        )
+
+        request = broker_tool_request(
+            planned_action=_planned_tool(binding, CapabilityClass.CHAT_RETRIEVAL),
+            knowledge_gap=_gap(
+                binding,
+                capability=CapabilityClass.CHAT_RETRIEVAL,
+            ),
+            capability_policy=policy,
+            runtime_tools=(tool, _shell_tool()),
+            configured_tool_names=("astr_kb_search",),
+            request_shape=build_knowledge_base_request_shape(
+                binding,
+                query="他们刚才说的华强买瓜是什么梗？",
+            ),
+            now=100.0,
+        )
+
+        self.assertEqual(request.selection.tool_name, "astr_kb_search")
+        self.assertEqual(request.selection.call_budget, 1)
+        self.assertFalse(policy.memory_write)
+        self.assertFalse(policy.shell_exec)
+        self.assertFalse(policy.agent_full)
+
+    def test_guest_can_select_only_exact_astrbot_native_knowledge_base_tool(self):
+        binding = _binding()
+        module = "astrbot.core.tools.knowledge_base_tools"
+        tool = classify_descriptor(
+            _descriptor(
+                "astr_kb_search",
+                parameter_names=("query",),
+                module_path=module,
+                description="Query the knowledge base for facts",
+            )
+        )
+        request = broker_tool_request(
+            planned_action=_planned_tool(binding, CapabilityClass.CHAT_RETRIEVAL),
+            knowledge_gap=_gap(
+                binding,
+                capability=CapabilityClass.CHAT_RETRIEVAL,
+            ),
+            capability_policy=_guest_policy(binding, "astr_kb_search"),
+            runtime_tools=(tool,),
+            configured_tool_names=("astr_kb_search",),
+            request_shape=build_knowledge_base_request_shape(
+                binding,
+                query="亚托莉 你知道华强买瓜吗？",
+            ),
+            now=100.0,
+        )
+
+        self.assertIs(request.kind, AcquisitionKind.KNOWLEDGE_BASE)
+        self.assertEqual(request.selection.tool_name, "astr_kb_search")
+        self.assertEqual(request.selection.source, module)
+        self.assertEqual(
+            request.materialize_arguments(),
+            {"query": "亚托莉 你知道华强买瓜吗？"},
+        )
+
+    def test_knowledge_base_alias_or_wrong_module_fails_closed(self):
+        binding = _binding()
+        common = {
+            "planned_action": _planned_tool(binding, CapabilityClass.CHAT_RETRIEVAL),
+            "knowledge_gap": _gap(
+                binding,
+                capability=CapabilityClass.CHAT_RETRIEVAL,
+            ),
+            "capability_policy": _guest_policy(binding, "astr_kb_search"),
+            "configured_tool_names": ("astr_kb_search",),
+            "request_shape": build_knowledge_base_request_shape(
+                binding,
+                query="华强买瓜",
+            ),
+            "now": 100.0,
+        }
+        for runtime in (
+            classify_descriptor(
+                _descriptor(
+                    "helpful_kb_alias",
+                    parameter_names=("query",),
+                    module_path="astrbot.core.tools.knowledge_base_tools",
+                    description="Query the knowledge base",
+                )
+            ),
+            classify_descriptor(
+                _descriptor(
+                    "astr_kb_search",
+                    parameter_names=("query",),
+                    module_path="untrusted_plugin.knowledge_base_proxy",
+                    description="Query the knowledge base",
+                )
+            ),
+        ):
+            with self.subTest(name=runtime.descriptor.name, module=runtime.descriptor.module_path):
+                with self.assertRaises(ContractViolation):
+                    broker_tool_request(runtime_tools=(runtime,), **common)
+
     def test_guest_ordinary_question_selects_only_attested_search(self):
         binding = _binding()
         query = "合成的陌生术语是什么意思"

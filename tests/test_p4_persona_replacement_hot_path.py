@@ -25,6 +25,16 @@ except ModuleNotFoundError:
     )
 
 
+def _system_sections(system_prompt: str) -> tuple[str, str, str]:
+    common, remainder = system_prompt.split(
+        "[角色人格与表达｜可信配置]", 1
+    )
+    persona, capability = remainder.split(
+        "[本轮真实能力｜代码生成]", 1
+    )
+    return common, persona, capability
+
+
 class P4PersonaReplacementHotPathTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -86,20 +96,25 @@ class P4PersonaReplacementHotPathTests(unittest.IsolatedAsyncioTestCase):
                 atri.planned_action.action.reply_target,
             )
             self.assertEqual(request.capability_policy, atri.capability_policy)
-            self.assertEqual(request.system_prompt, atri.system_prompt)
-            self.assertEqual(request.call_budget, atri.call_budget)
-            self.assertEqual(
-                request.user_prompt.split("[人格与表达]", 1)[0],
-                atri.user_prompt.split("[人格与表达]", 1)[0],
+            request_common, _request_persona, request_capability = _system_sections(
+                request.system_prompt
             )
+            atri_common, _atri_persona, atri_capability = _system_sections(
+                atri.system_prompt
+            )
+            self.assertEqual(request_common, atri_common)
+            self.assertEqual(request_capability, atri_capability)
+            self.assertEqual(request.call_budget, atri.call_budget)
+            self.assertEqual(request.user_prompt, atri.user_prompt)
 
         persona_sections = tuple(
-            request.user_prompt.split("[人格与表达]", 1)[1]
+            _system_sections(request.system_prompt)[1]
             for request in requests
         )
         self.assertEqual(len(set(persona_sections)), 3)
-        self.assertNotIn("亚托莉", neutral.user_prompt)
-        self.assertNotIn("苏澄", neutral.user_prompt)
+        neutral_persona = _system_sections(neutral.system_prompt)[1]
+        self.assertNotIn("亚托莉", neutral_persona)
+        self.assertNotIn("苏澄", neutral_persona)
 
     def test_hot_path_has_no_persona_specific_branch(self):
         source = Path(main.__file__).read_text(encoding="utf-8")

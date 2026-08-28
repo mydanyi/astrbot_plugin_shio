@@ -10,6 +10,7 @@ from astrbot_plugin_shio.core.proactive_policy import (
     ProactivePolicyConfig,
     ProactivePolicyDecisionKind,
     ProactivePolicyState,
+    ProactivePolicyTerminalKind,
 )
 from astrbot_plugin_shio.core.proactive_trigger import ProactiveTriggerAuthority
 try:
@@ -111,9 +112,24 @@ class ProactivePolicyTests(unittest.TestCase):
                 now=1070.0,
             )
             self.assertTrue(admitted.admitted)
+            state.record_terminal(
+                admitted,
+                ProactivePolicyTerminalKind.SENT,
+                now=1070.0,
+                topic_digest="1" * 64,
+                final_text_digest="2" * 64,
+            )
+            self.assertTrue(
+                state.observe_group_activity(
+                    platform_id="platform-a",
+                    bot_id="bot-a",
+                    group_id="group-a",
+                    observed_at=1071.0,
+                )
+            )
             cooldown = state.evaluate(
-                self._candidate(authority, observed_at=1080.0),
-                now=1080.0,
+                self._candidate(authority, observed_at=1135.0),
+                now=1135.0,
             )
             self.assertIs(cooldown.kind, ProactivePolicyDecisionKind.COOLDOWN_ACTIVE)
 
@@ -122,6 +138,21 @@ class ProactivePolicyTests(unittest.TestCase):
                 now=1180.0,
             )
             self.assertTrue(second.admitted)
+            state.record_terminal(
+                second,
+                ProactivePolicyTerminalKind.SENT,
+                now=1180.0,
+                topic_digest="3" * 64,
+                final_text_digest="4" * 64,
+            )
+            self.assertTrue(
+                state.observe_group_activity(
+                    platform_id="platform-a",
+                    bot_id="bot-a",
+                    group_id="group-a",
+                    observed_at=1181.0,
+                )
+            )
             limited = state.evaluate(
                 self._candidate(authority, observed_at=1300.0),
                 now=1300.0,
@@ -191,6 +222,63 @@ class ProactivePolicyTests(unittest.TestCase):
                 },
             )
 
+    def test_stale_hot_reload_instance_cannot_erase_sent_cooldown(self):
+        """A second live plugin object must merge, not overwrite, terminal state."""
+
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            policy = self._enabled_policy(
+                observation_seconds=0,
+                idle_seconds=0,
+                cooldown_seconds=300,
+            )
+            first_authority = ProactiveTriggerAuthority()
+            first = ProactivePolicyState(
+                root_path,
+                trigger_authority=first_authority,
+                policy=policy,
+            )
+            stale = ProactivePolicyState(
+                root_path,
+                trigger_authority=ProactiveTriggerAuthority(),
+                policy=policy,
+            )
+            decision = first.evaluate(
+                self._candidate(first_authority, observed_at=1000.0),
+                now=1000.0,
+            )
+            self.assertTrue(decision.admitted)
+            first.record_terminal(
+                decision,
+                ProactivePolicyTerminalKind.SENT,
+                now=1000.0,
+                topic_digest="5" * 64,
+                final_text_digest="6" * 64,
+            )
+
+            self.assertTrue(
+                stale.observe_group_activity(
+                    platform_id="platform-a",
+                    bot_id="bot-a",
+                    group_id="group-a",
+                    observed_at=1001.0,
+                )
+            )
+            reopened_authority = ProactiveTriggerAuthority()
+            reopened = ProactivePolicyState(
+                root_path,
+                trigger_authority=reopened_authority,
+                policy=policy,
+            )
+            within_cooldown = reopened.evaluate(
+                self._candidate(reopened_authority, observed_at=1100.0),
+                now=1100.0,
+            )
+            self.assertIs(
+                within_cooldown.kind,
+                ProactivePolicyDecisionKind.COOLDOWN_ACTIVE,
+            )
+
     def test_stale_generation_and_missing_or_changed_secret_fail_closed(self):
         with tempfile.TemporaryDirectory() as root:
             root_path = Path(root)
@@ -250,7 +338,48 @@ class ProactivePolicyTests(unittest.TestCase):
             self.assertNotIn("bot-a", rendered)
             self.assertNotIn("sender", rendered.casefold())
             payload = json.loads(rendered)
-            self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["schema_version"], 3)
+
+    def test_repeat_digests_are_bounded_and_isolated_per_group(self):
+        with tempfile.TemporaryDirectory() as root:
+            authority = ProactiveTriggerAuthority()
+            state = ProactivePolicyState(
+                Path(root),
+                trigger_authority=authority,
+                policy=self._enabled_policy(
+                    group_allowlist=("group-a", "group-b"),
+                    observation_seconds=0,
+                    idle_seconds=0,
+                ),
+            )
+            decision = state.evaluate(
+                self._candidate(authority, group_id="group-a"),
+                now=1000.0,
+            )
+            state.record_terminal(
+                decision,
+                ProactivePolicyTerminalKind.SENT,
+                now=1000.0,
+                topic_digest="a" * 64,
+                final_text_digest="b" * 64,
+            )
+
+            self.assertEqual(
+                state.recent_delivery_digests(
+                    platform_id="platform-a",
+                    bot_id="bot-a",
+                    group_id="group-a",
+                ),
+                (("a" * 64,), ("b" * 64,)),
+            )
+            self.assertEqual(
+                state.recent_delivery_digests(
+                    platform_id="platform-a",
+                    bot_id="bot-a",
+                    group_id="group-b",
+                ),
+                ((), ()),
+            )
 
     def test_corrupt_state_and_atomic_write_failure_fail_closed(self):
         with tempfile.TemporaryDirectory() as root:

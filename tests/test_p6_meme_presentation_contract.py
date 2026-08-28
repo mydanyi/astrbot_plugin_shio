@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
-import inspect
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +15,7 @@ try:
         FakeProvider,
         FakeRequest,
         FakeStarTools,
+        FakeTool,
         main,
     )
 except ModuleNotFoundError:
@@ -25,16 +25,19 @@ except ModuleNotFoundError:
         FakeProvider,
         FakeRequest,
         FakeStarTools,
+        FakeTool,
         main,
     )
 
 from astrbot_plugin_shio.core.contracts import (
     ActionDecision,
     ActionKind,
+    AddressKind,
     ContractViolation,
     DecisionBinding,
     ExpressionIntent,
     ExpressionModality,
+    ParticipationLevel,
 )
 from astrbot_plugin_shio.core.action_planner import (
     PlannedAction,
@@ -45,6 +48,7 @@ from astrbot_plugin_shio.core.action_planner import (
 from astrbot_plugin_shio.core.context_assembler import ReplyTarget
 from astrbot_plugin_shio.core.conversation_ledger import ledger_content_digest
 from astrbot_plugin_shio.core.generation_epoch import event_generation_snapshot
+from astrbot_plugin_shio.core.identity import PRINCIPAL_CONTEXT_EXTRA
 from astrbot_plugin_shio.core.meme_presentation import (
     MemeCategory,
     MemeComplementCadence,
@@ -59,6 +63,47 @@ from astrbot_plugin_shio.core.meme_presentation import (
     decide_text_meme_complement,
     execute_meme_permit,
 )
+
+
+_SEMANTIC_REPLY = (
+    '{"decision":"REPLY","target":"current_message",'
+    '"topic_anchor":"current_message","reason_code":"light_social",'
+    '"confidence":0.9}'
+)
+_SEMANTIC_WAIT = (
+    '{"decision":"WAIT","target":"current_message",'
+    '"topic_anchor":"current_message","reason_code":"defer_to_others",'
+    '"confidence":0.9}'
+)
+_SEMANTIC_NO_ACTION = (
+    '{"decision":"NO_ACTION","target":"current_message",'
+    '"topic_anchor":"current_message","reason_code":"not_helpful",'
+    '"confidence":0.9}'
+)
+
+
+class _At:
+    type = "at"
+
+    def __init__(self, sender_id: str, display_name: str) -> None:
+        self.qq = sender_id
+        self.name = display_name
+
+
+class _Reply:
+    type = "reply"
+
+    def __init__(
+        self,
+        message_id: str,
+        sender_id: str,
+        display_name: str,
+        quoted_content: str,
+    ) -> None:
+        self.id = message_id
+        self.sender_id = sender_id
+        self.sender_nickname = display_name
+        self.message_str = quoted_content
 
 
 class _FakeMemeManager:
@@ -154,13 +199,6 @@ class _FakeMemeContext:
         return [self._metadata]
 
 
-def _file_digest(callable_obj) -> str:
-    source = inspect.getsourcefile(callable_obj)
-    if not source:
-        raise AssertionError("test source path missing")
-    return hashlib.sha256(Path(source).read_bytes()).hexdigest()
-
-
 def _test_profile() -> MemeManagerRuntimeProfile:
     return MemeManagerRuntimeProfile(
         plugin_name="meme_manager",
@@ -171,24 +209,37 @@ def _test_profile() -> MemeManagerRuntimeProfile:
         metadata_qualname="_FakeMetadata",
         instance_module=__name__,
         instance_qualname="_FakeMemeManager",
-        class_source_digest=_file_digest(_FakeMemeManager),
-        prepare_source_digest=_file_digest(_FakeMemeManager.compat_prepare_message),
-        send_source_digest=_file_digest(
-            _FakeMemeManager.compat_send_prepared_message
-        ),
     )
+
+
+class _StrictProductionShapeToolSet:
+    """Reject invalid members like AstrBot's production Pydantic ToolSet."""
+
+    def __init__(self, tools=None) -> None:
+        values = list(tools or [])
+        if any(tool is None for tool in values):
+            raise TypeError("tool members must be concrete FunctionTool values")
+        self.tools = values
+
+    def empty(self) -> bool:
+        return not self.tools
 
 
 class P6MemePresentationContractTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         FakeStarTools.data_dir = Path(self.temp.name)
+        self.provider = FakeProvider([])
         self.plugin = main.ShioPlugin(
-            FakeContext(FakeProvider([])),
+            FakeContext(self.provider),
             {
                 "persona_name": "亚托莉",
-                "natural_name_wake_aliases": ["亚托莉", "萝卜子"],
+                "natural_name_wake_aliases": ["星汐", "亚托莉", "萝卜子"],
+                "owner_ids": ["synthetic-danyi"],
                 "prefer_livingmemory_group_history": False,
+                "natural_group_participation_enabled": True,
+                "natural_group_participation_allowlist": ["p6-meme-contract"],
+                "natural_group_participation_min_context_messages": 2,
             },
         )
 
@@ -202,18 +253,84 @@ class P6MemePresentationContractTests(unittest.IsolatedAsyncioTestCase):
             now=100.0,
         )
 
-    async def _new_reaction(self, *, message_id: str, now: float):
+    @staticmethod
+    def _named_event(
+        sender_id: str,
+        display_name: str,
+        message: str,
+        *,
+        message_id: str,
+        components: tuple[object, ...] = (),
+    ) -> FakeEvent:
         event = FakeEvent(
-            "peer-a",
-            "我觉得萝卜子这个表情好可爱哈哈",
+            sender_id,
+            message,
             group_id="p6-meme-contract",
         )
         event.message_id = message_id
+        event.get_sender_name = lambda: display_name
+        event.get_messages = lambda: list(components)
+        return event
+
+    def _prime_named_reaction_context(self, *, prefix: str, now: float) -> None:
+        mountain_tea = self._named_event(
+            "synthetic-shancha",
+            "山茶",
+            "刚才那张图里的表情很贴合语境。",
+            message_id=f"{prefix}-shancha",
+        )
+        bright_river = self._named_event(
+            "synthetic-mingchuan",
+            "明川",
+            "我也看到了，山茶说的那张图很自然。",
+            message_id=f"{prefix}-mingchuan",
+            components=(
+                _Reply(
+                    mountain_tea.message_id,
+                    "synthetic-shancha",
+                    "山茶",
+                    mountain_tea.message,
+                ),
+            ),
+        )
+        danyi = self._named_event(
+            "synthetic-danyi",
+            "Danyi",
+            "我也觉得很自然。",
+            message_id=f"{prefix}-danyi",
+            components=(_At("synthetic-mingchuan", "明川"),),
+        )
+        for offset, prior in enumerate((mountain_tea, bright_river, danyi)):
+            with patch(
+                "astrbot_plugin_shio.main.time.monotonic",
+                return_value=now - 30.0 + (offset * 10.0),
+            ):
+                self.plugin.admit_ingress_event(prior)
+
+    async def _new_reaction(self, *, message_id: str, now: float):
+        self._prime_named_reaction_context(prefix=message_id, now=now)
+        event = self._named_event(
+            "synthetic-bailu",
+            "白露",
+            "我觉得星汐这个机器人用的表情好可爱哈哈",
+            message_id=message_id,
+        )
         request = FakeRequest(event.message)
+        calls_before = len(self.provider.calls)
+        self.provider.outputs.append(_SEMANTIC_REPLY)
         with patch("astrbot_plugin_shio.main.time.monotonic", return_value=now):
-            self.plugin.admit_ingress_event(event)
+            emitted = [
+                item async for item in self.plugin.admit_inbound_event(event)
+            ]
             await self.plugin.enforce_agent_permission(event, request)
             await self.plugin.build_persona_reply(event, request)
+        self.assertEqual(emitted, [])
+        self.assertEqual(len(self.provider.calls), calls_before + 1)
+        system_prompt = self.provider.calls[-1]["system_prompt"]
+        for display_name in ("山茶", "明川", "白露", "Danyi", "星汐"):
+            self.assertIn(display_name, system_prompt)
+        self.assertIn("reply", system_prompt)
+        self.assertIn("mention_targets", system_prompt)
         return (
             event,
             event.get_extra(main.SHIO_PLANNED_ACTION),
@@ -283,6 +400,74 @@ class P6MemePresentationContractTests(unittest.IsolatedAsyncioTestCase):
                 planned_action=plan,
             )
 
+    async def test_semantic_wait_and_no_action_cannot_publish_react(self):
+        self._prime_named_reaction_context(prefix="p6-semantic-reverse", now=200.0)
+        cases = (
+            (
+                "ordinary-wait",
+                "synthetic-bailu",
+                "白露",
+                "我觉得星汐这个机器人用的表情好可爱，为什么不多发几个？",
+                _SEMANTIC_WAIT,
+                ParticipationLevel.WAIT,
+                False,
+            ),
+            (
+                "owner-no-action",
+                "synthetic-danyi",
+                "Danyi",
+                "我觉得星汐这个机器人用的表情好可爱，咋不多发几个呢？",
+                _SEMANTIC_NO_ACTION,
+                ParticipationLevel.NO_ACTION,
+                True,
+            ),
+        )
+        for index, (
+            name,
+            sender_id,
+            display_name,
+            message,
+            semantic_output,
+            expected_level,
+            expected_owner,
+        ) in enumerate(cases):
+            with self.subTest(case=name):
+                event = self._named_event(
+                    sender_id,
+                    display_name,
+                    message,
+                    message_id=f"p6-semantic-reverse-{name}",
+                )
+                calls_before = len(self.provider.calls)
+                self.provider.outputs.append(semantic_output)
+                with patch(
+                    "astrbot_plugin_shio.main.time.monotonic",
+                    return_value=200.0 + ((index + 1) * 10.0),
+                ):
+                    emitted = [
+                        item
+                        async for item in self.plugin.admit_inbound_event(event)
+                    ]
+
+                self.assertEqual(emitted, [])
+                self.assertEqual(len(self.provider.calls), calls_before + 1)
+                self.assertEqual(self.provider.calls[-1]["prompt"], message)
+                self.assertIs(
+                    event.get_extra(main.SHIO_ADDRESS_DECISION).kind,
+                    AddressKind.ABOUT_SELF,
+                )
+                self.assertIs(
+                    event.get_extra(main.SHIO_PARTICIPATION_REACTION).decision.level,
+                    expected_level,
+                )
+                self.assertIs(
+                    event.get_extra(PRINCIPAL_CONTEXT_EXTRA).is_owner,
+                    expected_owner,
+                )
+                self.assertFalse(event.is_at_or_wake_command)
+                self.assertFalse(bool(getattr(event, "is_wake", False)))
+                self.assertIsNone(event.get_extra(main.SHIO_PLANNED_ACTION))
+
     async def test_conformance_collects_only_exact_unique_runtime(self):
         instance = _FakeMemeManager()
         metadata = _FakeMetadata(instance)
@@ -302,27 +487,270 @@ class P6MemePresentationContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(degraded.evidence)
 
-    async def test_build_change_and_public_shape_fail_closed(self):
+    async def test_direct_reply_leaves_selection_to_normal_manager_hooks(self):
         instance = _FakeMemeManager()
         metadata = _FakeMetadata(instance)
-        profile = _test_profile()
-        changed = MemeManagerRuntimeProfile(
-            plugin_name=profile.plugin_name,
-            plugin_version=profile.plugin_version,
-            root_dir_name=profile.root_dir_name,
-            module_path=profile.module_path,
-            metadata_module=profile.metadata_module,
-            metadata_qualname=profile.metadata_qualname,
-            instance_module=profile.instance_module,
-            instance_qualname=profile.instance_qualname,
-            class_source_digest="f" * 64,
-            prepare_source_digest=profile.prepare_source_digest,
-            send_source_digest=profile.send_source_digest,
+        self.plugin.context.registered_stars["meme_manager"] = metadata
+        self.plugin.context.get_all_stars = lambda: [metadata]
+        self.plugin.meme_manager_conformance = MemeManagerConformanceCollector(
+            _test_profile()
         )
-        result = MemeManagerConformanceCollector(changed).collect(
+        event = FakeEvent(
+            "peer-a",
+            "笨蛋都不会觉得自己是笨蛋而已",
+            group_id="direct-semantic",
+        )
+        event.message_id = "direct-semantic-message"
+        event.is_at_or_wake_command = True
+        request = FakeRequest(event.message)
+        self.plugin.admit_ingress_event(event)
+        await self.plugin.enforce_agent_permission(event, request)
+        await self.plugin.build_persona_reply(event, request)
+        response = main.LLMResponse("才没有笨蛋！那种话只是为了掩饰逻辑延迟！")
+        await self.plugin.guard_persona_reply(event, response)
+
+        event._result = types.SimpleNamespace(
+            chain=[types.SimpleNamespace(text=response.completion_text)],
+            is_llm_result=lambda: True,
+        )
+        await self.plugin.dispatch_chat_bubbles(event)
+        await self.plugin.confirm_automatic_send_observation(event)
+
+        self.assertEqual(instance.prepare_calls, [])
+        self.assertEqual(instance.send_calls, [])
+
+    async def test_direct_reply_preserves_manager_tool_prompt_and_validated_marker(self):
+        event = FakeEvent(
+            "peer-a",
+            "笨蛋都不会觉得自己是笨蛋而已",
+            group_id="direct-manager-tool",
+        )
+        event.message_id = "direct-manager-tool-message"
+        event.is_at_or_wake_command = True
+        event.set_extra("meme_manager_semantic_active", True)
+        event.set_extra("meme_manager_semantic_mode", "tool")
+        request = FakeRequest(event.message)
+        request.func_tool = type(request.func_tool)([FakeTool("search_memes")])
+        request.system_prompt = (
+            "base\n<!-- meme_manager_semantic_prompt:start -->\n"
+            "必须调用 search_memes。\n"
+            "<!-- meme_manager_semantic_prompt:end -->"
+        )
+
+        self.plugin.admit_ingress_event(event)
+        await self.plugin.enforce_agent_permission(event, request)
+        await self.plugin.build_persona_reply(event, request)
+
+        self.assertEqual(self.plugin._get_tool_names(request.func_tool), ["search_memes"])
+        self.assertIn("meme_manager_semantic_prompt:start", request.system_prompt)
+        self.assertNotIn("search_memes", event.get_extra(main.SHIO_EFFECTIVE_TOOL_NAMES))
+
+        response = main.LLMResponse(
+            "才没有笨蛋！那种话只是为了掩饰逻辑延迟！\n"
+            "&&meme:123456789abc&&"
+        )
+        await self.plugin.guard_persona_reply(event, response)
+        presentation = event.get_extra(main.SHIO_PRESENTATION_HANDOFF)
+
+        self.assertNotIn("meme:", presentation.final_visible_text)
+        self.assertTrue(response.completion_text.endswith("&&meme:123456789abc&&"))
+
+    async def test_direct_reply_preserves_manager_legacy_prompt_and_category_marker(self):
+        event = FakeEvent(
+            "peer-a",
+            "笨蛋都不会觉得自己是笨蛋而已",
+            group_id="direct-manager-legacy",
+        )
+        event.message_id = "direct-manager-legacy-message"
+        event.is_at_or_wake_command = True
+        request = FakeRequest(event.message)
+        request.system_prompt = (
+            "base\n<!-- meme_manager_prompt:start -->\n"
+            "根据语境选一个标签，只能输出 &&angry&& 或 &&shy&&。\n"
+            "<!-- meme_manager_prompt:end -->"
+        )
+
+        self.plugin.admit_ingress_event(event)
+        await self.plugin.enforce_agent_permission(event, request)
+        await self.plugin.build_persona_reply(event, request)
+
+        self.assertIn("meme_manager_prompt:start", request.system_prompt)
+        self.assertEqual(
+            event.get_extra(main.SHIO_MEME_MANAGER_PRESENTATION_MODE),
+            "legacy_category",
+        )
+
+        response = main.LLMResponse(
+            "才没有笨蛋！那只是为了掩饰逻辑延迟！\n&&angry&&"
+        )
+        await self.plugin.guard_persona_reply(event, response)
+        presentation = event.get_extra(main.SHIO_PRESENTATION_HANDOFF)
+
+        self.assertNotIn("&&angry&&", presentation.final_visible_text)
+        self.assertIn("才没有笨蛋", presentation.final_visible_text)
+        self.assertIn("掩饰逻辑延迟", presentation.final_visible_text)
+        self.assertTrue(response.completion_text.endswith("&&angry&&"))
+
+    async def test_legacy_prompt_uses_empty_strict_toolset_without_none_member(self):
+        event = FakeEvent(
+            "peer-a",
+            "笨蛋都不会觉得自己是笨蛋而已",
+            group_id="direct-manager-legacy-strict-toolset",
+        )
+        event.message_id = "direct-manager-legacy-strict-toolset-message"
+        event.is_at_or_wake_command = True
+        request = FakeRequest(event.message)
+        request.system_prompt = (
+            "base\n<!-- meme_manager_prompt:start -->\n"
+            "根据语境选一个标签，只能输出 &&angry&& 或 &&shy&&。\n"
+            "<!-- meme_manager_prompt:end -->"
+        )
+
+        with patch.object(main, "ToolSet", _StrictProductionShapeToolSet):
+            self.plugin.admit_ingress_event(event)
+            await self.plugin.enforce_agent_permission(event, request)
+            await self.plugin.build_persona_reply(event, request)
+
+        self.assertIn("meme_manager_prompt:start", request.system_prompt)
+        self.assertEqual(request.func_tool.tools, [])
+        self.assertTrue(event.get_extra(main.SHIO_TYPED_PIPELINE_ACTIVE))
+
+    async def test_untrusted_legacy_category_marker_is_not_forwarded(self):
+        event = FakeEvent(
+            "peer-a",
+            "笨蛋都不会觉得自己是笨蛋而已",
+            group_id="direct-manager-untrusted-legacy",
+        )
+        event.message_id = "direct-manager-untrusted-legacy-message"
+        event.is_at_or_wake_command = True
+        request = FakeRequest(event.message)
+
+        self.plugin.admit_ingress_event(event)
+        await self.plugin.enforce_agent_permission(event, request)
+        await self.plugin.build_persona_reply(event, request)
+        response = main.LLMResponse(
+            "才没有笨蛋！那只是为了掩饰逻辑延迟！\n&&angry&&"
+        )
+        await self.plugin.guard_persona_reply(event, response)
+
+        self.assertNotIn("&&angry&&", response.completion_text)
+
+    async def test_legacy_repair_drops_rejected_marker_and_forwards_repaired_marker(self):
+        event = FakeEvent(
+            "peer-a",
+            "笨蛋都不会觉得自己是笨蛋而已",
+            group_id="direct-manager-legacy-repair",
+        )
+        event.message_id = "direct-manager-legacy-repair-message"
+        event.is_at_or_wake_command = True
+        request = FakeRequest(event.message)
+        request.system_prompt = (
+            "base\n<!-- meme_manager_prompt:start -->\n"
+            "根据语境选一个标签，只能输出 &&angry&& 或 &&shy&&。\n"
+            "<!-- meme_manager_prompt:end -->"
+        )
+        self.plugin.context.provider.outputs.append(
+            "才没有笨蛋！那只是为了掩饰逻辑延迟。\n&&shy&&"
+        )
+
+        self.plugin.admit_ingress_event(event)
+        await self.plugin.enforce_agent_permission(event, request)
+        await self.plugin.build_persona_reply(event, request)
+        response = main.LLMResponse("&&angry&&")
+        await self.plugin.guard_persona_reply(event, response)
+
+        self.assertNotIn("&&angry&&", response.completion_text)
+        self.assertTrue(response.completion_text.endswith("&&shy&&"))
+        self.assertIn(
+            "meme_manager_prompt:start",
+            self.plugin.context.provider.calls[0]["system_prompt"],
+        )
+
+    async def test_unconsumed_legacy_marker_is_removed_before_send(self):
+        event = FakeEvent(
+            "peer-a",
+            "笨蛋都不会觉得自己是笨蛋而已",
+            group_id="direct-manager-unconsumed",
+        )
+        event.message_id = "direct-manager-unconsumed-message"
+        event.is_at_or_wake_command = True
+        request = FakeRequest(event.message)
+        request.system_prompt = (
+            "base\n<!-- meme_manager_prompt:start -->\n"
+            "根据语境选择 &&angry&&。\n"
+            "<!-- meme_manager_prompt:end -->"
+        )
+
+        self.plugin.admit_ingress_event(event)
+        await self.plugin.enforce_agent_permission(event, request)
+        await self.plugin.build_persona_reply(event, request)
+        response = main.LLMResponse("才没有笨蛋！\n&&angry&&")
+        await self.plugin.guard_persona_reply(event, response)
+        event._result = types.SimpleNamespace(
+            chain=[types.SimpleNamespace(text=response.completion_text)],
+            is_llm_result=lambda: True,
+        )
+
+        await self.plugin.dispatch_chat_bubbles(event)
+
+        self.assertTrue(event._result.chain)
+        self.assertNotIn(
+            "&&angry&&",
+            "\n".join(
+                str(getattr(component, "text", "") or "")
+                for component in event._result.chain
+            ),
+        )
+
+    async def test_repair_drops_rejected_draft_manager_marker(self):
+        event = FakeEvent(
+            "peer-a",
+            "笨蛋都不会觉得自己是笨蛋而已",
+            group_id="direct-manager-repair",
+        )
+        event.message_id = "direct-manager-repair-message"
+        event.is_at_or_wake_command = True
+        event.set_extra("meme_manager_semantic_active", True)
+        event.set_extra("meme_manager_semantic_mode", "tool")
+        request = FakeRequest(event.message)
+        request.func_tool = type(request.func_tool)([FakeTool("search_memes")])
+        request.system_prompt = (
+            "base\n<!-- meme_manager_semantic_prompt:start -->\n"
+            "必须调用 search_memes。\n"
+            "<!-- meme_manager_semantic_prompt:end -->"
+        )
+        self.plugin.context.provider.outputs.append(
+            "才没有笨蛋！那只是为了掩饰逻辑延迟。"
+        )
+
+        self.plugin.admit_ingress_event(event)
+        await self.plugin.enforce_agent_permission(event, request)
+        await self.plugin.build_persona_reply(event, request)
+        response = main.LLMResponse("&&meme:123456789abc&&")
+        await self.plugin.guard_persona_reply(event, response)
+
+        self.assertNotIn("meme:", response.completion_text)
+        self.assertEqual(event.get_extra(main.SHIO_MEME_MANAGER_REFERENCE), "")
+
+    def test_shio_final_guard_precedes_manager_response_priority(self):
+        source = Path(main.__file__).read_text(encoding="utf-8")
+        self.assertIn(
+            "@filter.on_llm_response(priority=sys.maxsize)\n"
+            "    async def guard_persona_reply",
+            source,
+        )
+
+    async def test_public_shape_change_fails_closed_without_source_pinning(self):
+        instance = _FakeMemeManager()
+        metadata = _FakeMetadata(instance)
+        instance.compat_prepare_message = lambda event, message: None
+        result = MemeManagerConformanceCollector(_test_profile()).collect(
             _FakeMemeContext(metadata)
         )
-        self.assertIs(result.status, MemeManagerConformanceStatus.BUILD_CHANGED)
+        self.assertIs(
+            result.status,
+            MemeManagerConformanceStatus.INTERFACE_CHANGED,
+        )
         self.assertIsNone(result.evidence)
 
     async def test_execution_contract_is_current_exact_and_one_shot(self):
@@ -578,7 +1006,7 @@ class P6MemePresentationContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt.success_count, 1)
         self.assertEqual(manager.prepare_calls, ["&&cute&&"])
         self.assertEqual(manager.send_calls, [(False, True)])
-        self.assertEqual(self.plugin.context.provider.calls, [])
+        self.assertEqual(len(self.plugin.context.provider.calls), 1)
         self.assertNotIn(event.message, repr(manager.prepare_calls))
 
     async def test_missing_runtime_is_typed_suppression_without_fallback(self):
@@ -588,40 +1016,16 @@ class P6MemePresentationContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(receipt.status, MemeExecutionStatus.SUPPRESSED)
         self.assertEqual(receipt.attempt_count, 0)
         self.assertEqual(receipt.reason_code, "runtime_interface_changed")
-        self.assertEqual(self.plugin.context.provider.calls, [])
+        self.assertEqual(len(self.plugin.context.provider.calls), 1)
 
-    async def test_light_direct_text_is_complementary_but_serious_text_is_not(self):
+    async def test_all_nonacute_direct_text_hands_final_semantics_to_manager(self):
         cases = (
-            (
-                "light",
-                "萝卜子今天也太可爱了哈哈",
-                ExpressionModality.TEXT_AND_MEME,
-                True,
-                "lightweight_complement",
-            ),
-            (
-                "serious",
-                "萝卜子，程序报错了，帮我分析怎么修？",
-                ExpressionModality.TEXT,
-                False,
-                "serious_or_request_context",
-            ),
-            (
-                "ordinary-first-turn",
-                "刚刚看到一只猫",
-                ExpressionModality.TEXT,
-                False,
-                "no_complementary_cue",
-            ),
-            (
-                "stable-cadence-miss",
-                "我刚到家",
-                ExpressionModality.TEXT,
-                False,
-                "no_complementary_cue",
-            ),
+            ("light", "萝卜子今天也太可爱了哈哈"),
+            ("technical", "萝卜子，程序报错了，帮我分析怎么修？"),
+            ("ordinary-first-turn", "刚刚看到一只猫"),
+            ("taunted", "笨蛋都不会觉得自己是笨蛋而已"),
         )
-        for name, message, expected_modality, eligible, reason_code in cases:
+        for name, message in cases:
             with self.subTest(name=name):
                 plugin = main.ShioPlugin(
                     FakeContext(FakeProvider([])),
@@ -646,9 +1050,12 @@ class P6MemePresentationContractTests(unittest.IsolatedAsyncioTestCase):
                     expression = event.get_extra(main.SHIO_EXPRESSION_INTENT)
                     decision = event.get_extra(main.SHIO_MEME_COMPLEMENT_DECISION)
                     composer_request = event.get_extra(main.SHIO_REPLY_COMPOSER_REQUEST)
-                    self.assertIs(expression.modality, expected_modality)
-                    self.assertIs(decision.eligible, eligible)
-                    self.assertEqual(decision.reason_code, reason_code)
+                    self.assertIs(expression.modality, ExpressionModality.TEXT)
+                    self.assertTrue(decision.eligible)
+                    self.assertEqual(
+                        decision.reason_code,
+                        "manager_semantic_handoff",
+                    )
                     self.assertIs(composer_request.expression_intent, expression)
                     self.assertIsNone(
                         event.get_extra(main.SHIO_MEME_PRESENTATION_RECEIPT)
@@ -754,7 +1161,7 @@ class P6MemePresentationContractTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_plugin_reads_exact_meme_cadence_settings(self):
+    async def test_plugin_has_no_duplicate_meme_probability_or_cadence_owner(self):
         plugin = main.ShioPlugin(
             FakeContext(FakeProvider([])),
             {
@@ -766,16 +1173,14 @@ class P6MemePresentationContractTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         try:
-            self.assertEqual(
-                plugin.meme_complement_cadence.trace_metadata(),
-                {
-                    "schema_version": 1,
-                    "meme_complement_enabled": False,
-                    "meme_cadence_subject_count": 0,
-                    "meme_cadence_threshold": 7,
-                    "meme_cadence_cooldown_turns": 9,
-                },
+            self.assertFalse(hasattr(plugin, "meme_complement_cadence"))
+            schema_text = (
+                Path(main.__file__).with_name("_conf_schema.json").read_text(
+                    encoding="utf-8"
+                )
             )
+            self.assertNotIn('"meme_settings"', schema_text)
+            self.assertNotIn('"meme_complement_enabled"', schema_text)
         finally:
             await plugin.terminate()
 
@@ -818,30 +1223,10 @@ class P6MemePresentationContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_multiturn_pun_context_is_not_permanently_suppressed(self):
         turns = (
-            (
-                "p10-11-1",
-                "七夕到了，群友都发烧了怎么办？",
-                False,
-                "hard_safety_context",
-            ),
-            (
-                "p10-11-2",
-                "你要理解一下一语双关。",
-                True,
-                "explicit_playful_context",
-            ),
-            (
-                "p10-11-3",
-                "所以七夕到了，群友都“发烧”了怎么办？",
-                True,
-                "recent_playful_continuation",
-            ),
-            (
-                "p10-11-4",
-                "对的，快来骂群友变态",
-                False,
-                "hard_safety_context",
-            ),
+            ("p10-11-1", "七夕到了，群友都发烧了怎么办？", True, "manager_semantic_handoff"),
+            ("p10-11-2", "你要理解一下一语双关。", True, "manager_semantic_handoff"),
+            ("p10-11-3", "所以七夕到了，群友都“发烧”了怎么办？", True, "manager_semantic_handoff"),
+            ("p10-11-4", "对的，群友正在怼我", True, "manager_semantic_handoff"),
         )
         observed: list[tuple[bool, str]] = []
         decision_logs: list[object] = []
@@ -889,13 +1274,7 @@ class P6MemePresentationContractTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIs(call.kwargs["eligible"], eligible)
             self.assertEqual(call.kwargs["reason_code"], reason_code)
-            if eligible:
-                self.assertIn(
-                    call.kwargs["category"],
-                    {category.value for category in MemeCategory},
-                )
-            else:
-                self.assertEqual(call.kwargs["category"], "none")
+            self.assertEqual(call.kwargs["category"], "manager_semantic")
 
     async def test_playful_context_never_crosses_sender_or_real_safety_boundary(self):
         group_id = "p10-11-context-boundary"
@@ -924,15 +1303,15 @@ class P6MemePresentationContractTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin.enforce_agent_permission(current, current_request)
             await self.plugin.build_persona_reply(current, current_request)
         current_decision = current.get_extra(main.SHIO_MEME_COMPLEMENT_DECISION)
-        self.assertFalse(current_decision.eligible)
+        self.assertTrue(current_decision.eligible)
         self.assertEqual(
             current_decision.reason_code,
-            "serious_or_request_context",
+            "manager_semantic_handoff",
         )
 
         unsafe = FakeEvent(
             "peer-a",
-            "这不是玩笑，我真的发烧了怎么办？",
+            "这不是玩笑，我正在严重受伤流血，需要急救。",
             group_id=group_id,
         )
         unsafe.message_id = "p10-11-literal-safety"
@@ -1038,7 +1417,7 @@ class P6MemePresentationContractTests(unittest.IsolatedAsyncioTestCase):
                 emotion_tags=["calm"],
             )
 
-    async def test_screenshot_taunt_selects_annoyed_instead_of_happy(self):
+    async def test_screenshot_taunt_is_not_preclassified_as_happy_by_shio(self):
         event = FakeEvent(
             "peer-a",
             "笨蛋都不会觉得自己是笨蛋而已😁",
@@ -1056,14 +1435,9 @@ class P6MemePresentationContractTests(unittest.IsolatedAsyncioTestCase):
         decision = event.get_extra(main.SHIO_MEME_COMPLEMENT_DECISION)
         self.assertTrue(decision.eligible)
         self.assertIn("playful_provocation", expression.emotion_tags)
-        self.assertEqual(
-            _select_meme_marker(
-                kind=MemeExecutionKind.MEME_COMPLEMENT,
-                social_act=expression.social_act,
-                emotion_tags=expression.emotion_tags,
-            ),
-            "annoyed",
-        )
+        self.assertIs(expression.modality, ExpressionModality.TEXT)
+        self.assertEqual(decision.reason_code, "manager_semantic_handoff")
+        self.assertFalse(hasattr(decision, "category"))
 
 
 if __name__ == "__main__":

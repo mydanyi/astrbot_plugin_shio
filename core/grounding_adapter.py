@@ -11,7 +11,11 @@ from typing import Any, Iterable
 
 from .capability_policy import CapabilityClass, SideEffectClass
 from .contracts import ContractViolation, DecisionBinding, GroundingFact
-from .tool_broker import AcquisitionRequest, DEFAULT_ACQUISITION_TIMEOUT_S
+from .tool_broker import (
+    AcquisitionKind,
+    AcquisitionRequest,
+    DEFAULT_ACQUISITION_TIMEOUT_S,
+)
 from .tool_result import TypedToolResult, ToolResultVisibility
 
 
@@ -60,6 +64,24 @@ _TOKEN_RE = re.compile(
 )
 _JSON_KEY_RE = re.compile(r'"(?:arguments|tool_calls?|function|api_key|token)"\s*:?', re.IGNORECASE)
 _WHITESPACE_RE = re.compile(r"\s+")
+_RELEVANCE_ASCII_RE = re.compile(r"[a-z][a-z0-9_.+-]{1,31}|\d{4,}", re.I)
+_RELEVANCE_CJK_RE = re.compile(r"[\u4e00-\u9fff]{2,}")
+_RELEVANCE_STOP_RE = re.compile(
+    r"(?:请(?:你)?|帮我|麻烦(?:你)?|劳驾(?:你)?|让我|联网|上网|"
+    r"(?:你|妳|您)?(?:知道|了解|听说过)|"
+    r"查证|核实|验证|搜索一下|搜一下|查一下|查查|查资料|"
+    r"检查一下|排查一下|自查一下|看看|有没有|是否|是不是|"
+    r"网络黑话|网络用语|黑话|挺有意思|有意思|"
+    r"是什么意思|是什么|为什么|怎么|如何|多少|这个|那个|这条|"
+    r"一下|的|吗|嘛|么)"
+)
+_RELEVANCE_EQUIVALENTS = (
+    (re.compile(r"(?:明日)"), "明天"),
+    (re.compile(r"(?:今日)"), "今天"),
+    (re.compile(r"(?:降雨|有雨|下雨|雨天)"), "天气"),
+    (re.compile(r"(?:价钱|售价|多少钱)"), "价格"),
+    (re.compile(r"(?:发布日期|发布日|发售时间|上市时间)"), "发布时间"),
+)
 
 
 class EvidenceOutcomeKind(str, Enum):
@@ -81,6 +103,7 @@ class EvidenceOutcomeKind(str, Enum):
     UNSAFE_CONTENT = "unsafe_content"
     INVALID_RESULT = "invalid_result"
     MULTIPLE_RESULTS = "multiple_results"
+    IRRELEVANT_RESULT = "irrelevant_result"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -240,6 +263,72 @@ def _safe_claims(content: str) -> tuple[str, ...]:
         if len(claims) >= MAX_GROUNDING_FACTS:
             break
     return tuple(claims)
+
+
+def _normalize_relevance_text(value: str) -> str:
+    text = html.unescape(str(value or "")).casefold()
+    for pattern, replacement in _RELEVANCE_EQUIVALENTS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _query_relevance_terms(value: str) -> tuple[frozenset[str], frozenset[str]]:
+    """Return bounded lexical anchors without logging or persisting the query."""
+
+    text = _normalize_relevance_text(value)
+    ascii_terms = frozenset(_RELEVANCE_ASCII_RE.findall(text))
+    stripped = _RELEVANCE_STOP_RE.sub(" ", text)
+    bigrams: set[str] = set()
+    strong: set[str] = set()
+    for chunk in _RELEVANCE_CJK_RE.findall(stripped):
+        if len(chunk) <= 12 and len(chunk) >= 3:
+            strong.add(chunk)
+        if len(chunk) == 2:
+            bigrams.add(chunk)
+            continue
+        for index in range(len(chunk) - 1):
+            bigrams.add(chunk[index : index + 2])
+        for index in range(len(chunk) - 2):
+            strong.add(chunk[index : index + 3])
+    return frozenset((*ascii_terms, *strong)), frozenset(bigrams)
+
+
+def _claims_relevant_to_query(query: str, claims: tuple[str, ...]) -> bool:
+    candidate = _WHITESPACE_RE.sub(
+        "",
+        _normalize_relevance_text("\n".join(claims)),
+    )
+    strong, bigrams = _query_relevance_terms(query)
+    if not strong and not bigrams:
+        return False
+    if any(term in candidate for term in strong):
+        return True
+    matched_bigrams = sum(term in candidate for term in bigrams)
+    minimum = 1 if len(bigrams) <= 2 else 2
+    return matched_bigrams >= minimum
+
+
+def _claims_relevant_to_request(
+    request: AcquisitionRequest,
+    claims: tuple[str, ...],
+) -> bool:
+    # Exact URL extraction is already bound to the requested URL and cannot be
+    # judged by lexical overlap between that URL and its page content.
+    if request.kind is AcquisitionKind.EXTRACT:
+        return True
+    arguments = request.materialize_arguments()
+    queries: tuple[str, ...]
+    if request.kind is AcquisitionKind.BATCH_SEARCH:
+        queries = tuple(
+            str(item.get("query", "") or "")
+            for item in arguments.get("queries", ())
+            if isinstance(item, dict)
+        )
+    elif request.kind in {AcquisitionKind.SEARCH, AcquisitionKind.KNOWLEDGE_BASE}:
+        queries = (str(arguments.get("query", "") or ""),)
+    else:
+        return True
+    return any(_claims_relevant_to_query(query, claims) for query in queries if query)
 
 
 def _source_kind(result: TypedToolResult) -> str:
@@ -456,6 +545,12 @@ def adapt_grounding_evidence(
     claims = _safe_claims(result.content)
     if not claims:
         return _outcome(request, EvidenceOutcomeKind.UNSAFE_CONTENT, result_count=count)
+    if not _claims_relevant_to_request(request, claims):
+        return _outcome(
+            request,
+            EvidenceOutcomeKind.IRRELEVANT_RESULT,
+            result_count=count,
+        )
     facts = _facts(request, result, claims)
     return _outcome(
         request,

@@ -40,6 +40,7 @@ _UNSAFE_MEMORY_SOURCES = {
 class MemoryDecision:
     binding: DecisionBinding
     mode: MemoryMode
+    current_account_key: str = ""
     selected_facts: tuple[ProvenancedFact, ...] = ()
     max_results: int = 0
     reason_codes: tuple[str, ...] = ()
@@ -57,7 +58,9 @@ class MemoryDecision:
             source = str(fact.source_kind or "").strip().lower()
             if source in _UNSAFE_MEMORY_SOURCES:
                 raise ContractViolation("unsafe_memory_source_selected")
-            if fact.subject_key and fact.subject_key != self.binding.current_sender_key:
+            if fact.subject_key and (
+                not self.current_account_key or fact.subject_key != self.current_account_key
+            ):
                 raise ContractViolation("other_subject_memory_selected")
             if fact.subject_key and fact.scope not in {"personal", "owner_private"}:
                 raise ContractViolation("subject_memory_scope_invalid")

@@ -47,6 +47,13 @@ from astrbot_plugin_shio.core.opportunity_attention import (
 )
 
 
+_SEMANTIC_REPLY = (
+    '{"decision":"REPLY","target":"current_message",'
+    '"topic_anchor":"current_message","reason_code":"natural_continuation",'
+    '"confidence":0.9}'
+)
+
+
 class At:
     type = "at"
 
@@ -69,10 +76,11 @@ class P5AttentionGateTests(unittest.IsolatedAsyncioTestCase):
         message: str,
         direct: bool = False,
         components: tuple[object, ...] = (),
+        prime_context: bool = False,
     ):
         self.runtime_count += 1
         FakeStarTools.data_dir = Path(self.temp.name) / f"runtime-{self.runtime_count}"
-        provider = FakeProvider([])
+        provider = FakeProvider([_SEMANTIC_REPLY] if prime_context else [])
         plugin = main.ShioPlugin(
             FakeContext(provider, global_tools=[FakeTool("anysearch_search")]),
             {
@@ -80,8 +88,19 @@ class P5AttentionGateTests(unittest.IsolatedAsyncioTestCase):
                 "natural_name_wake_aliases": ["亚托莉", "萝卜子"],
                 "guest_allowed_tools": ["anysearch_search"],
                 "prefer_livingmemory_group_history": False,
+                "natural_group_participation_enabled": True,
+                "natural_group_participation_allowlist": ["p5-attention-group"],
+                "natural_group_participation_min_context_messages": 2,
             },
         )
+        if prime_context:
+            prior = FakeEvent(
+                "peer-b",
+                "刚才的话题还没说完",
+                group_id="p5-attention-group",
+            )
+            prior.message_id = f"p5-attention-prior-{self.runtime_count}"
+            plugin.admit_ingress_event(prior)
         event = FakeEvent("peer-a", message, group_id="p5-attention-group")
         event.message_id = f"p5-attention-{abs(hash((message, direct))) % 1000000}"
         event.is_at_or_wake_command = direct
@@ -141,9 +160,9 @@ class P5AttentionGateTests(unittest.IsolatedAsyncioTestCase):
                 False,
                 (),
                 AddressKind.UNCERTAIN,
-                OpportunityAttentionLevel.WAIT,
+                OpportunityAttentionLevel.CANDIDATE,
                 False,
-                False,
+                True,
             ),
         )
         for (
@@ -261,6 +280,7 @@ class P5AttentionGateTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(message=message):
                 _plugin, event, request, provider = await self._run_turn(
                     message=message,
+                    prime_context=expected_kind is ActionKind.REPLY,
                 )
                 planned = event.get_extra(main.SHIO_PLANNED_ACTION)
                 self.assertIs(planned.kind, expected_kind)
@@ -270,10 +290,23 @@ class P5AttentionGateTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     self.assertTrue(request.system_prompt)
                     self.assertTrue(request.prompt)
-                self.assertEqual(request.contexts, [])
+                    self.assertTrue(request.contexts)
+                    self.assertTrue(
+                        all(
+                            context.get("role") in {"user", "assistant"}
+                            and bool(context.get("content"))
+                            for context in request.contexts
+                        )
+                    )
+                    self.assertNotIn(message, repr(request.contexts))
+                if expected_kind is ActionKind.NO_ACTION:
+                    self.assertEqual(request.contexts, [])
                 self.assertEqual(request.extra_user_content_parts, [])
                 self.assertEqual(tuple(request.func_tool.tools), ())
-                self.assertEqual(provider.calls, [])
+                self.assertEqual(
+                    len(provider.calls),
+                    0 if expected_kind is ActionKind.NO_ACTION else 1,
+                )
 
     async def test_dropped_self_and_known_bot_have_no_attention_or_state(self):
         cases = (

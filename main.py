@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import os
 import random
@@ -11,6 +12,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from astrbot.api import AstrBotConfig, ToolSet, logger
@@ -39,6 +41,7 @@ from .core.action_outcome import (
 from .core.affect import (
     AffectAppraisal,
     AffectTrigger,
+    RelationshipDistance,
     appraise_affect,
     trusted_relationship_distance,
 )
@@ -52,6 +55,7 @@ from .core.affect_state import (
     issue_shio_receipt_evidence,
 )
 from .core.capability_policy import (
+    CapabilityClass,
     build_guest_capability_policy,
     build_owner_capability_policy,
     classify_tool,
@@ -77,16 +81,23 @@ from .core.context_assembler import (
 )
 from .core.conversation_ledger import (
     ConversationLedger,
+    InboundIdentityMetadata,
     LedgerRecord,
     LedgerRole,
     LedgerSourceKind,
+    ParticipantDisplay,
     PlatformGroupHistoryRead,
     PlatformGroupHistoryStatus,
     adapt_astrbot_history,
+    build_display_name_metadata,
+    build_inbound_identity_metadata,
     has_verified_public_group_context,
+    identity_literals_for_sender_keys,
     ledger_content_digest,
+    identity_metadata_integrity,
     read_astrbot_group_history,
     records_for_sender_thread,
+    select_display_name_metadata,
 )
 from .core.conversation_runtime import ConversationRuntime
 from .core.contracts import (
@@ -146,13 +157,13 @@ from .core.inference_budget import (
 )
 from .core.meme_presentation import (
     ExpressionIntentAuthority,
-    MemeComplementCadence,
-    MemeComplementDecision,
+    MemeExecutionStatus,
     MemeExecutionAuthority,
     MemeExecutionReceipt,
     MemeManagerConformanceStatus,
     MemeManagerConformanceCollector,
-    decide_text_meme_complement,
+    decide_semantic_meme_handoff,
+    execute_meme_manager_category,
     execute_meme_permit,
     production_meme_manager_runtime_profile,
 )
@@ -247,6 +258,14 @@ from .core.participation_engine import (
 from .core.participation_cadence import (
     ParticipationCadenceAuthority,
     ParticipationCadenceDecision,
+    ParticipationCadencePreflight,
+)
+from .core.participation_semantic import (
+    ParticipationSemanticAuthority,
+    ParticipationSemanticDecisionKind,
+    ParticipationSemanticOutcome,
+    ParticipationSemanticRequest,
+    ParticipationSemanticStatus,
 )
 from .core.participation_reaction import (
     ParticipationReactionAuthority,
@@ -262,6 +281,7 @@ from .core.proactive_runtime import (
     ProactiveComposerRequest,
     ProactiveExecutionAuthority,
     ProactiveExecutionStatus,
+    ProactivePresentation,
     ProactiveSchedulerRuntime,
 )
 from .core.history_normalizer import (
@@ -280,6 +300,10 @@ from .core.response_guard import (
     contains_tool_protocol,
     extract_and_clean_internal_meme_references,
 )
+from .core.answer_obligation import (
+    AttributionRisk,
+    contains_history_speaker_attribution_confusion,
+)
 from .core.output_validator_v2 import (
     OutputValidationContext,
     _preflight_reply_composer_repair_candidate,
@@ -289,6 +313,7 @@ from .core.output_validator_v2 import (
 from .core.presentation_handoff import PresentationHandoff, build_presentation_handoff
 from .core.repair_controller import (
     RepairAction,
+    build_grounded_evidence_fallback,
     build_safe_direct_reply_fallback,
     build_single_repair_request,
     decide_output_repair,
@@ -304,6 +329,12 @@ from .core.reply_composer import (
     ReplyComposerRequest,
     build_reply_composer_request,
     parse_reply_composer_output,
+    parse_semantic_risk_decision,
+    SemanticRiskDecision,
+)
+from .core.model_input_contract import (
+    canonical_model_messages_digest,
+    project_model_identity_prompt_data,
 )
 from .core.relationship_state import (
     RelationshipMutationResult,
@@ -311,11 +342,20 @@ from .core.relationship_state import (
     RelationshipStateBook,
 )
 from .core.runtime_continuity import RuntimeContinuityStore
-from .core.knowledge_gap import decide_knowledge_gap
+from .core.scene_rules import (
+    DEFAULT_NATURAL_GROUP_PARTICIPATION_RULES,
+    DEFAULT_PROACTIVE_INITIATION_RULES,
+)
+from .core.knowledge_gap import (
+    decide_knowledge_gap,
+    decide_proactive_knowledge_need,
+)
 from .core.tool_broker import (
     AcquisitionRequest,
+    broker_proactive_read_request,
     broker_tool_request,
     build_extract_request_shape,
+    build_knowledge_base_request_shape,
     build_search_request_shape,
 )
 from .core.grounding_adapter import (
@@ -389,6 +429,7 @@ _CONFIG_GROUP_BY_KEY = {
     **dict.fromkeys(
         (
             "natural_group_participation_enabled",
+            "natural_group_participation_rules",
             "natural_group_participation_allowlist",
             "natural_group_participation_min_context_messages",
             "natural_group_participation_cooldown_seconds",
@@ -402,6 +443,8 @@ _CONFIG_GROUP_BY_KEY = {
     **dict.fromkeys(
         (
             "proactive_initiation_enabled",
+            "proactive_initiation_rules",
+            "proactive_min_bubbles",
             "proactive_group_allowlist",
             "proactive_active_hour_start",
             "proactive_active_hour_end",
@@ -422,14 +465,6 @@ _CONFIG_GROUP_BY_KEY = {
             "inject_verified_context",
         ),
         "context_settings",
-    ),
-    **dict.fromkeys(
-        (
-            "meme_complement_enabled",
-            "meme_complement_cadence_turns",
-            "meme_complement_cooldown_turns",
-        ),
-        "meme_settings",
     ),
     **dict.fromkeys(
         (
@@ -468,6 +503,7 @@ SHIO_TYPED_INBOUND_RECORDED = "_shio_typed_inbound_recorded"
 SHIO_TYPED_INBOUND_RECORD = "_shio_typed_inbound_record_v1"
 SHIO_ASSEMBLED_CONTEXT_V2 = "_shio_assembled_context_v2"
 SHIO_CAPABILITY_POLICY = "_shio_capability_policy"
+SHIO_EFFECTIVE_TOOL_NAMES = "_shio_effective_tool_names_v1"
 SHIO_TYPED_RUNTIME = "_shio_typed_runtime"
 SHIO_TYPED_RUNTIME_DECISION = "_shio_typed_runtime_decision"
 SHIO_TYPED_PIPELINE_ACTIVE = "_shio_typed_pipeline_active"
@@ -483,6 +519,7 @@ SHIO_ACQUISITION_REQUEST = "_shio_acquisition_request_v1"
 SHIO_EVIDENCE_OUTCOME = "_shio_evidence_outcome_v1"
 SHIO_ACTIVE_CAPABILITY_POLICY = "_shio_active_capability_policy"
 SHIO_REPLY_COMPOSER_REQUEST = "_shio_reply_composer_request"
+SHIO_SEMANTIC_RISK_DECISION = "_shio_semantic_risk_decision"
 SHIO_OUTPUT_VALIDATION_CONTEXT = "_shio_output_validation_context"
 SHIO_SEMANTIC_GUARD_CONTRACT = "_shio_semantic_guard_contract"
 SHIO_SEMANTIC_VALIDATION_SEAL = "_shio_semantic_validation_seal"
@@ -511,8 +548,11 @@ SHIO_OWNER_ACTION_TICKET = "_shio_owner_action_ticket_v1"
 SHIO_OPPORTUNITY_ATTENTION_TICKET = "_shio_opportunity_attention_ticket_v1"
 SHIO_OPPORTUNITY_ATTENTION = "_shio_opportunity_attention_v1"
 SHIO_PARTICIPATION_ASSESSMENT = "_shio_participation_assessment_v1"
+SHIO_PARTICIPATION_CADENCE_PREFLIGHT = "_shio_participation_cadence_preflight_v1"
 SHIO_PARTICIPATION_CADENCE = "_shio_participation_cadence_v1"
 SHIO_PARTICIPATION_REACTION = "_shio_participation_reaction_v1"
+SHIO_PARTICIPATION_SEMANTIC_REQUEST = "_shio_participation_semantic_request_v1"
+SHIO_PARTICIPATION_SEMANTIC_OUTCOME = "_shio_participation_semantic_outcome_v1"
 SHIO_OWNER_ACTION_ROUTE = "_shio_owner_action_route_v1"
 SHIO_OWNER_ACTION_SOURCE = "_shio_owner_action_source_v1"
 SHIO_ACTION_OUTCOME = "_shio_action_outcome_v1"
@@ -527,6 +567,22 @@ SHIO_RELATIONSHIP_RENDER_CONTEXT = "_shio_relationship_render_context_v1"
 SHIO_INFERENCE_PERMIT = "_shio_inference_permit_v1"
 SHIO_PRIMARY_PROVIDER_STARTED_AT = "_shio_primary_provider_started_at_v1"
 SHIO_PERFORMANCE_SNAPSHOT = "_shio_performance_snapshot_v1"
+SHIO_MEME_MANAGER_TOOL = "_shio_meme_manager_tool_v1"
+SHIO_MEME_MANAGER_PROMPT = "_shio_meme_manager_prompt_v1"
+SHIO_MEME_MANAGER_REFERENCE = "_shio_meme_manager_reference_v1"
+SHIO_MEME_MANAGER_PRESENTATION_MODE = "_shio_meme_manager_presentation_mode_v1"
+SHIO_MEME_MANAGER_CATEGORY_MARKERS = "_shio_meme_manager_category_markers_v1"
+
+_MEME_MANAGER_SEMANTIC_PROMPT_RE = re.compile(
+    r"<!-- meme_manager_semantic_prompt:start -->[\s\S]*?"
+    r"<!-- meme_manager_semantic_prompt:end -->"
+)
+_MEME_MANAGER_LEGACY_PROMPT_RE = re.compile(
+    r"<!-- meme_manager_prompt:start -->[\s\S]*?"
+    r"<!-- meme_manager_prompt:end -->"
+)
+_MEME_MANAGER_STRICT_MARKER_RE = re.compile(r"&&([^&\r\n]{1,96})&&")
+_MEME_MANAGER_SAFE_CATEGORY_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 RECOVERABLE_QUESTION_RE = re.compile(
     r"[？?]|(?:怎么|如何|为啥|为什么|是不是|有没有|能不能|可不可以|什么|谁|哪里|多少|"
@@ -541,11 +597,92 @@ _SENSITIVE_DEPENDENCY_LOGGERS = (
 )
 
 
+class _ProactiveMemeEvent:
+    """Small group-addressed event surface; it never impersonates a member."""
+
+    __slots__ = (
+        "_context",
+        "_extras",
+        "group_id",
+        "persona_id",
+        "session_id",
+        "unified_msg_origin",
+    )
+
+    def __init__(self, context: Context, request: ProactiveComposerRequest) -> None:
+        target = request.plan.target
+        self._context = context
+        self._extras: dict[str, Any] = {}
+        self.group_id = target.group_id
+        self.session_id = target.group_id
+        self.unified_msg_origin = target.unified_msg_origin
+        self.persona_id = ""
+
+    def get_extra(self, key: str, default: Any = None) -> Any:
+        return self._extras.get(key, default)
+
+    def set_extra(self, key: str, value: Any) -> None:
+        self._extras[str(key)] = value
+
+    def get_sender_id(self) -> str:
+        return ""
+
+    def get_group_id(self) -> str:
+        return self.group_id
+
+    def get_platform_name(self) -> str:
+        return self.unified_msg_origin.split(":", 1)[0] or "aiocqhttp"
+
+    async def send(self, chain: MessageChain) -> Any:
+        return await self._context.send_message(self.unified_msg_origin, chain)
+
+
 def _suppress_sensitive_dependency_debug_logs() -> None:
     """Keep third-party request bodies out of AstrBot's DEBUG root bridge."""
 
     for logger_name in _SENSITIVE_DEPENDENCY_LOGGERS:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+
+def _llm_response_diagnostics(response: Any) -> dict[str, str | int | bool]:
+    """Return content-free diagnostics for one provider response object."""
+
+    if response is None:
+        return {
+            "repair_response_received": False,
+            "repair_visible_chars": 0,
+            "repair_reasoning_chars": 0,
+            "repair_response_role_code": "none",
+            "repair_output_token_count": 0,
+        }
+    completion = str(getattr(response, "completion_text", "") or "")
+    reasoning = ""
+    for attribute in ("reasoning_content", "reasoning_text", "reasoning"):
+        value = getattr(response, attribute, None)
+        if value:
+            reasoning = str(value)
+            break
+    usage = getattr(response, "usage", None)
+    output_tokens = 0
+    for field_name in ("output_tokens", "completion_tokens"):
+        if isinstance(usage, dict):
+            value = usage.get(field_name, 0)
+        else:
+            value = getattr(usage, field_name, 0) if usage is not None else 0
+        try:
+            output_tokens = max(output_tokens, int(value or 0))
+        except (TypeError, ValueError):
+            continue
+    role = str(getattr(response, "role", "") or "unknown").strip().casefold()
+    if role not in {"assistant", "tool", "err", "error", "unknown"}:
+        role = "unknown"
+    return {
+        "repair_response_received": True,
+        "repair_visible_chars": len(completion),
+        "repair_reasoning_chars": len(reasoning),
+        "repair_response_role_code": role,
+        "repair_output_token_count": output_tokens,
+    }
 
 
 class ShioPlugin(Star):
@@ -637,6 +774,11 @@ class ShioPlugin(Star):
                 ),
             ),
         )
+        self.participation_semantic_authority = ParticipationSemanticAuthority(
+            self.participation_authority,
+            self.participation_cadence_authority,
+            self.group_scenes,
+        )
         self.participation_reaction_authority = ParticipationReactionAuthority(
             self.participation_cadence_authority,
         )
@@ -700,23 +842,6 @@ class ShioPlugin(Star):
         self.meme_manager_conformance = MemeManagerConformanceCollector(
             production_meme_manager_runtime_profile(),
         )
-        self.meme_complement_cadence = MemeComplementCadence(
-            enabled=self._config_bool("meme_complement_enabled", True),
-            ordinary_threshold=max(
-                1,
-                min(
-                    16,
-                    self._config_int("meme_complement_cadence_turns", 4),
-                ),
-            ),
-            cooldown_turns=max(
-                1,
-                min(
-                    32,
-                    self._config_int("meme_complement_cooldown_turns", 4),
-                ),
-            ),
-        )
         self.meme_execution_authority = MemeExecutionAuthority(
             planned_action_authority=self.planned_action_authority,
             expression_intent_authority=self.expression_intent_authority,
@@ -761,6 +886,21 @@ class ShioPlugin(Star):
         )
         self.proactive_execution_authority = ProactiveExecutionAuthority.issue_for_runtime(
             self.proactive_topic_authority,
+            scene_rules=str(
+                self._config(
+                    "proactive_initiation_rules",
+                    DEFAULT_PROACTIVE_INITIATION_RULES,
+                )
+                or DEFAULT_PROACTIVE_INITIATION_RULES
+            ).strip(),
+            min_bubbles=min(
+                min(3, max(1, self._config_int("chat_max_bubbles", 3))),
+                max(1, self._config_int("proactive_min_bubbles", 2)),
+            ),
+            max_bubbles=min(
+                3,
+                max(1, self._config_int("chat_max_bubbles", 3)),
+            ),
         )
         self.proactive_scheduler_runtime = ProactiveSchedulerRuntime.issue_for_runtime(
             self.proactive_execution_authority,
@@ -769,6 +909,10 @@ class ShioPlugin(Star):
             self.proactive_topic_authority,
         )
         self._proactive_scheduler_log_signature: tuple[tuple[str, object], ...] | None = None
+        self._proactive_scheduler_group_log_signatures: dict[
+            str,
+            tuple[str, str, bool],
+        ] = {}
         self._proactive_scheduler_task: asyncio.Task[None] | None = None
         bind_name_wake_plugin(self)
         self._ensure_proactive_scheduler_started()
@@ -1215,6 +1359,7 @@ class ShioPlugin(Star):
     ) -> tuple[
         tuple[StructuredMentionEvidence, ...],
         StructuredReplyEvidence | None,
+        InboundIdentityMetadata,
     ]:
         """Adapt only structural At/Reply fields; never infer from display names."""
 
@@ -1223,7 +1368,7 @@ class ShioPlugin(Star):
             components = list(get_messages() or ()) if callable(get_messages) else []
         except Exception:
             components = []
-        mentions: list[StructuredMentionEvidence] = []
+        mention_components: list[tuple[Any, str, str]] = []
         reply_component: Any | None = None
         for component in components:
             raw_type = getattr(component, "type", "")
@@ -1234,11 +1379,12 @@ class ShioPlugin(Star):
             if component_type == "at" or class_name in {"at", "atall"}:
                 target_sender_id = str(getattr(component, "qq", "") or "").strip()
                 if target_sender_id and target_sender_id.casefold() != "all":
-                    mentions.append(
-                        StructuredMentionEvidence(
-                            source_message_id=envelope.message_id,
-                            target_sender_id=target_sender_id,
-                        )
+                    target_sender_key = build_sender_key(
+                        envelope.scope_key,
+                        target_sender_id,
+                    )
+                    mention_components.append(
+                        (component, target_sender_id, target_sender_key)
                     )
             if component_type == "reply" or class_name == "reply":
                 reply_component = component
@@ -1260,15 +1406,103 @@ class ShioPlugin(Star):
                 referenced_sender_id=envelope.reply_to_sender_id,
                 quoted_content=quoted_content,
             )
-        return tuple(mentions), structured_reply
+        referenced_sender_key = ""
+        if structured_reply is not None:
+            referenced_sender_key = build_sender_key(
+                envelope.scope_key,
+                structured_reply.referenced_sender_id,
+            )
+        protected_identity_literals = identity_literals_for_sender_keys(
+            (
+                envelope.sender_key,
+                referenced_sender_key,
+                *(target_key for _component, _target_id, target_key in mention_components),
+            ),
+            extra_literals=(
+                envelope.sender_id,
+                envelope.bot_id,
+                envelope.group_id,
+                envelope.session_id,
+                envelope.reply_to_sender_id,
+                *(target_id for _component, target_id, _target_key in mention_components),
+            ),
+        )
+
+        mentions: list[StructuredMentionEvidence] = []
+        mention_targets: list[ParticipantDisplay] = []
+        for component, target_sender_id, target_sender_key in mention_components:
+            mentions.append(
+                StructuredMentionEvidence(
+                    source_message_id=envelope.message_id,
+                    target_sender_id=target_sender_id,
+                )
+            )
+            if not target_sender_key:
+                continue
+            target_display = select_display_name_metadata(
+                (
+                    getattr(component, "name", ""),
+                    getattr(component, "display_name", ""),
+                ),
+                source="mention_component",
+                identity_literals=protected_identity_literals,
+            )
+            mention_targets.append(
+                ParticipantDisplay(
+                    sender_key=target_sender_key,
+                    display=target_display,
+                )
+            )
+
+        referenced_sender = None
+        if structured_reply is not None:
+            if referenced_sender_key:
+                reply_display = select_display_name_metadata(
+                    (
+                        getattr(reply_component, "sender_nickname", ""),
+                        getattr(reply_component, "sender_name", ""),
+                        getattr(reply_component, "name", ""),
+                    ),
+                    source="reply_component",
+                    identity_literals=protected_identity_literals,
+                )
+                referenced_sender = ParticipantDisplay(
+                    sender_key=referenced_sender_key,
+                    display=reply_display,
+                )
+        get_sender_name = getattr(event, "get_sender_name", None)
+        try:
+            sender_display_name = (
+                str(get_sender_name() or "") if callable(get_sender_name) else ""
+            )
+        except Exception:
+            sender_display_name = ""
+        identity_metadata = build_inbound_identity_metadata(
+            display_name=sender_display_name,
+            display_name_source="event_sender",
+            display_name_identity_literals=protected_identity_literals,
+            referenced_sender=referenced_sender,
+            mention_targets=mention_targets,
+            has_reply_edge=bool(envelope.reply_to_message_id),
+            open_group=envelope.chat_type == "group",
+        )
+        return tuple(mentions), structured_reply, identity_metadata
 
     def _effective_sender(
         self,
         event: AstrMessageEvent,
     ) -> tuple[str, str]:
         sender_id = str(event.get_sender_id() or "").strip()
-        sender_name = str(event.get_sender_name() or sender_id or "群友").strip()
-        return sender_id, sender_name
+        try:
+            raw_sender_name = event.get_sender_name()
+        except Exception:
+            raw_sender_name = ""
+        sender_display = build_display_name_metadata(
+            raw_sender_name,
+            source="event_sender",
+            identity_literals=(sender_id,),
+        )
+        return sender_id, sender_display.value
 
     def _effective_principal(
         self,
@@ -1591,7 +1825,17 @@ class ShioPlugin(Star):
         event: AstrMessageEvent,
         envelope: TurnEnvelope,
         current_message: str,
+        *,
+        identity_metadata: InboundIdentityMetadata | None = None,
+        structured_reply: StructuredReplyEvidence | None = None,
     ) -> LedgerRecord:
+        if identity_metadata is None:
+            _, structured_reply, identity_metadata = (
+                self._structured_address_evidence(event, envelope)
+            )
+        structured_mentions, _ignored_reply, _ignored_metadata = (
+            self._structured_address_evidence(event, envelope)
+        )
         existing = event.get_extra(SHIO_TYPED_INBOUND_RECORD, None)
         if type(existing) is LedgerRecord:
             if (
@@ -1602,6 +1846,8 @@ class ShioPlugin(Star):
                 or existing.message_id != envelope.message_id
                 or existing.sender_key != envelope.sender_key
                 or existing.content_digest != ledger_content_digest(current_message)
+                or identity_metadata_integrity(existing.identity_metadata)
+                != identity_metadata_integrity(identity_metadata)
             ):
                 raise ContractViolation("typed_inbound_record_corrupt")
             return existing
@@ -1611,9 +1857,26 @@ class ShioPlugin(Star):
             unified_msg_origin=str(
                 getattr(event, "unified_msg_origin", "") or ""
             ),
+            identity_metadata=identity_metadata,
+            mention_sender_ids=tuple(
+                item.target_sender_id for item in structured_mentions
+            ),
         )
         if envelope.reply_to_message_id:
-            self.ledger.record_reference(envelope)
+            self.ledger.record_reference(
+                envelope,
+                referenced_content=(
+                    structured_reply.quoted_content
+                    if structured_reply is not None
+                    else ""
+                ),
+                referenced_sender_key=(
+                    identity_metadata.referenced_sender.sender_key
+                    if identity_metadata.referenced_sender is not None
+                    else ""
+                ),
+                identity_metadata=identity_metadata,
+            )
         event.set_extra(SHIO_TYPED_INBOUND_RECORD, record)
         event.set_extra(SHIO_TYPED_INBOUND_RECORDED, True)
         return record
@@ -1840,6 +2103,7 @@ class ShioPlugin(Star):
                 reply_target=reply_target,
                 reference=reference_context,
                 fact_selection=fact_selection,
+                current_record=current_inbound_record,
             )
             if reply_target is not None
             else None
@@ -1904,7 +2168,7 @@ class ShioPlugin(Star):
     def _guest_allowed_tool_names(self) -> list[str]:
         raw = self._config(
             "guest_allowed_tools",
-            ["anysearch_search", "anysearch_extract"],
+            ["astr_kb_search", "anysearch_search", "anysearch_extract"],
         )
         if isinstance(raw, str):
             values = re.split(r"[,;\s]+", raw)
@@ -1991,6 +2255,24 @@ class ShioPlugin(Star):
                     "tools.inventory_failed",
                     failure_kind=safe_exception_kind(exc),
                 )
+        try:
+            if not any(
+                str(getattr(tool, "name", "") or "").strip() == "astr_kb_search"
+                for tool in candidates
+            ):
+                from astrbot.core.tools.knowledge_base_tools import (
+                    KnowledgeBaseQueryTool,
+                )
+
+                candidates.append(KnowledgeBaseQueryTool())
+        except Exception as exc:
+            if bool(self._config("debug_log", False)):
+                structured_log(
+                    logger,
+                    "warning",
+                    "knowledge_base.tool_unavailable",
+                    failure_kind=safe_exception_kind(exc),
+                )
 
         tools_by_name: dict[str, Any] = {}
         for tool in candidates:
@@ -2036,6 +2318,105 @@ class ShioPlugin(Star):
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,127}", exact_name):
                 names.add(exact_name)
         return tuple(sorted(names))
+
+    def _capture_meme_manager_tool_prompt(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ) -> tuple[object | None, str, str]:
+        """Capture Manager's normal-hook presentation mode without owning it."""
+
+        manager_mode = str(
+            event.get_extra("meme_manager_semantic_mode", "") or ""
+        ).strip()
+        system_prompt = str(getattr(req, "system_prompt", "") or "")
+        if (
+            bool(event.get_extra("meme_manager_semantic_active", False))
+            and manager_mode == "tool"
+        ):
+            tool = next(
+                (
+                    candidate
+                    for candidate in self._available_tools(req.func_tool)
+                    if str(getattr(candidate, "name", "") or "")
+                    == "search_memes"
+                ),
+                None,
+            )
+            prompt_match = _MEME_MANAGER_SEMANTIC_PROMPT_RE.search(system_prompt)
+            if tool is not None and prompt_match is not None:
+                return tool, prompt_match.group(0).strip(), "semantic_tool"
+            return None, "", "unavailable"
+        if (
+            bool(event.get_extra("meme_manager_semantic_active", False))
+            and manager_mode == "llm"
+        ):
+            return None, "", "semantic_llm"
+        prompt_match = _MEME_MANAGER_LEGACY_PROMPT_RE.search(system_prompt)
+        if prompt_match is not None:
+            return None, prompt_match.group(0).strip(), "legacy_category"
+        return None, "", "unavailable"
+
+    @staticmethod
+    def _extract_meme_manager_category_markers(
+        raw_output: str,
+        *,
+        trusted_legacy_mode: bool,
+    ) -> tuple[str, tuple[str, ...]]:
+        """Remove strict Manager markers; preserve only trusted legacy tags."""
+
+        markers: list[str] = []
+
+        def replace(match: re.Match[str]) -> str:
+            category = str(match.group(1) or "").strip()
+            if (
+                trusted_legacy_mode
+                and _MEME_MANAGER_SAFE_CATEGORY_RE.fullmatch(category)
+                and category not in markers
+            ):
+                markers.append(category)
+            return ""
+
+        cleaned = _MEME_MANAGER_STRICT_MARKER_RE.sub(
+            replace,
+            str(raw_output or ""),
+        )
+        cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned, tuple(markers[:4])
+
+    def _clean_meme_manager_model_output(
+        self,
+        event: AstrMessageEvent,
+        raw_output: str,
+    ) -> str:
+        """Separate Manager-owned machine markers from visible validation text."""
+
+        mode = str(
+            event.get_extra(SHIO_MEME_MANAGER_PRESENTATION_MODE, "") or ""
+        ).strip()
+        cleaned_output = str(raw_output or "")
+        event.set_extra(SHIO_MEME_MANAGER_REFERENCE, "")
+        event.set_extra(SHIO_MEME_MANAGER_CATEGORY_MARKERS, ())
+        if mode == "semantic_tool":
+            cleaned_output, manager_references = (
+                extract_and_clean_internal_meme_references(
+                    cleaned_output,
+                    self._response_guard_tool_names(event),
+                )
+            )
+            event.set_extra(
+                SHIO_MEME_MANAGER_REFERENCE,
+                manager_references[0] if len(manager_references) == 1 else "",
+            )
+        cleaned_output, category_markers = (
+            self._extract_meme_manager_category_markers(
+                cleaned_output,
+                trusted_legacy_mode=mode == "legacy_category",
+            )
+        )
+        event.set_extra(SHIO_MEME_MANAGER_CATEGORY_MARKERS, category_markers)
+        return cleaned_output
 
     @staticmethod
     def _collect_text_components(components: Any) -> list[Any]:
@@ -2497,13 +2878,29 @@ class ShioPlugin(Star):
         self,
         request: ProactiveComposerRequest,
     ) -> ProactiveExecutionStatus:
-        """Run one exact proactive request with zero tools and one send attempt."""
+        """Run one exact request with optional sealed read and canonical presentation."""
 
-        return await self.scope_concurrency.run_proactive(
-            request,
-            self.proactive_execution_authority,
-            work_factory=lambda: self._execute_proactive_request_serialized(request),
+        try:
+            status = await self.scope_concurrency.run_proactive(
+                request,
+                self.proactive_execution_authority,
+                work_factory=lambda: self._execute_proactive_request_serialized(request),
+            )
+        except Exception as exc:
+            structured_log(
+                logger,
+                "warning",
+                "proactive.outer_failed",
+                failure_kind=safe_exception_kind(exc),
+            )
+            raise
+        structured_log(
+            logger,
+            "info",
+            "proactive.outer_terminal",
+            outcome=status.value,
         )
+        return status
 
     async def _run_observed_provider_call(
         self,
@@ -2519,7 +2916,7 @@ class ShioPlugin(Star):
         try:
             return await work_factory()
         except BaseException:
-            self.performance_window.record_model_failure()
+            self.performance_window.record_model_failure(call_kind)
             raise
         finally:
             self.performance_window.observe_latency(
@@ -2527,12 +2924,362 @@ class ShioPlugin(Star):
                 float((time.perf_counter() - provider_started) * 1000.0),
             )
 
+    async def _run_semantic_risk_preflight(
+        self,
+        *,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        snapshot: Any,
+        principal: PrincipalContext,
+        planned_action: PlannedAction,
+        composer_request: ReplyComposerRequest,
+    ) -> SemanticRiskDecision:
+        """Use the request-selected provider once to classify semantic risk.
+
+        This call is deliberately separate from primary generation, but shares the
+        same event snapshot, principal, plan and selected provider.  Any failure
+        is an UNCERTAIN decision; callers must not fall back to text heuristics.
+        """
+        provider_id = str(getattr(req, "provider_id", "") or "").strip()
+        provider = self._provider(provider_id, event.unified_msg_origin)
+        selected = self.context.get_using_provider(event.unified_msg_origin)
+        if (
+            provider is None
+            or not hasattr(provider, "text_chat")
+            or (provider_id and provider is not selected)
+        ):
+            return SemanticRiskDecision.UNCERTAIN
+        current = composer_request.current_model_message
+        if current is None:
+            return SemanticRiskDecision.UNCERTAIN
+        observed_at = getattr(composer_request.temporal_context, "observed_at", None)
+        identity = project_model_identity_prompt_data(
+            composer_request.model_messages,
+            current_sender_key=composer_request.target_sender_key,
+            current_message=current,
+            server_now=observed_at,
+        )
+        evidence = list(identity["history"])
+        for record, message in zip(evidence, composer_request.model_messages, strict=True):
+            record["content"] = message.content
+            record["source_kind"] = message.source_kind
+            record["sequence"] = record["message_index"]
+        current_payload = dict(identity["current_message"])
+        current_payload["content"] = current.content
+        current_payload["source_kind"] = current.source_kind
+        current_payload["sequence"] = len(evidence) + 1
+        prompt = json.dumps(
+            {
+                "task": "Classify whether the requested reply requires structured actor attribution.",
+                "output": {"decision": "ATTRIBUTION_REQUIRED|NONE|UNCERTAIN"},
+                "current": current_payload,
+                "history": evidence,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        try:
+            response = await self.inference_budget.run_event_call(
+                snapshot,
+                principal,
+                planned_action,
+                purpose=InferencePurpose.RISK,
+                work_factory=lambda: self._run_observed_provider_call(
+                        call_kind=ModelCallKind.RISK,
+                        latency_kind=LatencyKind.RISK_PROVIDER,
+                        work_factory=lambda: self.generation_tasks.run(
+                            snapshot,
+                            provider.text_chat(
+                                prompt=prompt,
+                                contexts=[],
+                                system_prompt=(
+                                    "Return exactly one JSON object with decision equal to "
+                                    "ATTRIBUTION_REQUIRED, NONE, or UNCERTAIN."
+                                ),
+                                image_urls=[],
+                                audio_urls=[],
+                                func_tool=None,
+                                request_max_retries=1,
+                            ),
+                            cancel_safe=provider_supports_cancellation(provider),
+                        ),
+                ),
+                permit_observer=self._observe_inference_permit,
+            )
+        except BaseException:
+            return SemanticRiskDecision.UNCERTAIN
+        return parse_semantic_risk_decision(
+            getattr(response, "completion_text", "")
+        )
+
+    @staticmethod
+    def _semantic_risk_snapshot(
+        request: ReplyComposerRequest,
+    ) -> tuple[str, str]:
+        """Opaque binding for one canonical Composer request; never text-derived."""
+        return (
+            diagnostic_digest(
+                (request.action_id, request.target_message_id, request.target_sender_key)
+            ),
+            diagnostic_digest((
+                canonical_model_messages_digest(
+                    (*request.model_messages, request.current_model_message)
+                ),
+                json.dumps(
+                    project_model_identity_prompt_data(
+                        request.model_messages,
+                        current_sender_key=request.target_sender_key,
+                        current_message=request.current_model_message,
+                        server_now=getattr(request.temporal_context, "observed_at", None),
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )),
+        )
+
+    async def _bind_proactive_grounding(
+        self,
+        request: ProactiveComposerRequest,
+    ) -> bool:
+        """Bind at most one sealed public-read result; never invent a topic."""
+
+        decision = decide_proactive_knowledge_need(request.plan.topic_text)
+        if not decision.requires_evidence:
+            return True
+        runtime_tools = self._available_tools(None)
+        configured_names = tuple(self._guest_allowed_tool_names())
+        acquisition_clock = time.monotonic()
+        event = SimpleNamespace(
+            unified_msg_origin=request.plan.target.unified_msg_origin,
+            get_sender_id=lambda: "",
+            is_admin=lambda: False,
+            is_stopped=lambda: False,
+        )
+        try:
+            acquisition = broker_proactive_read_request(
+                proactive_request=request,
+                capability=decision.capability,
+                runtime_tools=tuple(classify_tool(tool) for tool in runtime_tools),
+                configured_tool_names=configured_names,
+                now=acquisition_clock,
+            )
+            self.proactive_scheduler_runtime.mark_provider_cancel_safe(
+                request,
+                cancel_safe=True,
+            )
+            sealed_execution = await execute_sealed_acquisition(
+                request=acquisition,
+                runtime_tools=tuple(runtime_tools),
+                plugin_context=self.context,
+                event=event,
+                clock=time.monotonic,
+                epoch_current=lambda binding: (
+                    binding == acquisition.binding
+                    and self.proactive_scheduler_runtime.is_current(request)
+                ),
+            )
+            observed_at = time.monotonic()
+            typed_results = (
+                adapt_tool_call_results(
+                    sealed_execution.batch,
+                    tools=tuple(runtime_tools),
+                    scope_key=acquisition.binding.scope_key,
+                    target_sender_key=acquisition.binding.current_sender_key,
+                    acquisition_request=acquisition,
+                    observed_at=observed_at,
+                )
+                if (
+                    sealed_execution.succeeded
+                    and sealed_execution.batch is not None
+                    and observed_at <= acquisition.selection.deadline
+                    and self.proactive_scheduler_runtime.is_current(request)
+                )
+                else ()
+            )
+            evidence = adapt_grounding_evidence(
+                request=acquisition,
+                results=typed_results,
+                current_binding=acquisition.binding,
+                now=observed_at,
+            )
+            if evidence.kind is not EvidenceOutcomeKind.ACCEPTED or not evidence.facts:
+                raise RuntimeError("proactive_grounding_not_accepted")
+            self.proactive_execution_authority.bind_grounding(
+                request,
+                tuple(fact.claim for fact in evidence.facts),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            structured_log(
+                logger,
+                "warning",
+                "proactive.grounding_unavailable",
+                failure_kind=safe_exception_kind(exc),
+                capability=(
+                    decision.capability.value
+                    if decision.capability is not None
+                    else "none"
+                ),
+                reason_code=decision.reason_code,
+            )
+            return False
+        structured_log(
+            logger,
+            "info",
+            "proactive.grounding_bound",
+            capability=(
+                decision.capability.value
+                if decision.capability is not None
+                else "none"
+            ),
+            reason_code=decision.reason_code,
+        )
+        return True
+
+    async def _execute_proactive_meme_after_text(
+        self,
+        *,
+        request: ProactiveComposerRequest,
+        presentation: ProactivePresentation,
+        internal_reply_id: str,
+    ) -> None:
+        """Use Manager's official category bridge after validated proactive text."""
+
+        self.proactive_execution_authority.inspect_completed_send(
+            presentation,
+            ledger=self.send_receipts,
+            internal_reply_id=internal_reply_id,
+        )
+        decision = decide_semantic_meme_handoff(
+            current_message=request.plan.topic_text,
+            final_visible_text=presentation.final_visible_text,
+        )
+        structured_log(
+            logger,
+            "info",
+            "proactive.meme_decision",
+            meme_complement_eligible=decision.eligible,
+            meme_complement_reason=decision.reason_code,
+            meme_selection_owner="proactive_provider_manager_category_contract",
+        )
+        if not decision.eligible:
+            return
+        category = presentation.meme_category
+        conformance = self.meme_manager_conformance.collect(self.context)
+        if (
+            conformance.status is not MemeManagerConformanceStatus.VERIFIED
+            or conformance.evidence is None
+        ):
+            structured_log(
+                logger,
+                "info",
+                "proactive.meme_terminal",
+                **conformance.trace_metadata(),
+                meme_execution_status=MemeExecutionStatus.SUPPRESSED.value,
+                meme_selection_owner="proactive_provider_manager_category_contract",
+                meme_execution_reason_code="manager_unavailable",
+            )
+            return
+        adapter_event = _ProactiveMemeEvent(self.context, request)
+        receipt = await execute_meme_manager_category(
+            self.meme_manager_conformance,
+            conformance.evidence,
+            category=category,
+            event=adapter_event,
+            is_current=lambda: self.proactive_scheduler_runtime.is_current(request),
+        )
+        structured_log(
+            logger,
+            "info",
+            "proactive.meme_terminal",
+            **conformance.trace_metadata(),
+            **receipt.trace_metadata(),
+            meme_selection_owner="proactive_provider_manager_category_contract",
+        )
+
     def _observe_inference_permit(self, permit: InferencePermit) -> None:
         self.inference_budget.inspect(permit)
         self.performance_window.observe_latency(
             LatencyKind.INFERENCE_QUEUE,
             float(permit.wait_seconds * 1000.0),
         )
+
+    async def _render_proactive_presentation(
+        self,
+        *,
+        provider: Any,
+        request: ProactiveComposerRequest,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> tuple[ProactiveExecutionStatus, ProactivePresentation | None]:
+        """Render once and, only after rejection, retry the same sealed contract."""
+
+        for attempt in range(2):
+            if not self.proactive_scheduler_runtime.is_current(request):
+                return ProactiveExecutionStatus.SUPERSEDED, None
+            response = await self._run_observed_provider_call(
+                call_kind=(
+                    ModelCallKind.PROACTIVE
+                    if attempt == 0
+                    else ModelCallKind.REPAIR
+                ),
+                latency_kind=(
+                    LatencyKind.PROACTIVE_PROVIDER
+                    if attempt == 0
+                    else LatencyKind.REPAIR_PROVIDER
+                ),
+                work_factory=lambda attempt=attempt: provider.text_chat(
+                    prompt=(
+                        user_prompt
+                        if attempt == 0
+                        else user_prompt
+                        + "\n上一次候选未通过同一场景的输出校验。请重新渲染，"
+                        f"只输出 {request.min_bubbles} 至 {request.max_bubbles} 行最终可见群聊气泡，"
+                        "并按 system 合同在最后另起一行保留一个合法隐藏表情类别标记；不解释错误。"
+                    ),
+                    contexts=self.proactive_execution_authority.provider_contexts(
+                        request
+                    ),
+                    system_prompt=(
+                        system_prompt
+                        if attempt == 0
+                        else system_prompt
+                        + "\n这是唯一一次无工具修复。必须继续遵守完全相同的 Persona、"
+                        "公开上下文、可信事实和冷场续题规则；不得补写新事实。"
+                    ),
+                    image_urls=[],
+                    audio_urls=[],
+                    func_tool=None,
+                    tool_calls_result=None,
+                    request_max_retries=1,
+                ),
+            )
+            if not self.proactive_scheduler_runtime.is_current(request):
+                return ProactiveExecutionStatus.SUPERSEDED, None
+            if getattr(response, "role", "assistant") == "err":
+                return ProactiveExecutionStatus.PROVIDER_FAILED, None
+            try:
+                presentation = self.proactive_execution_authority.validate_output(
+                    request,
+                    str(getattr(response, "completion_text", "") or ""),
+                )
+            except Exception as exc:
+                structured_log(
+                    logger,
+                    "warning",
+                    "proactive.output_rejected",
+                    failure_kind=safe_exception_kind(exc),
+                    validation_attempt=attempt + 1,
+                    repair_scheduled=attempt == 0,
+                )
+                if attempt == 0:
+                    continue
+                return ProactiveExecutionStatus.OUTPUT_REJECTED, None
+            return ProactiveExecutionStatus.SENT, presentation
+        return ProactiveExecutionStatus.OUTPUT_REJECTED, None
 
     async def _execute_proactive_request_serialized(
         self,
@@ -2556,28 +3303,36 @@ class ShioPlugin(Star):
             return ProactiveExecutionStatus.PROVIDER_UNAVAILABLE
         if provider is None:
             return ProactiveExecutionStatus.PROVIDER_UNAVAILABLE
+        proactive_provider_id = str(self._config("replyer_provider_id", "")).strip()
+        structured_log(
+            logger,
+            "info",
+            "proactive.provider_route",
+            proactive_provider_owner="shio_proactive_config",
+            proactive_provider_digest=diagnostic_digest(
+                proactive_provider_id or type(provider).__name__
+            ),
+            provider_context_count=len(request.model_messages),
+        )
+        if not await self._bind_proactive_grounding(request):
+            return ProactiveExecutionStatus.GROUNDING_UNAVAILABLE
+        provider_system_prompt, provider_user_prompt = (
+            self.proactive_execution_authority.provider_prompts(request)
+        )
         cancel_safe = provider_supports_cancellation(provider)
         try:
             self.proactive_scheduler_runtime.mark_provider_cancel_safe(
                 request,
                 cancel_safe=cancel_safe,
             )
-            response = await self.inference_budget.run_proactive_call(
+            render_status, presentation = await self.inference_budget.run_proactive_call(
                 request,
                 self.proactive_execution_authority,
-                work_factory=lambda: self._run_observed_provider_call(
-                    call_kind=ModelCallKind.PROACTIVE,
-                    latency_kind=LatencyKind.PROACTIVE_PROVIDER,
-                    work_factory=lambda: provider.text_chat(
-                        prompt=request.user_prompt,
-                        contexts=[],
-                        system_prompt=request.system_prompt,
-                        image_urls=[],
-                        audio_urls=[],
-                        func_tool=None,
-                        tool_calls_result=None,
-                        request_max_retries=1,
-                    ),
+                work_factory=lambda: self._render_proactive_presentation(
+                    provider=provider,
+                    request=request,
+                    system_prompt=provider_system_prompt,
+                    user_prompt=provider_user_prompt,
                 ),
                 permit_observer=self._observe_inference_permit,
             )
@@ -2591,22 +3346,9 @@ class ShioPlugin(Star):
                 failure_kind=safe_exception_kind(exc),
             )
             return ProactiveExecutionStatus.PROVIDER_FAILED
-        if not self.proactive_scheduler_runtime.is_current(request):
-            return ProactiveExecutionStatus.SUPERSEDED
-        if getattr(response, "role", "assistant") == "err":
-            return ProactiveExecutionStatus.PROVIDER_FAILED
-        try:
-            presentation = self.proactive_execution_authority.validate_output(
-                request,
-                str(getattr(response, "completion_text", "") or ""),
-            )
-        except Exception as exc:
-            structured_log(
-                logger,
-                "warning",
-                "proactive.output_rejected",
-                failure_kind=safe_exception_kind(exc),
-            )
+        if render_status is not ProactiveExecutionStatus.SENT:
+            return render_status
+        if not isinstance(presentation, ProactivePresentation):
             return ProactiveExecutionStatus.OUTPUT_REJECTED
         if not self.proactive_scheduler_runtime.claim_send(request):
             return ProactiveExecutionStatus.SUPERSEDED
@@ -2614,32 +3356,77 @@ class ShioPlugin(Star):
             reply = self.send_receipts.begin_proactive_presentation_reply(
                 presentation,
             )
-            segment = reply.segments[0]
-            self.send_receipts.mark_attempted(segment.segment_id)
-            try:
-                sent = await self.context.send_message(
-                    request.plan.target.unified_msg_origin,
-                    MessageChain().message(presentation.final_visible_text),
-                )
-            except Exception as exc:
-                self.send_receipts.mark_failed(
-                    segment.segment_id,
-                    failure_kind=safe_exception_kind(exc),
-                )
-            else:
-                if sent is True:
-                    self.send_receipts.mark_succeeded(segment.segment_id)
-                else:
+            min_delay = max(
+                0,
+                self._config_int("bubble_interval_min_ms", 450),
+            ) / 1000
+            max_delay = max(
+                0,
+                self._config_int("bubble_interval_max_ms", 1200),
+            ) / 1000
+            if max_delay < min_delay:
+                min_delay, max_delay = max_delay, min_delay
+            send_failed = False
+            for index, segment in enumerate(reply.segments):
+                if index and not self.proactive_scheduler_runtime.is_current(request):
+                    for remaining in reply.segments[index:]:
+                        self.send_receipts.mark_attempted(remaining.segment_id)
+                        self.send_receipts.mark_failed(
+                            remaining.segment_id,
+                            failure_kind="ProactiveSuperseded",
+                        )
+                    send_failed = True
+                    break
+                if index and max_delay:
+                    await asyncio.sleep(random.uniform(min_delay, max_delay))
+                self.send_receipts.mark_attempted(segment.segment_id)
+                try:
+                    sent = await self.context.send_message(
+                        request.plan.target.unified_msg_origin,
+                        MessageChain().message(segment.visible_text),
+                    )
+                except Exception as exc:
                     self.send_receipts.mark_failed(
                         segment.segment_id,
-                        failure_kind="ContextSendRejected",
+                        failure_kind=safe_exception_kind(exc),
                     )
+                    send_failed = True
+                else:
+                    if sent is True:
+                        self.send_receipts.mark_succeeded(segment.segment_id)
+                    else:
+                        self.send_receipts.mark_failed(
+                            segment.segment_id,
+                            failure_kind="ContextSendRejected",
+                        )
+                        send_failed = True
+                if send_failed:
+                    for remaining in reply.segments[index + 1 :]:
+                        self.send_receipts.mark_attempted(remaining.segment_id)
+                        self.send_receipts.mark_failed(
+                            remaining.segment_id,
+                            failure_kind="PriorSegmentFailed",
+                        )
+                    break
             status = self.proactive_execution_authority.complete_send(
                 presentation,
                 ledger=self.send_receipts,
             )
             terminal_metadata = presentation.trace_metadata()
             if status is ProactiveExecutionStatus.SENT:
+                try:
+                    await self._execute_proactive_meme_after_text(
+                        request=request,
+                        presentation=presentation,
+                        internal_reply_id=reply.internal_reply_id,
+                    )
+                except Exception as exc:
+                    structured_log(
+                        logger,
+                        "warning",
+                        "proactive.meme_failed_after_text",
+                        failure_kind=safe_exception_kind(exc),
+                    )
                 scene_mutation = self.group_scenes.record_proactive_outbound(
                     presentation,
                     ledger=self.send_receipts,
@@ -2699,6 +3486,34 @@ class ShioPlugin(Star):
                 "proactive.scheduler_tick",
                 **metadata,
             )
+        current_group_digests: set[str] = set()
+        for diagnostic in self.proactive_scheduler_runtime.last_group_diagnostics():
+            group_digest = diagnostic_digest(diagnostic.group_id)
+            current_group_digests.add(group_digest)
+            group_signature = (
+                diagnostic.stage_kind,
+                diagnostic.reason_code,
+                diagnostic.admitted,
+            )
+            if (
+                self._proactive_scheduler_group_log_signatures.get(group_digest)
+                == group_signature
+            ):
+                continue
+            self._proactive_scheduler_group_log_signatures[group_digest] = (
+                group_signature
+            )
+            structured_log(
+                logger,
+                "info",
+                "proactive.scheduler_group",
+                group_digest=group_digest,
+                proactive_group_stage_kind=diagnostic.stage_kind,
+                proactive_group_reason_code=diagnostic.reason_code,
+                proactive_group_admitted=diagnostic.admitted,
+            )
+        for stale_digest in set(self._proactive_scheduler_group_log_signatures) - current_group_digests:
+            del self._proactive_scheduler_group_log_signatures[stale_digest]
         return len(requests)
 
     async def _proactive_scheduler_loop(self) -> None:
@@ -2843,6 +3658,8 @@ class ShioPlugin(Star):
             scene_ready = True
             address_ready = True
             participation_assessment: ParticipationAssessment | None = None
+            participation_preflight: ParticipationCadencePreflight | None = None
+            participation_semantic_request: ParticipationSemanticRequest | None = None
             participation_cadence: ParticipationCadenceDecision | None = None
             participation_reaction: ParticipationReactionDecision | None = None
             attention_ticket = event.get_extra(
@@ -2865,11 +3682,22 @@ class ShioPlugin(Star):
                     failure_kind=safe_exception_kind(exc),
                 )
             if envelope.chat_type == "group":
+                structured_mentions: tuple[StructuredMentionEvidence, ...] = ()
+                structured_reply: StructuredReplyEvidence | None = None
+                identity_metadata = build_inbound_identity_metadata(
+                    open_group=True,
+                )
                 try:
+                    (
+                        structured_mentions,
+                        structured_reply,
+                        identity_metadata,
+                    ) = self._structured_address_evidence(event, envelope)
                     scene_mutation = self.group_scenes.record_human(
                         conversation_event,
                         decision=result.decision,
                         public_content=message,
+                        identity_metadata=identity_metadata,
                     )
                 except Exception as exc:
                     scene_ready = False
@@ -2895,6 +3723,8 @@ class ShioPlugin(Star):
                                 event,
                                 envelope,
                                 message,
+                                identity_metadata=identity_metadata,
+                                structured_reply=structured_reply,
                             )
                         except Exception as exc:
                             structured_log(
@@ -2912,9 +3742,6 @@ class ShioPlugin(Star):
                         )
                 if scene_ready and address_ready:
                     try:
-                        structured_mentions, structured_reply = (
-                            self._structured_address_evidence(event, envelope)
-                        )
                         address_decision = self.address_resolution_authority.resolve_group(
                             attention_context,
                             conversation_event,
@@ -3003,18 +3830,56 @@ class ShioPlugin(Star):
                                 ),
                             ),
                         )
-                        participation_cadence = (
-                            self.participation_cadence_authority.issue(
-                                participation_assessment,
-                                now=float(time.monotonic()),
+                        participation_now = float(time.monotonic())
+                        if (
+                            participation_assessment.decision.level
+                            is ParticipationLevel.MAY_JOIN
+                        ):
+                            participation_preflight = (
+                                self.participation_cadence_authority.preflight(
+                                    participation_assessment,
+                                    now=participation_now,
+                                )
                             )
-                        )
-                        participation_reaction = (
-                            self.participation_reaction_authority.issue(
-                                participation_cadence,
-                                current_message=message,
+                            if participation_preflight.allowed:
+                                if envelope.chat_type != "group":
+                                    raise RuntimeError(
+                                        "participation_semantic_group_required"
+                                    )
+                                participation_semantic_request = (
+                                    self.participation_semantic_authority.issue_request(
+                                        participation_assessment,
+                                        participation_preflight,
+                                        scene=scene_mutation.snapshot,
+                                        assistant_display_name="星汐",
+                                    )
+                                )
+                            else:
+                                participation_cadence = (
+                                    self.participation_cadence_authority.finalize(
+                                        participation_preflight,
+                                        outcome=ParticipationLevel.WAIT,
+                                        reason_code=(
+                                            participation_preflight.reason_codes[0]
+                                            if participation_preflight.reason_codes
+                                            else "participation_cadence_preflight_blocked"
+                                        ),
+                                    )
+                                )
+                        else:
+                            participation_cadence = (
+                                self.participation_cadence_authority.issue(
+                                    participation_assessment,
+                                    now=participation_now,
+                                )
                             )
-                        )
+                        if participation_cadence is not None:
+                            participation_reaction = (
+                                self.participation_reaction_authority.issue(
+                                    participation_cadence,
+                                    current_message=message,
+                                )
+                            )
                     except Exception as exc:
                         address_ready = False
                         structured_log(
@@ -3028,19 +3893,85 @@ class ShioPlugin(Star):
                             SHIO_PARTICIPATION_ASSESSMENT,
                             participation_assessment,
                         )
-                        event.set_extra(
-                            SHIO_PARTICIPATION_CADENCE,
-                            participation_cadence,
+                        if participation_preflight is not None:
+                            event.set_extra(
+                                SHIO_PARTICIPATION_CADENCE_PREFLIGHT,
+                                participation_preflight,
+                            )
+                        if participation_semantic_request is not None:
+                            event.set_extra(
+                                SHIO_PARTICIPATION_SEMANTIC_REQUEST,
+                                participation_semantic_request,
+                            )
+                        if participation_cadence is not None:
+                            event.set_extra(
+                                SHIO_PARTICIPATION_CADENCE,
+                                participation_cadence,
+                            )
+                        if participation_reaction is not None:
+                            event.set_extra(
+                                SHIO_PARTICIPATION_REACTION,
+                                participation_reaction,
+                            )
+                        admission_trace = participation_assessment.trace_metadata()
+                        if participation_preflight is not None:
+                            admission_trace.update(
+                                {
+                                    key: value
+                                    for key, value in participation_preflight.trace_metadata().items()
+                                    if key != "schema_version"
+                                }
+                            )
+                        if participation_semantic_request is not None:
+                            admission_trace.update(
+                                {
+                                    key: value
+                                    for key, value in participation_semantic_request.trace_metadata().items()
+                                    if key != "schema_version"
+                                }
+                            )
+                        if participation_cadence is not None:
+                            admission_trace.update(
+                                {
+                                    key: value
+                                    for key, value in participation_cadence.trace_metadata().items()
+                                    if key != "schema_version"
+                                }
+                            )
+                        if participation_semantic_request is not None:
+                            admission_stage = "semantic_candidate"
+                            admission_reason = "participation_semantic_request_issued"
+                        elif participation_preflight is not None:
+                            admission_stage = "preflight_gate"
+                            admission_reason = (
+                                participation_preflight.reason_codes[0]
+                                if participation_preflight.reason_codes
+                                else "participation_cadence_preflight_blocked"
+                            )
+                        else:
+                            admission_stage = "deterministic_terminal"
+                            admission_reason = (
+                                participation_cadence.reason_codes[0]
+                                if participation_cadence is not None
+                                and participation_cadence.reason_codes
+                                else participation_assessment.reason_codes[0]
+                            )
+                        structured_log(
+                            logger,
+                            "info",
+                            "participation.admission_evaluated",
+                            participation_stage=admission_stage,
+                            reason_code=admission_reason,
+                            **admission_trace,
                         )
-                        event.set_extra(
-                            SHIO_PARTICIPATION_REACTION,
-                            participation_reaction,
-                        )
-                        if participation_reaction.decision.level in {
+                        if (
+                            participation_reaction is not None
+                            and participation_reaction.decision.level in {
                             ParticipationLevel.MUST_REPLY,
                             ParticipationLevel.MAY_JOIN,
                             ParticipationLevel.REACT_ONLY,
-                        }:
+                            }
+                        ):
                             try:
                                 generation_snapshot = self.generation_epochs.advance(
                                     envelope,
@@ -3162,7 +4093,20 @@ class ShioPlugin(Star):
             and participation_reaction.decision.level
             in {ParticipationLevel.MAY_JOIN, ParticipationLevel.REACT_ONLY}
         )
-        if candidate.should_promote or participation_should_promote:
+        candidate_should_promote = bool(
+            candidate.should_promote
+            and (
+                str(self._config("natural_name_wake_mode", "natural"))
+                .strip()
+                .lower()
+                == "contains"
+                or (
+                    type(address_decision) is AddressDecision
+                    and address_decision.kind is AddressKind.DIRECT_SELF
+                )
+            )
+        )
+        if candidate_should_promote or participation_should_promote:
             event.is_at_or_wake_command = True
             event.is_wake = True
             event.set_extra(
@@ -3177,7 +4121,7 @@ class ShioPlugin(Star):
                             else "participation_may_join"
                         )
                         if participation_should_promote
-                        and not candidate.should_promote
+                        and not candidate_should_promote
                         else candidate.reason_code
                     ),
                 },
@@ -3197,17 +4141,222 @@ class ShioPlugin(Star):
                         else "participation_may_join"
                     )
                     if participation_should_promote
-                    and not candidate.should_promote
+                    and not candidate_should_promote
                     else candidate.reason_code
                 ),
             )
         return result
+
+    async def _resolve_participation_semantic(
+        self,
+        event: AstrMessageEvent,
+    ) -> None:
+        """Resolve one admitted semantic candidate before any wake promotion."""
+
+        request = event.get_extra(SHIO_PARTICIPATION_SEMANTIC_REQUEST, None)
+        if type(request) is not ParticipationSemanticRequest:
+            return
+        if (
+            type(event.get_extra(SHIO_PARTICIPATION_SEMANTIC_OUTCOME, None))
+            is ParticipationSemanticOutcome
+            or type(event.get_extra(SHIO_PARTICIPATION_CADENCE, None))
+            is ParticipationCadenceDecision
+            or type(event.get_extra(SHIO_PARTICIPATION_REACTION, None))
+            is ParticipationReactionDecision
+        ):
+            return
+
+        preflight = event.get_extra(SHIO_PARTICIPATION_CADENCE_PREFLIGHT, None)
+        if type(preflight) is not ParticipationCadencePreflight:
+            return
+        current_message = request.current_message.content
+        outcome: ParticipationSemanticOutcome | None = None
+        provider = None
+        try:
+            provider = self.context.get_using_provider(
+                str(getattr(event, "unified_msg_origin", "") or "")
+            )
+        except Exception:
+            provider = None
+        try:
+            if provider is None or not callable(getattr(provider, "text_chat", None)):
+                outcome = self.participation_semantic_authority.reject_without_provider(
+                    request,
+                )
+            else:
+                outcome = await self.participation_semantic_authority.evaluate(
+                    request,
+                    provider=provider,
+                    inference_budget=self.inference_budget,
+                    performance_window=self.performance_window,
+                    permit_observer=self._observe_inference_permit,
+                )
+        except asyncio.CancelledError:
+            if self.participation_cadence_authority.is_open(preflight):
+                try:
+                    cadence = self.participation_cadence_authority.finalize(
+                        preflight,
+                        outcome=ParticipationLevel.WAIT,
+                        reason_code="participation_semantic_cancelled",
+                    )
+                    reaction = self.participation_reaction_authority.issue(
+                        cadence,
+                        current_message=current_message,
+                    )
+                    event.set_extra(SHIO_PARTICIPATION_CADENCE, cadence)
+                    event.set_extra(SHIO_PARTICIPATION_REACTION, reaction)
+                except Exception:
+                    pass
+            raise
+        except Exception as exc:
+            structured_log(
+                logger,
+                "error",
+                "participation.semantic_evaluation_failed",
+                failure_kind=safe_exception_kind(exc),
+            )
+
+        final_level = ParticipationLevel.WAIT
+        cadence_reason = "participation_semantic_failed_closed"
+        decision_kind: ParticipationSemanticDecisionKind | None = None
+        if type(outcome) is ParticipationSemanticOutcome:
+            event.set_extra(SHIO_PARTICIPATION_SEMANTIC_OUTCOME, outcome)
+            semantic_trace = request.trace_metadata()
+            semantic_trace.update(
+                {
+                    key: value
+                    for key, value in outcome.trace_metadata().items()
+                    if key != "schema_version"
+                }
+            )
+            structured_log(
+                logger,
+                "info",
+                "participation.semantic_outcome",
+                **semantic_trace,
+            )
+            if outcome.status is ParticipationSemanticStatus.DECIDED:
+                try:
+                    semantic_decision = (
+                        self.participation_semantic_authority.claim_decision(outcome)
+                    )
+                except Exception:
+                    cadence_reason = "participation_semantic_stale_at_claim"
+                else:
+                    decision_kind = semantic_decision.decision
+                    cadence_reason = (
+                        "participation_semantic_"
+                        + semantic_decision.reason_code.value
+                    )
+                    if decision_kind is ParticipationSemanticDecisionKind.REPLY:
+                        final_level = ParticipationLevel.MAY_JOIN
+                    elif decision_kind is ParticipationSemanticDecisionKind.NO_ACTION:
+                        final_level = ParticipationLevel.NO_ACTION
+            else:
+                cadence_reason = outcome.reason_code
+
+        conversation_event = event.get_extra(SHIO_CONVERSATION_EVENT, None)
+        if (
+            final_level is ParticipationLevel.MAY_JOIN
+            and (
+                not isinstance(conversation_event, ConversationEvent)
+                or self.generation_epochs.current(request.binding.scope_key)
+                != request.binding.generation_epoch - 1
+            )
+        ):
+            final_level = ParticipationLevel.WAIT
+            cadence_reason = "participation_semantic_generation_stale"
+
+        try:
+            cadence = self.participation_cadence_authority.finalize(
+                preflight,
+                outcome=final_level,
+                reason_code=cadence_reason,
+            )
+            reaction = self.participation_reaction_authority.issue(
+                cadence,
+                current_message=current_message,
+            )
+        except Exception as exc:
+            structured_log(
+                logger,
+                "error",
+                "participation.semantic_finalize_failed",
+                failure_kind=safe_exception_kind(exc),
+            )
+            return
+        event.set_extra(SHIO_PARTICIPATION_CADENCE, cadence)
+        event.set_extra(SHIO_PARTICIPATION_REACTION, reaction)
+        cadence_trace = cadence.trace_metadata()
+        cadence_trace.update(
+            {
+                key: value
+                for key, value in reaction.trace_metadata().items()
+                if key != "schema_version"
+            }
+        )
+        structured_log(
+            logger,
+            "info",
+            "participation.cadence_finalized",
+            semantic_decision=(
+                decision_kind.value if decision_kind is not None else "failed_closed"
+            ),
+            reason_code=(
+                cadence.reason_codes[0]
+                if cadence.reason_codes
+                else "participation_cadence_finalized"
+            ),
+            **cadence_trace,
+        )
+        if reaction.decision.level not in {
+            ParticipationLevel.MAY_JOIN,
+            ParticipationLevel.REACT_ONLY,
+        }:
+            return
+        if not isinstance(conversation_event, ConversationEvent):
+            return
+        try:
+            generation_snapshot = self.generation_epochs.advance(
+                conversation_event.envelope,
+                expected_epoch=request.binding.generation_epoch,
+            )
+        except Exception as exc:
+            structured_log(
+                logger,
+                "error",
+                "participation.semantic_promotion_failed",
+                failure_kind=safe_exception_kind(exc),
+            )
+            return
+        event.set_extra(GENERATION_EPOCH_EXTRA, generation_snapshot)
+        self.generation_tasks.cancel_older(generation_snapshot)
+        event.is_at_or_wake_command = True
+        event.is_wake = True
+        promotion_reason = (
+            "participation_react_only"
+            if reaction.decision.level is ParticipationLevel.REACT_ONLY
+            else "participation_may_join"
+        )
+        event.set_extra(
+            SHIO_NATURAL_WAKE,
+            {"alias": "星汐", "reason": promotion_reason},
+        )
+        structured_log(
+            logger,
+            "info",
+            "participation.semantic_promoted",
+            scope_digest=diagnostic_digest(request.binding.scope_key),
+            message_digest=request.messages_digest,
+            reason_code=promotion_reason,
+        )
 
     @filter.custom_filter(NaturalNameWakeFilter, False, priority=90)
     async def admit_inbound_event(self, event: AstrMessageEvent):
         """Run after external gates; never emit or globally stop an event."""
 
         self.admit_ingress_event(event)
+        await self._resolve_participation_semantic(event)
 
         if False:  # 保持 AstrBot 对异步生成器过滤器的调用契约。
             yield event
@@ -3231,6 +4380,7 @@ class ShioPlugin(Star):
         event.set_extra(SHIO_ACQUISITION_REQUEST, None)
         event.set_extra(SHIO_EVIDENCE_OUTCOME, None)
         event.set_extra(SHIO_ACTIVE_CAPABILITY_POLICY, None)
+        event.set_extra(SHIO_EFFECTIVE_TOOL_NAMES, ())
         event.set_extra(SHIO_REPLY_COMPOSER_REQUEST, None)
         event.set_extra(SHIO_OUTPUT_VALIDATION_CONTEXT, None)
         event.set_extra(SHIO_SEMANTIC_GUARD_CONTRACT, None)
@@ -3245,6 +4395,11 @@ class ShioPlugin(Star):
         event.set_extra(SHIO_INFERENCE_PERMIT, None)
         event.set_extra(SHIO_PRIMARY_PROVIDER_STARTED_AT, None)
         event.set_extra(SHIO_PERFORMANCE_SNAPSHOT, None)
+        event.set_extra(SHIO_MEME_MANAGER_TOOL, None)
+        event.set_extra(SHIO_MEME_MANAGER_PROMPT, "")
+        event.set_extra(SHIO_MEME_MANAGER_REFERENCE, "")
+        event.set_extra(SHIO_MEME_MANAGER_PRESENTATION_MODE, "unavailable")
+        event.set_extra(SHIO_MEME_MANAGER_CATEGORY_MARKERS, ())
 
     def _discard_semantic_validation_seal(self, event: AstrMessageEvent) -> None:
         self.semantic_guard_controller.discard(
@@ -3436,115 +4591,6 @@ class ShioPlugin(Star):
         )
         return receipt
 
-    async def _execute_text_meme_complement_after_send(
-        self,
-        *,
-        event: AstrMessageEvent,
-        tracker: ReplyObservationTracker,
-    ) -> MemeExecutionReceipt | None:
-        """Run one optional Meme only after the exact text presentation succeeded."""
-
-        planned_action = event.get_extra(SHIO_PLANNED_ACTION, None)
-        expression_intent = event.get_extra(SHIO_EXPRESSION_INTENT, None)
-        if (
-            type(planned_action) is not PlannedAction
-            or type(expression_intent) is not ExpressionIntent
-            or planned_action.kind is not ActionKind.REPLY
-            or expression_intent.modality is not ExpressionModality.TEXT_AND_MEME
-        ):
-            return None
-        existing = event.get_extra(SHIO_MEME_PRESENTATION_RECEIPT, None)
-        if type(existing) is MemeExecutionReceipt:
-            return self.meme_execution_authority.inspect_receipt(existing)
-        presentation = event.get_extra(SHIO_PRESENTATION_HANDOFF, None)
-        if type(presentation) is not PresentationHandoff:
-            raise ContractViolation("meme_complement_presentation_required")
-        send_evidence = self.send_receipts.issue_presentation_send_terminal_evidence(
-            presentation,
-            internal_reply_id=tracker.internal_reply_id,
-        )
-        event.set_extra(SHIO_PRESENTATION_SEND_EVIDENCE, send_evidence)
-        generation = event_generation_snapshot(event)
-        if generation is None:
-            raise ContractViolation("meme_generation_not_canonical")
-        if not event_epoch_validation(event, self.generation_epochs).is_current:
-            receipt = self.meme_execution_authority.issue_stale_complement(
-                planned_action=planned_action,
-                expression_intent=expression_intent,
-                generation=generation,
-                presentation=presentation,
-                send_ledger=self.send_receipts,
-                send_evidence=send_evidence,
-            )
-            conformance = None
-        else:
-            conformance = self.meme_manager_conformance.collect(self.context)
-            if conformance.status is not MemeManagerConformanceStatus.VERIFIED:
-                reason_by_status = {
-                    MemeManagerConformanceStatus.MISSING: "runtime_missing",
-                    MemeManagerConformanceStatus.DISABLED: "runtime_disabled",
-                    MemeManagerConformanceStatus.INTERFACE_CHANGED: (
-                        "runtime_interface_changed"
-                    ),
-                    MemeManagerConformanceStatus.BUILD_CHANGED: (
-                        "runtime_build_changed"
-                    ),
-                    MemeManagerConformanceStatus.ERROR: "runtime_error",
-                }
-                receipt = self.meme_execution_authority.issue_suppressed(
-                    planned_action=planned_action,
-                    expression_intent=expression_intent,
-                    generation=generation,
-                    reason_code=reason_by_status[conformance.status],
-                )
-            else:
-                runtime_evidence = conformance.evidence
-                if runtime_evidence is None:
-                    raise ContractViolation("meme_runtime_evidence_required")
-                lease = self.meme_execution_authority.prepare(
-                    planned_action=planned_action,
-                    expression_intent=expression_intent,
-                    generation=generation,
-                    runtime_evidence=runtime_evidence,
-                    presentation=presentation,
-                    send_ledger=self.send_receipts,
-                    send_evidence=send_evidence,
-                )
-                permit = self.meme_execution_authority.claim(
-                    lease,
-                    generation=generation,
-                )
-                receipt = await self.scope_concurrency.run_event(
-                    generation,
-                    self._effective_principal(event),
-                    kind=ScopeWorkKind.REACT,
-                    work_factory=lambda: execute_meme_permit(
-                        self.meme_execution_authority,
-                        permit,
-                        event=event,
-                        generation=generation,
-                    ),
-                )
-        self.meme_execution_authority.inspect_receipt(receipt)
-        event.set_extra(SHIO_MEME_PRESENTATION_RECEIPT, receipt)
-        trace_values = receipt.trace_metadata()
-        if conformance is not None:
-            trace_values = {**conformance.trace_metadata(), **trace_values}
-        record_pipeline_stage(
-            event,
-            "meme_presentation",
-            text_terminal=True,
-            **trace_values,
-        )
-        structured_log(
-            logger,
-            "info",
-            "meme.presentation_terminal",
-            trace_id=get_trace_id(event),
-            **receipt.trace_metadata(),
-        )
-        return receipt
-
     def _block_typed_turn(
         self,
         event: AstrMessageEvent,
@@ -3583,7 +4629,7 @@ class ShioPlugin(Star):
             reason_code=reason_code,
         )
 
-    def _activate_planned_reply_request(
+    async def _activate_planned_reply_request(
         self,
         *,
         event: AstrMessageEvent,
@@ -3601,6 +4647,7 @@ class ShioPlugin(Star):
         persona_package: PersonaPackage,
         recent_replies: list[str],
         evidence_outcome: EvidenceOutcome | None = None,
+        generation_snapshot: Any = None,
     ) -> bool:
         """Build the sole final Persona request after content and evidence settle."""
 
@@ -3727,46 +4774,21 @@ class ShioPlugin(Star):
                     if value
                 )
             )
-            recent_sender_messages = tuple(
-                record.content
-                for record in assembled.replyer_thread
-                if record.role is LedgerRole.USER and record.content
-            )[-4:]
-            meme_complement = decide_text_meme_complement(
-                cadence=self.meme_complement_cadence,
-                planned_action_authority=self.planned_action_authority,
-                planned_action=planned_action,
+            meme_complement = decide_semantic_meme_handoff(
                 current_message=current_message,
-                social_act=persona_expression.topic_return,
-                emotion_tags=emotion_tags,
-                relationship_distance=appraisal.relationship_distance,
-                recent_sender_messages=recent_sender_messages,
             )
             expression_intent = self.expression_intent_authority.issue(
                 planned_action_authority=self.planned_action_authority,
                 planned_action=planned_action,
-                modality=(
-                    ExpressionModality.TEXT_AND_MEME
-                    if meme_complement.eligible
-                    else ExpressionModality.TEXT
-                ),
+                modality=ExpressionModality.TEXT,
                 social_act=persona_expression.topic_return,
                 emotion_tags=emotion_tags,
-                **(
-                    {
-                        "current_message": current_message,
-                        "relationship_distance": appraisal.relationship_distance,
-                        "recent_sender_messages": recent_sender_messages,
-                    }
-                    if meme_complement.eligible
-                    else {}
-                ),
                 max_bubbles=min(
                     3,
                     max(1, int(self._config("chat_max_bubbles", 3))),
                 ),
-                meme_executor=("meme_manager" if meme_complement.eligible else ""),
-                max_meme_calls=(1 if meme_complement.eligible else 0),
+                meme_executor="",
+                max_meme_calls=0,
                 reason_codes=("typed_text_renderer",),
             )
             event.set_extra(SHIO_MEME_COMPLEMENT_DECISION, meme_complement)
@@ -3777,11 +4799,7 @@ class ShioPlugin(Star):
                 trace_id=get_trace_id(event),
                 eligible=meme_complement.eligible,
                 reason_code=meme_complement.reason_code,
-                category=(
-                    meme_complement.category.value
-                    if meme_complement.category is not None
-                    else "none"
-                ),
+                category="manager_semantic",
             )
             if isinstance(product_trace, ProductTrace):
                 product_trace.append(
@@ -3795,29 +4813,70 @@ class ShioPlugin(Star):
                         source_verified=True,
                     ),
                 )
-            composer_request = build_reply_composer_request(
-                planned_action=planned_action,
-                content_seed=content_seed,
-                expression_intent=expression_intent,
-                affect_appraisal=appraisal,
-                continuous_affect=continuous_affect,
-                relationship_context=relationship_context,
-                persona_expression=persona_expression,
-                expression_candidates=retrieval.candidates,
-                persona_package=persona_package,
-                capability_policy=capability_policy,
-                current_message=current_message,
-                sender_name=sender_name,
-                current_question_anchor=current_question_anchor,
-                assembled_context=assembled,
-                media_context=media_adaptation.context,
-                media_prompt_evidence=(
+            composer_request_kwargs = {
+                "planned_action": planned_action,
+                "content_seed": content_seed,
+                "expression_intent": expression_intent,
+                "affect_appraisal": appraisal,
+                "continuous_affect": continuous_affect,
+                "relationship_context": relationship_context,
+                "persona_expression": persona_expression,
+                "expression_candidates": retrieval.candidates,
+                "persona_package": persona_package,
+                "capability_policy": capability_policy,
+                "current_message": current_message,
+                "sender_name": sender_name,
+                "current_question_anchor": current_question_anchor,
+                "assembled_context": assembled,
+                "media_context": media_adaptation.context,
+                "media_prompt_evidence": (
                     media_adaptation.transport.safe_prompt_evidence
                 ),
-                evidence_outcome=evidence_outcome,
-                temporal_context=self._build_temporal_context(
+                "evidence_outcome": evidence_outcome,
+                "temporal_context": self._build_temporal_context(
                     now=float(time.time()),
                 ),
+                "scene_rules": (
+                    str(
+                        self._config(
+                            "natural_group_participation_rules",
+                            DEFAULT_NATURAL_GROUP_PARTICIPATION_RULES,
+                        )
+                        or DEFAULT_NATURAL_GROUP_PARTICIPATION_RULES
+                    ).strip()
+                    if capability_policy.conversation_mode == "group_join"
+                    else ""
+                ),
+                "effective_tool_names": tuple(
+                    event.get_extra(SHIO_EFFECTIVE_TOOL_NAMES, ()) or ()
+                ),
+            }
+            # The provisional request is canonical input only.  Its action
+            # outcome is deliberately not claimed until the Provider decision
+            # has sealed the final request's immutable typed gate.
+            preflight_request = build_reply_composer_request(
+                **composer_request_kwargs,
+                semantic_risk_decision=SemanticRiskDecision.NONE,
+                claim_action_outcome=False,
+            )
+            semantic_risk = await self._run_semantic_risk_preflight(
+                event=event,
+                req=req,
+                snapshot=generation_snapshot,
+                principal=principal,
+                planned_action=planned_action,
+                composer_request=preflight_request,
+            )
+            if semantic_risk is SemanticRiskDecision.UNCERTAIN:
+                event.set_extra(SHIO_SEMANTIC_RISK_DECISION, None)
+                return False
+            composer_request = build_reply_composer_request(
+                **composer_request_kwargs,
+                semantic_risk_decision=semantic_risk,
+            )
+            event.set_extra(
+                SHIO_SEMANTIC_RISK_DECISION,
+                (semantic_risk, self._semantic_risk_snapshot(composer_request)),
             )
             semantic_contract = SemanticGuardContract(
                 composer_request=composer_request,
@@ -3860,11 +4919,34 @@ class ShioPlugin(Star):
             ),
         )
         media_adaptation.restore_request_media(req)
-        req.system_prompt = composer_request.system_prompt
-        req.contexts = []
+        manager_tool = event.get_extra(SHIO_MEME_MANAGER_TOOL, None)
+        manager_prompt = str(
+            event.get_extra(SHIO_MEME_MANAGER_PROMPT, "") or ""
+        ).strip()
+        manager_presentation_mode = str(
+            event.get_extra(SHIO_MEME_MANAGER_PRESENTATION_MODE, "") or ""
+        ).strip()
+        manager_presentation_active = bool(
+            manager_prompt
+            and (
+                manager_presentation_mode == "legacy_category"
+                or (
+                    manager_presentation_mode == "semantic_tool"
+                    and manager_tool is not None
+                )
+            )
+        )
+        req.system_prompt = composer_request.system_prompt + (
+            f"\n\n{manager_prompt}" if manager_presentation_active else ""
+        )
+        req.contexts = [
+            message.provider_dict() for message in composer_request.model_messages
+        ]
         req.prompt = composer_request.user_prompt
         req.extra_user_content_parts = []
-        req.func_tool = ToolSet([])
+        req.func_tool = ToolSet(
+            [manager_tool] if manager_tool is not None else []
+        )
         req.tool_calls_result = None
 
         event.set_extra(SHIO_TYPED_PIPELINE_ACTIVE, True)
@@ -3886,7 +4968,10 @@ class ShioPlugin(Star):
             {
                 "typed_pipeline_active": True,
                 "system_prompt": composer_request.system_prompt,
-                "contexts": [],
+                "contexts": [
+                    message.provider_dict()
+                    for message in composer_request.model_messages
+                ],
                 "recent_assistant_replies": list(recent_replies),
                 "prompt": composer_request.user_prompt,
                 "current_message": current_message,
@@ -3962,10 +5047,26 @@ class ShioPlugin(Star):
             target_digest=diagnostic_digest(target.message_id),
             action_kind=planned_action.kind.value,
             context_record_count=composer_request.context_record_count,
+            provider_context_count=len(composer_request.model_messages),
             grounding_fact_count=composer_request.grounding_fact_count,
             expression_count=composer_request.candidate_count,
             planner_call_count=0,
             final_generation_budget=1,
+            manager_presentation_active=manager_presentation_active,
+            manager_presentation_tool=bool(
+                manager_presentation_mode == "semantic_tool"
+                and manager_tool is not None
+            ),
+            manager_presentation_mode=manager_presentation_mode or "unavailable",
+            manager_prompt_captured=bool(manager_prompt),
+            primary_provider_owner="astrbot_default_request",
+            primary_provider_digest=diagnostic_digest(
+                str(
+                    getattr(req, "provider_id", "")
+                    or getattr(req, "model", "")
+                    or "astrbot_default_request"
+                )
+            ),
         )
         return True
 
@@ -3976,6 +5077,7 @@ class ShioPlugin(Star):
         req: ProviderRequest,
     ) -> None:
         """内置权限守卫：主人保留全部工具，普通用户只保留精确白名单。"""
+        event.set_extra(SHIO_EFFECTIVE_TOOL_NAMES, ())
         if not bool(self._config("permission_guard_enabled", True)):
             return
 
@@ -3987,6 +5089,24 @@ class ShioPlugin(Star):
         event.set_extra(SHIO_IDENTITY_SCOPE, identity_scope)
         configured_allowed = set(self._guest_allowed_tool_names())
         available_tools = self._available_tools(req.func_tool)
+        manager_tool = (
+            next(
+                (
+                    tool
+                    for tool in available_tools
+                    if str(getattr(tool, "name", "") or "") == "search_memes"
+                ),
+                None,
+            )
+            if (
+                bool(event.get_extra("meme_manager_semantic_active", False))
+                and str(event.get_extra("meme_manager_semantic_mode", "")) == "tool"
+            )
+            else None
+        )
+        capability_tools = [
+            tool for tool in available_tools if tool is not manager_tool
+        ]
         active_policy = (
             build_owner_capability_policy(
                 principal,
@@ -4001,18 +5121,27 @@ class ShioPlugin(Star):
         )
         allowed_tools = [
             tool
-            for tool in available_tools
+            for tool in capability_tools
             if decide_tool(active_policy, classify_tool(tool)).allowed
         ]
         allowed_tool_names = [str(getattr(tool, "name", "")) for tool in allowed_tools]
         if not sender_id:
             allowed_tools = []
             allowed_tool_names = []
+            manager_tool = None
+        event.set_extra(
+            SHIO_EFFECTIVE_TOOL_NAMES,
+            tuple(
+                dict.fromkeys(
+                    name for name in allowed_tool_names if str(name or "").strip()
+                )
+            ),
+        )
         event.set_extra(
             SHIO_CAPABILITY_POLICY,
             self._capability_policy_metadata(
                 policy=active_policy,
-                available_tools=available_tools,
+                available_tools=capability_tools,
             ),
         )
 
@@ -4021,8 +5150,11 @@ class ShioPlugin(Star):
             name
             for name in self._get_tool_names(req.func_tool)
             if name not in allowed_name_set
+            and not (manager_tool is not None and name == "search_memes")
         ]
-        req.func_tool = ToolSet(allowed_tools)
+        req.func_tool = ToolSet(
+            allowed_tools + ([manager_tool] if manager_tool is not None else [])
+        )
 
         if bool(self._config("inject_verified_context", True)):
             access_mode = (
@@ -4099,12 +5231,26 @@ class ShioPlugin(Star):
             )
             return
 
+        await self._resolve_participation_semantic(event)
+
         # AstrBot's internal tool loop does not re-enter this hook.  A value
         # arriving here is therefore legacy/unbound input, never evidence for
         # the current action.  Drop it and build the current turn from the
         # admitted event; the sealed acquisition path below owns all results.
+        manager_tool, manager_prompt, manager_presentation_mode = (
+            self._capture_meme_manager_tool_prompt(
+            event,
+            req,
+            )
+        )
         req.tool_calls_result = None
         self._set_inactive(event)
+        event.set_extra(SHIO_MEME_MANAGER_TOOL, manager_tool)
+        event.set_extra(SHIO_MEME_MANAGER_PROMPT, manager_prompt)
+        event.set_extra(
+            SHIO_MEME_MANAGER_PRESENTATION_MODE,
+            manager_presentation_mode,
+        )
         sender_id, sender_name = self._effective_sender(event)
         turn_envelope = ensure_turn_envelope(event)
         generation_snapshot = event_generation_snapshot(event)
@@ -4520,10 +5666,9 @@ class ShioPlugin(Star):
                     requires_evidence=False,
                     requested_capability=None,
                     max_tool_calls=0,
-                    reason_codes=("opportunity_join_zero_tool",),
+                    reason_codes=("participation_react_only_zero_tool",),
                 )
-                if participation.level
-                in {ParticipationLevel.MAY_JOIN, ParticipationLevel.REACT_ONLY}
+                if participation.level is ParticipationLevel.REACT_ONLY
                 else decide_knowledge_gap(
                     content_seed=content_seed,
                     current_message=current_message,
@@ -4721,7 +5866,9 @@ class ShioPlugin(Star):
             acquisition_clock = time.monotonic()
             runtime_tools = self._available_tools(req.func_tool)
             configured_names = (
-                tuple(
+                tuple(self._guest_allowed_tool_names())
+                if conversation_mode == "group_join"
+                else tuple(
                     str(getattr(tool, "name", "") or "").strip()
                     for tool in runtime_tools
                     if str(getattr(tool, "name", "") or "").strip()
@@ -4736,7 +5883,13 @@ class ShioPlugin(Star):
             )
             try:
                 request_shape = (
-                    build_extract_request_shape(
+                    build_knowledge_base_request_shape(
+                        admitted_event.binding,
+                        query=current_message,
+                    )
+                    if knowledge_gap.requested_capability
+                    is CapabilityClass.CHAT_RETRIEVAL
+                    else build_extract_request_shape(
                         admitted_event.binding,
                         url=url_match.group(0),
                     )
@@ -4836,6 +5989,16 @@ class ShioPlugin(Star):
                     reason_codes=("acquisition_unavailable",),
                 )
             event.set_extra(SHIO_EVIDENCE_OUTCOME, evidence_outcome)
+            if (
+                conversation_mode == "group_join"
+                and evidence_outcome.kind is not EvidenceOutcomeKind.ACCEPTED
+            ):
+                self._block_typed_turn(
+                    event,
+                    req,
+                    reason_code="group_join_grounding_unavailable",
+                )
+                return
             if evidence_outcome.kind is EvidenceOutcomeKind.ACCEPTED:
                 content_seed = attach_grounding_facts(
                     content_seed,
@@ -4850,7 +6013,7 @@ class ShioPlugin(Star):
 
         if (
             runtime_decision.activate_typed_pipeline
-            and self._activate_planned_reply_request(
+            and await self._activate_planned_reply_request(
                 event=event,
                 req=req,
                 envelope=turn_envelope,
@@ -4866,9 +6029,28 @@ class ShioPlugin(Star):
                 persona_package=persona_package,
                 recent_replies=recent_replies,
                 evidence_outcome=evidence_outcome,
+                generation_snapshot=generation_snapshot,
             )
         ):
             try:
+                composer_request = event.get_extra(SHIO_REPLY_COMPOSER_REQUEST, None)
+                if not isinstance(composer_request, ReplyComposerRequest):
+                    raise RuntimeError("semantic risk request unavailable")
+                risk_binding = event.get_extra(SHIO_SEMANTIC_RISK_DECISION, None)
+                if (
+                    type(risk_binding) is not tuple
+                    or len(risk_binding) != 2
+                    or risk_binding[0] is not composer_request.semantic_risk_decision
+                    or risk_binding[1]
+                    != self._semantic_risk_snapshot(composer_request)
+                ):
+                    self._set_inactive(event)
+                    self._block_typed_turn(
+                        event,
+                        req,
+                        reason_code="semantic_risk_binding_missing",
+                    )
+                    return
                 permit = await self.inference_budget.acquire_event(
                     generation_snapshot,
                     principal,
@@ -4940,6 +6122,7 @@ class ShioPlugin(Star):
         persona_expression = event.get_extra(SHIO_PERSONA_EXPRESSION, None)
         capability_policy = event.get_extra(SHIO_ACTIVE_CAPABILITY_POLICY, None)
         media_adaptation = event.get_extra(SHIO_MEDIA_ADAPTATION, None)
+        risk_binding = event.get_extra(SHIO_SEMANTIC_RISK_DECISION, None)
         if (
             not isinstance(composer_request, ReplyComposerRequest)
             or not isinstance(validation_context, OutputValidationContext)
@@ -4962,6 +6145,20 @@ class ShioPlugin(Star):
             or semantic_contract.media_context is not media_adaptation.context
             or semantic_contract.evidence_outcome
             is not event.get_extra(SHIO_EVIDENCE_OUTCOME, None)
+            or type(risk_binding) is not tuple
+            or len(risk_binding) != 2
+            or type(risk_binding[0]) is not SemanticRiskDecision
+            or risk_binding[0] is SemanticRiskDecision.UNCERTAIN
+            or risk_binding[0] is not composer_request.semantic_risk_decision
+            or (
+                risk_binding[0] is SemanticRiskDecision.ATTRIBUTION_REQUIRED
+                and composer_request.attribution_risk is AttributionRisk.NONE
+            )
+            or (
+                risk_binding[0] is SemanticRiskDecision.NONE
+                and composer_request.attribution_risk is not AttributionRisk.NONE
+            )
+            or risk_binding[1] != self._semantic_risk_snapshot(composer_request)
         ):
             response.role = "assistant"
             response.completion_text = ""
@@ -4975,7 +6172,10 @@ class ShioPlugin(Star):
             return
 
         initial_raw_output = str(response.completion_text or "")
-        raw_output = initial_raw_output
+        raw_output = self._clean_meme_manager_model_output(
+            event,
+            initial_raw_output,
+        )
         record_pipeline_stage(
             event,
             "raw_reply",
@@ -5011,6 +6211,8 @@ class ShioPlugin(Star):
         )
 
         if decision.action is RepairAction.BLOCK:
+            event.set_extra(SHIO_MEME_MANAGER_REFERENCE, "")
+            event.set_extra(SHIO_MEME_MANAGER_CATEGORY_MARKERS, ())
             response.role = "assistant"
             response.completion_text = ""
             event.set_extra("meme_manager_semantic_selected_ids", [])
@@ -5025,7 +6227,19 @@ class ShioPlugin(Star):
             return
 
         if decision.action is RepairAction.GENERATE_ONCE:
+            # A marker selected for the rejected draft cannot authorize an
+            # image for the repaired visible reply.
+            event.set_extra(SHIO_MEME_MANAGER_REFERENCE, "")
+            event.set_extra(SHIO_MEME_MANAGER_CATEGORY_MARKERS, ())
             repair_call_count = 0
+            initial_issue_count = len(report.issues)
+            initial_primary_issue_code = (
+                report.issue_codes[0] if report.issue_codes else "none"
+            )
+            repair_failure_kind = ""
+            repair_result_code = "not_started"
+            repair_provider_digest = ""
+            repair_response_metadata = _llm_response_diagnostics(None)
             try:
                 repair_request = build_single_repair_request(
                     original_request=composer_request,
@@ -5033,6 +6247,20 @@ class ShioPlugin(Star):
                     report=report,
                     repair_attempts_used=attempts,
                     semantic_contract=semantic_contract,
+                    trusted_presentation_prompt=(
+                        str(
+                            event.get_extra(SHIO_MEME_MANAGER_PROMPT, "") or ""
+                        ).strip()
+                        if str(
+                            event.get_extra(
+                                SHIO_MEME_MANAGER_PRESENTATION_MODE,
+                                "",
+                            )
+                            or ""
+                        ).strip()
+                        == "legacy_category"
+                        else ""
+                    ),
                 )
                 event.set_extra(SHIO_REPAIR_ATTEMPTS, attempts + 1)
                 owner_action_fallback = (
@@ -5041,15 +6269,27 @@ class ShioPlugin(Star):
                 direct_reply_fallback = build_safe_direct_reply_fallback(
                     composer_request
                 )
+                grounded_evidence_fallback = build_grounded_evidence_fallback(
+                    composer_request
+                )
                 used_fallback = owner_action_fallback is not None
-                repair_failure_kind = ""
                 if owner_action_fallback is not None:
                     raw_output = owner_action_fallback
+                    repair_result_code = "owner_action_fallback"
                 else:
                     try:
+                        configured_repair_provider_id = str(
+                            self._config("replyer_provider_id", "")
+                        ).strip()
                         provider = self._provider(
-                            str(self._config("replyer_provider_id", "")),
+                            configured_repair_provider_id,
                             event.unified_msg_origin,
+                        )
+                        repair_provider_digest = diagnostic_digest(
+                            configured_repair_provider_id
+                            or type(provider).__name__
+                            if provider is not None
+                            else "missing"
                         )
                         snapshot = event_generation_snapshot(event)
                         if provider is None or snapshot is None:
@@ -5092,7 +6332,10 @@ class ShioPlugin(Star):
                                         snapshot,
                                         provider.text_chat(
                                             prompt=repair_request.user_prompt,
-                                            contexts=[],
+                                            contexts=[
+                                                message.provider_dict()
+                                                for message in composer_request.model_messages
+                                            ],
                                             system_prompt=repair_request.system_prompt,
                                             image_urls=list(
                                                 repair_media.transport.image_urls
@@ -5111,13 +6354,48 @@ class ShioPlugin(Star):
                                 permit_observer=self._observe_inference_permit,
                             ),
                         )
+                        repair_response_metadata = _llm_response_diagnostics(repaired)
                         raw_output = str(repaired.completion_text or "")
+                        if raw_output.strip():
+                            repair_result_code = "visible_completion"
+                        elif repair_response_metadata["repair_reasoning_chars"]:
+                            repair_result_code = "reasoning_only"
+                        else:
+                            repair_result_code = "empty_completion"
+                        structured_log(
+                            logger,
+                            "info",
+                            "typed_reply.repair_provider_returned",
+                            trace_id=get_trace_id(event),
+                            initial_issue_count=initial_issue_count,
+                            initial_primary_issue_code=initial_primary_issue_code,
+                            repair_provider_digest=repair_provider_digest,
+                            repair_result_code=repair_result_code,
+                            **repair_response_metadata,
+                        )
                     except SupersededGeneration:
                         raise
                     except Exception as exc:
                         repair_failure_kind = safe_exception_kind(exc)
+                        repair_result_code = "provider_exception"
                         raw_output = ""
+                        structured_log(
+                            logger,
+                            "warning",
+                            "typed_reply.repair_provider_failed",
+                            trace_id=get_trace_id(event),
+                            initial_issue_count=initial_issue_count,
+                            initial_primary_issue_code=initial_primary_issue_code,
+                            repair_provider_digest=repair_provider_digest,
+                            failure_kind=repair_failure_kind,
+                            repair_result_code=repair_result_code,
+                            **repair_response_metadata,
+                        )
 
+                    raw_output = self._clean_meme_manager_model_output(
+                        event,
+                        raw_output,
+                    )
                     candidate_result = parse_reply_composer_output(
                         composer_request,
                         raw_output,
@@ -5128,9 +6406,23 @@ class ShioPlugin(Star):
                         raw_output=raw_output,
                         context=validation_context,
                     )
-                    if not candidate_is_valid and direct_reply_fallback is not None:
-                        raw_output = direct_reply_fallback
-                        used_fallback = True
+                    if not candidate_is_valid:
+                        if repair_result_code == "visible_completion":
+                            repair_result_code = "validation_rejected"
+                        if grounded_evidence_fallback is not None:
+                            raw_output = grounded_evidence_fallback
+                            used_fallback = True
+                            event.set_extra(
+                                SHIO_MEME_MANAGER_CATEGORY_MARKERS,
+                                (),
+                            )
+                        elif direct_reply_fallback is not None:
+                            raw_output = direct_reply_fallback
+                            used_fallback = True
+                            event.set_extra(
+                                SHIO_MEME_MANAGER_CATEGORY_MARKERS,
+                                (),
+                            )
                 result = parse_reply_composer_output(composer_request, raw_output)
                 report = validate_reply_composer_output(
                     request=composer_request,
@@ -5145,6 +6437,10 @@ class ShioPlugin(Star):
                     "repair",
                     repair_call_count=repair_call_count,
                     repair_failure_count=0 if report.is_valid else 1,
+                    initial_issue_count=initial_issue_count,
+                    initial_primary_issue_code=initial_primary_issue_code,
+                    repair_result_code=repair_result_code,
+                    repair_provider_digest=repair_provider_digest,
                     outcome=(
                         "fallback_succeeded"
                         if used_fallback and report.is_valid
@@ -5160,6 +6456,7 @@ class ShioPlugin(Star):
                         else {}
                     ),
                     **report.trace_metadata(),
+                    **repair_response_metadata,
                 )
             except SupersededGeneration:
                 response.role = "assistant"
@@ -5179,6 +6476,11 @@ class ShioPlugin(Star):
                     repair_failure_count=1,
                     outcome="failed",
                     failure_kind=safe_exception_kind(exc),
+                    initial_issue_count=initial_issue_count,
+                    initial_primary_issue_code=initial_primary_issue_code,
+                    repair_result_code="orchestration_exception",
+                    repair_provider_digest=repair_provider_digest,
+                    **repair_response_metadata,
                 )
 
             post_decision = decide_output_repair(
@@ -5198,12 +6500,22 @@ class ShioPlugin(Star):
                     "typed_reply.repair_rejected",
                     trace_id=get_trace_id(event),
                     issue_count=len(report.issues),
+                    initial_issue_count=initial_issue_count,
+                    initial_primary_issue_code=initial_primary_issue_code,
                     primary_issue_code=(
                         report.issue_codes[0]
                         if report.issue_codes
                         else "repair_output_invalid"
                     ),
                     repair_attempt_count=1,
+                    repair_result_code=repair_result_code,
+                    repair_provider_digest=repair_provider_digest,
+                    **(
+                        {"failure_kind": repair_failure_kind}
+                        if repair_failure_kind
+                        else {}
+                    ),
+                    **repair_response_metadata,
                 )
                 return
 
@@ -5249,7 +6561,25 @@ class ShioPlugin(Star):
         event.set_extra(SHIO_PRESENTATION_HANDOFF, presentation)
         event.set_extra(SHIO_SEMANTIC_VALIDATION_SEAL, semantic_seal)
         response.role = "assistant"
-        response.completion_text = final_text
+        manager_reference = str(
+            event.get_extra(SHIO_MEME_MANAGER_REFERENCE, "") or ""
+        ).strip()
+        manager_categories = tuple(
+            str(value or "").strip()
+            for value in (
+                event.get_extra(SHIO_MEME_MANAGER_CATEGORY_MARKERS, ()) or ()
+            )
+            if _MEME_MANAGER_SAFE_CATEGORY_RE.fullmatch(
+                str(value or "").strip()
+            )
+        )
+        manager_suffixes = (
+            ([f"&&{manager_reference}&&"] if manager_reference else [])
+            + [f"&&{category}&&" for category in manager_categories]
+        )
+        response.completion_text = final_text + (
+            "\n" + "\n".join(manager_suffixes) if manager_suffixes else ""
+        )
         record_pipeline_stage(
             event,
             "presentation_handoff",
@@ -5267,7 +6597,9 @@ class ShioPlugin(Star):
             **report.trace_metadata(),
         )
 
-    @filter.on_llm_response(priority=100)
+    # Validate/repair before Meme Manager's priority=99999 response hook so
+    # semantic selection always sees the final user-visible reply.
+    @filter.on_llm_response(priority=sys.maxsize)
     async def guard_persona_reply(
         self,
         event: AstrMessageEvent,
@@ -5467,9 +6799,28 @@ class ShioPlugin(Star):
                 for reference in references:
                     if reference not in final_meme_references:
                         final_meme_references.append(reference)
+        removed_unconsumed_manager_marker = False
+        for component in text_components:
+            original_component_text = str(component.text or "")
+            cleaned_component_text, _ = (
+                self._extract_meme_manager_category_markers(
+                    original_component_text,
+                    trusted_legacy_mode=False,
+                )
+            )
+            component.text = cleaned_component_text
+            if cleaned_component_text != original_component_text.strip():
+                removed_unconsumed_manager_marker = True
         if removed_visible_tool_artifact:
             logger.warning(
                 "[星汐/表达守卫] 发送前已从消息节点移除伪造的工具文本调用。"
+            )
+        if removed_unconsumed_manager_marker:
+            structured_log(
+                logger,
+                "warning",
+                "presentation.manager_marker_unconsumed",
+                trace_id=get_trace_id(event),
             )
         if final_meme_references:
             structured_log(
@@ -5533,6 +6884,7 @@ class ShioPlugin(Star):
         media_adaptation = event.get_extra(SHIO_MEDIA_ADAPTATION, None)
         evidence_outcome = event.get_extra(SHIO_EVIDENCE_OUTCOME, None)
         presentation = event.get_extra(SHIO_PRESENTATION_HANDOFF, None)
+        risk_binding = event.get_extra(SHIO_SEMANTIC_RISK_DECISION, None)
         stage_state_valid = bool(
             isinstance(semantic_contract, SemanticGuardContract)
             and isinstance(semantic_seal, SemanticValidationSeal)
@@ -5542,6 +6894,12 @@ class ShioPlugin(Star):
             and isinstance(content_intent, ContentIntent)
             and isinstance(media_adaptation, AstrBotMediaAdaptation)
             and isinstance(presentation, PresentationHandoff)
+            and type(risk_binding) is tuple
+            and len(risk_binding) == 2
+            and type(risk_binding[0]) is SemanticRiskDecision
+            and risk_binding[0] is not SemanticRiskDecision.UNCERTAIN
+            and isinstance(composer_request, ReplyComposerRequest)
+            and risk_binding[1] == self._semantic_risk_snapshot(composer_request)
             and presentation.eligible
             and validation_context.composer_request is composer_request
             and validation_context.semantic_contract is semantic_contract
@@ -5577,6 +6935,28 @@ class ShioPlugin(Star):
                 event,
                 "final_send_blocked",
                 reason_code="semantic_stage_seal_missing_or_mismatched",
+            )
+            self._emit_pipeline_metrics(event)
+            return
+        if contains_history_speaker_attribution_confusion(
+            current_message=validation_context.current_message,
+            visible_text=visible_text,
+            model_messages=composer_request.model_messages,
+            current_sender_key=composer_request.target_sender_key,
+        ):
+            self._discard_semantic_validation_seal(event)
+            result.chain.clear()
+            event.set_extra("meme_manager_semantic_selected_ids", [])
+            structured_log(
+                logger,
+                "warning",
+                "typed_reply.final_history_speaker_attribution_blocked",
+                trace_id=get_trace_id(event),
+            )
+            record_pipeline_stage(
+                event,
+                "final_send_blocked",
+                reason_code="history_speaker_attribution",
             )
             self._emit_pipeline_metrics(event)
             return
@@ -6010,6 +7390,8 @@ class ShioPlugin(Star):
                     reply_to_message_id=envelope.message_id,
                     timestamp=time.time(),
                     content=text,
+                    platform_id=envelope.platform_id,
+                    bot_id=envelope.bot_id,
                 )
                 ledger_ids.add(internal_message_id)
                 event.set_extra(SHIO_LEDGER_OUTBOUND_IDS, ledger_ids)
@@ -6138,25 +7520,6 @@ class ShioPlugin(Star):
             self.performance_window.observe_latency(
                 LatencyKind.FULL_REPLY,
                 float((time.perf_counter() - trace_context.started_at) * 1000.0),
-            )
-        try:
-            await self._execute_text_meme_complement_after_send(
-                event=event,
-                tracker=tracker,
-            )
-        except Exception as exc:
-            structured_log(
-                logger,
-                "error",
-                "meme.presentation_finalize_failed",
-                trace_id=get_trace_id(event),
-                failure_kind=safe_exception_kind(exc),
-            )
-            record_pipeline_stage(
-                event,
-                "meme_presentation",
-                meme_execution_status="failed_closed",
-                failure_kind=safe_exception_kind(exc),
             )
         try:
             affect_mutation = self._settle_affect_after_send(event)

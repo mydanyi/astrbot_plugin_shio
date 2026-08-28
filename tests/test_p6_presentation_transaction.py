@@ -29,8 +29,6 @@ except ModuleNotFoundError:
 
 from astrbot_plugin_shio.core.meme_presentation import (
     MemeExecutionAuthority,
-    MemeExecutionReceipt,
-    MemeExecutionStatus,
     MemeManagerConformanceCollector,
 )
 from astrbot_plugin_shio.tests.test_p6_meme_presentation_contract import (
@@ -100,7 +98,7 @@ class P6PresentationTransactionTests(unittest.IsolatedAsyncioTestCase):
         )
         return event, response
 
-    async def test_text_complement_waits_for_terminal_text_and_runs_once(self):
+    async def test_text_terminal_never_duplicates_manager_hook_selection(self):
         event, response = await self._prepare(
             "哼哼，这次知道我的厉害了吧。\n被你夸，我还是有一点开心的。",
             message_id="p6-presentation-success",
@@ -120,33 +118,20 @@ class P6PresentationTransactionTests(unittest.IsolatedAsyncioTestCase):
         with patch("astrbot_plugin_shio.main.structured_log") as log_mock:
             await self.plugin.confirm_automatic_send_observation(event)
         receipt = event.get_extra(main.SHIO_MEME_PRESENTATION_RECEIPT)
-        self.assertIs(type(receipt), MemeExecutionReceipt)
-        self.assertIs(receipt.status, MemeExecutionStatus.SUCCEEDED)
-        self.assertEqual(self.manager.prepare_calls, ["&&shy&&"])
-        self.assertEqual(self.manager.send_calls, [(False, True)])
+        self.assertIsNone(receipt)
+        self.assertEqual(self.manager.prepare_calls, [])
+        self.assertEqual(self.manager.send_calls, [])
         terminal_logs = [
             call
             for call in log_mock.call_args_list
             if len(call.args) >= 3 and call.args[2] == "meme.presentation_terminal"
         ]
-        self.assertEqual(len(terminal_logs), 1)
-        self.assertEqual(
-            set(terminal_logs[0].kwargs),
-            {
-                "trace_id",
-                "schema_version",
-                "meme_execution_kind",
-                "meme_execution_status",
-                "meme_execution_attempt_count",
-                "meme_execution_success_count",
-                "meme_execution_reason_code",
-                "meme_execution_receipt_canonical",
-            },
-        )
+        self.assertEqual(terminal_logs, [])
         self.assertNotIn(event.message, repr(terminal_logs))
 
         await self.plugin.confirm_automatic_send_observation(event)
-        self.assertEqual(self.manager.prepare_calls, ["&&shy&&"])
+        self.assertEqual(self.manager.prepare_calls, [])
+        self.assertEqual(self.manager.send_calls, [])
         sent = self.plugin.send_receipts.sent_reply_record(tracker.internal_reply_id)
         self.assertEqual(
             tuple(segment.visible_text for segment in sent.successful_segments),
@@ -200,9 +185,9 @@ class P6PresentationTransactionTests(unittest.IsolatedAsyncioTestCase):
 
         await self.plugin.confirm_automatic_send_observation(event)
         receipt = event.get_extra(main.SHIO_MEME_PRESENTATION_RECEIPT)
-        self.assertIs(type(receipt), MemeExecutionReceipt)
-        self.assertIs(receipt.status, MemeExecutionStatus.STALE_BEFORE_SEND)
+        self.assertIsNone(receipt)
         self.assertEqual(self.manager.prepare_calls, [])
+        self.assertEqual(self.manager.send_calls, [])
 
 
 if __name__ == "__main__":

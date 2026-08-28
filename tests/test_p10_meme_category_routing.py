@@ -25,6 +25,8 @@ from astrbot_plugin_shio.core.meme_presentation import (
     MemeExecutionKind,
     _select_meme_marker,
     decide_text_meme_complement,
+    extract_required_proactive_meme_category,
+    proactive_meme_category_prompt,
     select_meme_category,
 )
 
@@ -256,6 +258,28 @@ class P10MemeCategoryRoutingTests(unittest.TestCase):
                         emotion_tags=tags,
                     )
                 )
+
+    def test_proactive_hidden_contract_covers_every_live_category(self):
+        prompt = proactive_meme_category_prompt()
+        for category in MemeCategory:
+            with self.subTest(category=category.value):
+                self.assertIn(f"{category.value}=", prompt)
+                visible, selected = extract_required_proactive_meme_category(
+                    f"这是最终可见正文。\n&&{category.value}&&"
+                )
+                self.assertEqual(visible, "这是最终可见正文。")
+                self.assertIs(selected, category)
+
+    def test_proactive_hidden_contract_rejects_missing_multiple_and_unknown(self):
+        for output in (
+            "只有正文",
+            "正文\n&&unknown&&",
+            "正文\n&&happy&&\n&&sad&&",
+            "正文\n&&happy&&\n标记后还有正文",
+        ):
+            with self.subTest(output=output):
+                with self.assertRaises(ContractViolation):
+                    extract_required_proactive_meme_category(output)
         with self.assertRaisesRegex(ContractViolation, "marker_invalid"):
             _select_meme_marker(
                 kind=MemeExecutionKind.MEME_COMPLEMENT,

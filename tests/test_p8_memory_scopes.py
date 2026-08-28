@@ -166,7 +166,7 @@ class P8MemoryScopeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             tuple(fact.subject_key for fact in result.personal_facts),
-            (event.binding.current_sender_key,),
+            (event.principal.account_key,),
         )
         self.assertTrue(
             all(not fact.subject_key for fact in result.group_public_facts)
@@ -200,6 +200,7 @@ class P8MemoryScopeTests(unittest.IsolatedAsyncioTestCase):
                 },
                 {
                     "id": "group-public",
+                    "session_id": "session-group",
                     "content": "群内公共话题",
                     "scope": "group",
                     "confidence": 0.95,

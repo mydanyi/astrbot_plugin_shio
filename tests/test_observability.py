@@ -36,6 +36,8 @@ class ObservabilityTests(unittest.TestCase):
                 "call_count": 2,
                 "guard_hit": True,
                 "unknown_string": "should be dropped",
+                "repair_output_token_count": 64,
+                "access_token": "still-secret",
             }
         )
         self.assertEqual(
@@ -45,6 +47,7 @@ class ObservabilityTests(unittest.TestCase):
                 "subject_digest": diagnostic_digest("real-user-42"),
                 "call_count": 2,
                 "guard_hit": True,
+                "repair_output_token_count": 64,
             },
         )
         self.assertNotIn(secret, repr(raw))
@@ -91,6 +94,38 @@ class ObservabilityTests(unittest.TestCase):
             {
                 "safe_status": "ready",
                 "safe_source": "astrbot.native_caption",
+            },
+        )
+
+    def test_provider_and_meme_ownership_are_visible_without_content(self):
+        provider_digest = diagnostic_digest("configured-provider")
+        raw = sanitize_trace_metadata(
+            {
+                "primary_provider_owner": "astrbot_default_request",
+                "proactive_provider_owner": "shio_proactive_config",
+                "proactive_provider_digest": provider_digest,
+                "provider_context_count": 4,
+                "meme_selection_owner": "meme_manager_semantic",
+                "meme_complement_reason": "manager_semantic_handoff",
+                "meme_complement_category": "food",
+                "meme_execution_category": "food",
+                "proactive_meme_category": "food",
+                "prompt": "private group history",
+            }
+        )
+
+        self.assertEqual(
+            raw,
+            {
+                "primary_provider_owner": "astrbot_default_request",
+                "proactive_provider_owner": "shio_proactive_config",
+                "proactive_provider_digest": provider_digest,
+                "provider_context_count": 4,
+                "meme_selection_owner": "meme_manager_semantic",
+                "meme_complement_reason": "manager_semantic_handoff",
+                "meme_complement_category": "food",
+                "meme_execution_category": "food",
+                "proactive_meme_category": "food",
             },
         )
 

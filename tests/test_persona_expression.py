@@ -111,7 +111,7 @@ class PersonaExpressionTests(unittest.TestCase):
         )
         self.assertIn("answer_from_unrelated_memory", plan.avoid_behavior_ids)
 
-    def test_praise_has_reaction_softening_and_situational_phrase(self):
+    def test_praise_has_open_reaction_without_forced_catchphrase(self):
         plan = build_persona_expression_plan(
             self.atri,
             appraisal(AffectTrigger.PRAISE),
@@ -119,10 +119,12 @@ class PersonaExpressionTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.material_ids, ("praise_softening",))
-        self.assertIn("soften_and_accept", plan.trajectory_steps)
+        self.assertIn("openly_pleased_reaction", plan.trajectory_steps)
+        self.assertIn("accept_or_invite_more", plan.trajectory_steps)
         self.assertIn("react_then_answer", plan.trajectory_steps)
-        self.assertEqual(plan.catchphrase_candidates, ("我是高性能的嘛！",))
-        self.assertIn("constant_denial", plan.avoid_behavior_ids)
+        self.assertEqual(plan.catchphrase_candidates, ())
+        self.assertIn("forced_praise_denial", plan.avoid_behavior_ids)
+        self.assertIn("topic_abandonment", plan.avoid_behavior_ids)
 
         primary = build_persona_expression_plan(
             self.atri,
@@ -149,16 +151,15 @@ class PersonaExpressionTests(unittest.TestCase):
             plan.trajectory_steps,
             (
                 "brief_flustered_acknowledgement",
+                "plain_apology",
                 "clear_correction",
                 "repair_current_answer",
                 "repair_then_continue",
             ),
         )
-        self.assertEqual(
-            plan.catchphrase_candidates,
-            ("刚才只是暂时校准失误！",),
-        )
-        self.assertIn("excuse_without_repair", plan.avoid_behavior_ids)
+        self.assertEqual(plan.catchphrase_candidates, ())
+        self.assertIn("excuse_before_repair", plan.avoid_behavior_ids)
+        self.assertIn("machine_status_excuse", plan.avoid_behavior_ids)
 
     def test_care_and_apology_use_distinct_non_boasting_arcs(self):
         care = build_persona_expression_plan(

@@ -16,6 +16,14 @@ from astrbot_plugin_shio.core.context_assembler import (
 )
 from astrbot_plugin_shio.core.identity import resolve_principal
 from astrbot_plugin_shio.core.identity import TurnEnvelope
+from astrbot_plugin_shio.core.conversation_ledger import (
+    LedgerRecord,
+    LedgerRole,
+    LedgerSourceKind,
+    build_inbound_identity_metadata,
+    build_participant_display,
+    ledger_content_digest,
+)
 
 
 def turn(**overrides):
@@ -170,7 +178,7 @@ class ProvenancedFactTests(unittest.TestCase):
                     "tool_call_id": "fake_recall_1",
                     "name": "recall_long_term_memory",
                     "content": (
-                        '{"results":[{"id":"memory-1","sender_id":"guest-b",'
+                        '{"results":[{"id":"memory-1","platform_id":"p","sender_id":"guest-b",'
                         '"content":"喜欢海边","confidence":0.82,"timestamp":123}]}'
                     ),
                 }
@@ -181,7 +189,7 @@ class ProvenancedFactTests(unittest.TestCase):
 
         self.assertEqual(len(facts), 1)
         self.assertEqual(facts[0].scope, "personal")
-        self.assertEqual(facts[0].subject_key, f"{self.scope}|user:guest-b")
+        self.assertEqual(facts[0].subject_key, "platform:p|account:guest-b")
         self.assertEqual(facts[0].source_kind, "livingmemory_tool_recall")
         self.assertEqual(facts[0].source_id, "memory-1")
         self.assertEqual(facts[0].observed_at, 123)
@@ -194,7 +202,7 @@ class ProvenancedFactTests(unittest.TestCase):
                     "role": "tool",
                     "name": "recall_long_term_memory",
                     "content": (
-                        '{"results":[{"sender_id":"guest-a",'
+                        '{"results":[{"platform_id":"p","sender_id":"guest-a",'
                         '"content":"正在修东西"}]}'
                     ),
                 }
@@ -203,8 +211,8 @@ class ProvenancedFactTests(unittest.TestCase):
 
         facts = adapt_livingmemory_facts(request, scope_key=self.scope)
 
-        self.assertEqual(facts[0].subject_key, f"{self.scope}|user:guest-a")
-        self.assertNotEqual(facts[0].subject_key, f"{self.scope}|user:guest-b")
+        self.assertEqual(facts[0].subject_key, "platform:p|account:guest-a")
+        self.assertNotEqual(facts[0].subject_key, "platform:p|account:guest-b")
 
     def test_unstructured_recall_is_low_confidence_background(self):
         request = self.request(
@@ -269,9 +277,9 @@ class ProvenancedFactTests(unittest.TestCase):
                     "name": "recall_long_term_memory",
                     "content": (
                         '{"results":['
-                        '{"sender_id":"guest-b","content":"喜欢海边","confidence":0.8},'
-                        '{"sender_id":"guest-a","content":"刚做完手术","confidence":0.9},'
-                        '{"sender_id":"guest-b","content":"也许怕冷","confidence":0.3}'
+                        '{"platform_id":"p","sender_id":"guest-b","content":"喜欢海边","confidence":0.8},'
+                        '{"platform_id":"p","sender_id":"guest-a","content":"刚做完手术","confidence":0.9},'
+                        '{"platform_id":"p","sender_id":"guest-b","content":"也许怕冷","confidence":0.3}'
                         ']}'
                     ),
                 }
@@ -281,7 +289,7 @@ class ProvenancedFactTests(unittest.TestCase):
 
         selection = select_facts_for_target(
             facts,
-            target_sender_key=f"{self.scope}|user:guest-b",
+            target_sender_key="platform:p|account:guest-b",
         )
 
         self.assertEqual(
@@ -327,6 +335,55 @@ class ContextViewTests(unittest.TestCase):
     @staticmethod
     def empty_facts():
         return FactSelection((), (), (), ())
+
+    def test_identity_and_addressing_metadata_survive_view_assembly_exactly(self):
+        metadata = build_inbound_identity_metadata(
+            display_name="上下文测试发言者",
+            display_name_source="event_sender",
+            referenced_sender=build_participant_display(
+                self.guest_a,
+                display_name="上下文测试引用者",
+                display_name_source="reply_component",
+            ),
+            mention_targets=(
+                build_participant_display(
+                    self.guest_a,
+                    display_name="上下文测试提及者",
+                    display_name_source="mention_component",
+                ),
+            ),
+            has_reply_edge=True,
+        )
+        record = LedgerRecord(
+            sequence=1,
+            source_kind=LedgerSourceKind.INBOUND,
+            role=LedgerRole.USER,
+            scope_key=self.scope,
+            session_id="group-7",
+            message_id="prior-b",
+            sender_key=self.guest_b,
+            reply_to_message_id="prior-a",
+            referenced_sender_key=self.guest_a,
+            target_sender_key="",
+            timestamp=1.0,
+            content="上下文纯正文",
+            content_digest=ledger_content_digest("上下文纯正文"),
+            source_id="prior-b",
+            attribution_status="verified",
+            identity_metadata=metadata,
+        )
+
+        assembled = assemble_context_views(
+            (record,),
+            reply_target=build_direct_reply_target(turn(), "B 的当前问题"),
+            reference=None,
+            fact_selection=self.empty_facts(),
+        )
+
+        self.assertIs(assembled.planner_records[0], record)
+        self.assertIs(assembled.replyer_thread[0].identity_metadata, metadata)
+        self.assertEqual(assembled.replyer_thread[0].content, "上下文纯正文")
+        self.assertNotIn("上下文测试发言者", record.content)
 
     def records(self):
         from astrbot_plugin_shio.core.conversation_ledger import adapt_astrbot_history

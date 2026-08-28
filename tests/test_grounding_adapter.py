@@ -50,8 +50,9 @@ def _binding(
     revision: int = 1,
     epoch: int = 7,
     sender: str = "peer-a",
+    message: str | None = None,
 ) -> DecisionBinding:
-    message = f"请查证合成术语-{revision}"
+    message = message or f"请查证合成术语-{revision}"
     scope = "platform:test|bot:shio|group:grounding"
     return DecisionBinding(
         scope_key=scope,
@@ -90,7 +91,12 @@ def _runtime_tool(name: str = "anysearch_search") -> SimpleNamespace:
     )
 
 
-def _request(binding: DecisionBinding | None = None, *, now: float = 100.0):
+def _request(
+    binding: DecisionBinding | None = None,
+    *,
+    now: float = 100.0,
+    query: str = "合成术语是什么意思",
+):
     binding = binding or _binding()
     tool = _runtime_tool()
     classification: ToolClassification = classify_tool(tool)
@@ -130,7 +136,7 @@ def _request(binding: DecisionBinding | None = None, *, now: float = 100.0):
             capability_policy=policy,
             runtime_tools=(classification,),
             configured_tool_names=("anysearch_search",),
-            request_shape=build_search_request_shape(binding, query="合成术语是什么意思"),
+            request_shape=build_search_request_shape(binding, query=query),
             now=now,
         ),
         tool,
@@ -236,6 +242,67 @@ class GroundingAdapterTests(unittest.TestCase):
         self.assertEqual(len(typed[0].content_digest), 64)
         self.assertEqual(len(typed[0].call_arguments_digest), 64)
         self.assertTrue(typed[0].arguments_attested)
+
+    def test_unrelated_search_claims_never_become_grounding_facts(self):
+        message = "醒醒起床，让我检查一下身体，看看有没有修好"
+        request, tool = _request(
+            _binding(message=message),
+            query=message,
+        )
+        typed = _typed(
+            request,
+            tool,
+            {
+                "results": [
+                    {"snippet": "可以一起预约治疗师，因为抑郁会影响思维。"},
+                    {"snippet": "能够帮助她的方法可能是刺激身体活动。"},
+                ]
+            },
+        )
+
+        outcome = adapt_grounding_evidence(
+            request=request,
+            results=typed,
+            current_binding=request.binding,
+            now=105.0,
+        )
+
+        self.assertIs(outcome.kind, EvidenceOutcomeKind.IRRELEVANT_RESULT)
+        self.assertEqual(outcome.facts, ())
+
+    def test_relevant_search_claims_survive_relevance_gate(self):
+        cases = (
+            (
+                "请查证合成术语是什么意思",
+                {"answer": "合成测试术语只用于验证公开资料取证链。"},
+            ),
+            (
+                "查一下北京明天的天气",
+                {"answer": "北京明天天气预计有雨。"},
+            ),
+            (
+                "查一下北京明天会不会下雨",
+                {"answer": "北京明日预计有雨。"},
+            ),
+            (
+                "你知道显卡吗？",
+                {"answer": "显卡负责处理图形计算任务。"},
+            ),
+        )
+        for index, (message, content) in enumerate(cases, start=20):
+            with self.subTest(message=message):
+                request, tool = _request(
+                    _binding(revision=index, message=message),
+                    query=message,
+                )
+                outcome = adapt_grounding_evidence(
+                    request=request,
+                    results=_typed(request, tool, content),
+                    current_binding=request.binding,
+                    now=105.0,
+                )
+                self.assertIs(outcome.kind, EvidenceOutcomeKind.ACCEPTED)
+                self.assertTrue(outcome.facts)
 
     def test_content_intent_accepts_grounding_without_semantic_rewrite(self):
         request, tool = _request()
@@ -394,9 +461,9 @@ class GroundingAdapterTests(unittest.TestCase):
         matching_json = _typed(
             request,
             tool,
-            "valid evidence",
+            "合成术语的有效公开证据",
             raw=_batch(
-                "valid evidence",
+                "合成术语的有效公开证据",
                 arguments='{"query":"合成术语是什么意思"}',
             ),
         )

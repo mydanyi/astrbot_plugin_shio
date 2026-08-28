@@ -8,10 +8,11 @@ from typing import Any
 from .conversation_ledger import (
     LedgerRecord,
     LedgerRole,
+    LedgerSourceKind,
     ledger_content_digest,
     records_for_sender_thread,
 )
-from .identity import TurnEnvelope, build_sender_key
+from .identity import TurnEnvelope, build_account_key, build_sender_key
 
 
 REPLY_TARGET_EXTRA = "_shio_reply_target_v2"
@@ -82,6 +83,7 @@ class AssembledContext:
     replyer_thread: tuple[LedgerRecord, ...]
     public_background: tuple[LedgerRecord, ...]
     fact_selection: FactSelection
+    current_record: LedgerRecord | None = None
 
 
 def build_direct_reply_target(envelope: TurnEnvelope, content: str) -> ReplyTarget:
@@ -193,14 +195,8 @@ def _structured_fact(
     if not content:
         return None
 
-    explicit_subject = str(item.get("subject_key", "") or "").strip()
-    if explicit_subject.startswith(f"{scope_key}|user:"):
-        subject_key = explicit_subject
-    else:
-        sender_id = str(
-            item.get("sender_id", "") or item.get("user_id", "") or ""
-        ).strip()
-        subject_key = build_sender_key(scope_key, sender_id)
+    sender_id = str(item.get("sender_id", "") or item.get("user_id", "") or "").strip()
+    subject_key = build_account_key(str(item.get("platform_id", "") or ""), sender_id)
 
     raw_scope = str(item.get("scope", "") or "").strip().lower()
     if subject_key:
@@ -411,11 +407,24 @@ def assemble_context_views(
     reply_target: ReplyTarget,
     reference: ReferenceContext | None,
     fact_selection: FactSelection,
+    current_record: LedgerRecord | None = None,
     planner_record_limit: int = 32,
     replyer_record_limit: int = 16,
     background_record_limit: int = 12,
 ) -> AssembledContext:
     """Build separate typed views without adjacency-based attribution."""
+
+    if current_record is not None and (
+        type(current_record) is not LedgerRecord
+        or current_record.role is not LedgerRole.USER
+        or current_record.source_kind is not LedgerSourceKind.INBOUND
+        or current_record.attribution_status != "verified"
+        or current_record.scope_key != reply_target.scope_key
+        or current_record.message_id != reply_target.message_id
+        or current_record.sender_key != reply_target.sender_key
+        or current_record.content_digest != reply_target.content_digest
+    ):
+        raise ValueError("assembled_current_record_target_mismatch")
 
     scoped: list[LedgerRecord] = []
     seen: set[tuple[str, str, str, str, str]] = set()
@@ -467,4 +476,5 @@ def assemble_context_views(
         replyer_thread=replyer_thread,
         public_background=public_background,
         fact_selection=fact_selection,
+        current_record=current_record,
     )
