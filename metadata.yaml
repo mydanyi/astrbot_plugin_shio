@@ -1,11 +1,11 @@
 name: astrbot_plugin_shio
 display_name: 星汐
-desc: 为 AstrBot 构筑 typed 数字仿生人格群聊心智回路：可信身份、自然参与、多模态、人格情绪、受控检索与默认关闭的主人动作。
-short_desc: 让数字仿生人格从群聊的星潮中醒来。
-help: 先在测试群核对人格、权限与插件组合。主人名单只表示动作资格，四个动作适配器默认关闭；普通用户仅保留精确白名单中的只读资料工具。请勿同时启用独立的 astrbot_plugin_agent_guard。
-version: 0.5.25
+desc: 在 AstrBot 标准事件链上增强自然聊天：当前回合事实、群聊自然参与、群聊模型可见能力收窄与文本组件布局。
+short_desc: 只增强 AstrBot 标准自然聊天链。
+help: SYS-001 候选不兼容旧 Shio 设置。先配置 AstrBot 的 Persona、管理员、工具权限、内置指令、沙箱和 fallback；Shio 只增强真实入站事件，不接管工具执行或发送。
+version: "0.5"
 author: "Danyi"
 repo: "https://github.com/mydanyi/astrbot_plugin_shio"
-astrbot_version: ">=4.26.7,<5"
+astrbot_version: "==4.27.4"
 support_platforms:
   - aiocqhttp

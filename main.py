@@ -1,7609 +1,3646 @@
+"""SYS-001 Shio plugin.
+
+Shio is an event-bound AstrBot extension. It never owns a provider loop,
+tool-execution permission, transport, raw-message parser, or delayed timer.
+Every accepted turn yields ``event.request_llm`` and therefore stays in the
+official Pipeline, Persona, fallback, result-decoration, and send lifecycle.
+"""
+
 from __future__ import annotations
 
 import asyncio
-import html
 import json
-import logging
-import os
 import random
-import re
 import secrets
-import sys
-import threading
 import time
-from pathlib import Path
-from types import SimpleNamespace
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any
 
 from astrbot.api import AstrBotConfig, ToolSet, logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, ResultContentType, filter
+from astrbot.api.message_components import Plain
 from astrbot.api.provider import LLMResponse, ProviderRequest
-from astrbot.api.star import Context, Star, StarTools
-from astrbot.core.agent.message import TextPart
+from astrbot.api.star import Context, Star
 
-from .core.runtime_invariant import (
-    TypedRuntimeDecision,
-    TypedTurnGate,
-    typed_runtime_decision,
-    validate_typed_turn,
-)
-from .core.action_planner import PlannedAction, PlannedActionAuthority, plan_action
-from .core.accepted_turn_authority import (
-    AcceptedTurnAuthority,
-    AcceptedTurnConsumer,
-    AcceptedTurnDisposition,
-)
-from .core.action_outcome import (
-    ActionOutcomeAuthority,
-    ActionOutcomeIntent,
-    ActionOutcomeKind,
-)
-from .core.affect import (
-    AffectAppraisal,
-    AffectTrigger,
-    RelationshipDistance,
-    appraise_affect,
-    trusted_relationship_distance,
-)
-from .core.affect_state import (
-    AffectAppraisalKind,
-    AffectMutationResult,
-    AffectMutationStatus,
-    AffectStateBook,
-    ModelAffectAppraisal,
-    issue_affect_admission_evidence,
-    issue_shio_receipt_evidence,
-)
-from .core.capability_policy import (
-    CapabilityClass,
-    build_guest_capability_policy,
-    build_owner_capability_policy,
-    classify_tool,
-    decide_tool,
-)
-from .core.content_intent_builder import (
-    ContentIntentSeed,
-    attach_action_outcome,
-    attach_grounding_facts,
-    build_content_intent_seed,
-)
-from .core.context_builder import (
-    clean_contexts,
-)
-from .core.context_assembler import (
-    AssembledContext,
-    FactSelection,
-    ReferenceContext,
-    ReplyTarget,
-    assemble_context_views,
-    ensure_direct_reply_target,
-    ensure_reference_context,
-)
-from .core.conversation_ledger import (
-    ConversationLedger,
-    InboundIdentityMetadata,
-    LedgerRecord,
-    LedgerRole,
-    LedgerSourceKind,
-    ParticipantDisplay,
-    PlatformGroupHistoryRead,
-    PlatformGroupHistoryStatus,
-    adapt_astrbot_history,
-    build_display_name_metadata,
-    build_inbound_identity_metadata,
-    has_verified_public_group_context,
-    identity_literals_for_sender_keys,
-    ledger_content_digest,
-    identity_metadata_integrity,
-    read_astrbot_group_history,
-    records_for_sender_thread,
-    select_display_name_metadata,
-)
-from .core.conversation_runtime import ConversationRuntime
-from .core.contracts import (
-    ActionKind,
-    AddressDecision,
-    AddressKind,
-    ContentIntent,
-    ContractViolation,
-    ExpressionIntent,
-    ExpressionModality,
-    IngressDisposition,
-    KnowledgeGapDecision,
-    KnowledgeNeed,
-    ParticipationLevel,
-    PluginEvidenceStatus,
-    SenderKind,
-)
-from .core.conversation_event import (
-    ConversationEvent,
-    ConversationRevisionBook,
-    PluginSourceEvidence,
-    build_ingress_event,
-)
-from .core.group_scene import (
-    GroupSceneBook,
-    GroupSceneSnapshot,
-    SceneEntrySource,
-    SceneMutationResult,
-    SceneMutationStatus,
-)
-from .core.identity import (
-    PrincipalContext,
-    TurnEnvelope,
-    build_scope_key,
-    build_sender_key,
-    ensure_principal_context,
-    ensure_turn_envelope,
-)
-from .core.generation_epoch import (
-    GENERATION_EPOCH_EXTRA,
-    GenerationEpochRegistry,
-    ensure_event_generation_epoch,
-    event_epoch_validation,
-    event_generation_snapshot,
-)
-from .core.generation_cancellation import (
-    GenerationTaskRegistry,
-    SupersededGeneration,
-    provider_supports_cancellation,
-)
-from .core.scope_concurrency import ScopeWorkKind, TurnScopeCoordinator
-from .core.inference_budget import (
-    InferenceBudgetAuthority,
-    InferenceBudgetError,
-    InferencePermit,
-    InferencePurpose,
-)
-from .core.meme_presentation import (
-    ExpressionIntentAuthority,
-    MemeExecutionStatus,
-    MemeExecutionAuthority,
-    MemeExecutionReceipt,
-    MemeManagerConformanceStatus,
-    MemeManagerConformanceCollector,
-    decide_semantic_meme_handoff,
-    execute_meme_manager_category,
-    execute_meme_permit,
-    production_meme_manager_runtime_profile,
-)
-from .core.learning_cluster import (
-    LearningContext,
-    make_learning_context,
-)
-from .core.name_wake_filter import (
-    IngressWakeCandidate,
-    NaturalNameWakeFilter,
-    bind_name_wake_plugin,
-    unbind_name_wake_plugin,
-)
-from .core.ingress_admission import (
-    AdmissionResult,
-    GateObservation,
-    IngressAdmissionController,
-)
-from .core.trusted_bot_registry import (
-    BotIdentityObservation,
-    TrustedBotRegistry,
-    TypedAdapterBotFlag,
-)
-from .core.temporal_context import TemporalContext, build_temporal_context
-from .core.plugin_adapters.reneban import (
-    inspect_reneban_hook,
-)
-from .core.plugin_adapters.livingmemory import (
-    EXPECTED_PLUGIN_NAME as LIVINGMEMORY_PLUGIN_NAME,
-    LivingMemoryAdapter,
-    has_provided_recall,
-)
-from .core.memory_policy import MemoryPolicy, MemoryPolicyResult
-from .core.pipeline_trace import (
-    content_fingerprint,
-    get_pipeline_trace,
-    get_trace_context,
-    get_trace_id,
-    record_pipeline_stage,
-    start_pipeline_trace,
-)
-from .core.pipeline_metrics import (
-    PIPELINE_METRICS_EXTRA,
-    PipelineMetricsSnapshot,
-    store_pipeline_metrics,
-)
-from .core.performance_metrics import (
-    LatencyKind,
-    ModelCallKind,
-    PerformanceWindow,
-)
-from .core.product_trace import (
-    ProductOutcome,
-    ProductStage,
-    ProductTrace,
-    ProductTracePayload,
-    ProductTraceStatus,
-)
-from .core.observability import (
-    diagnostic_digest,
-    safe_exception_kind,
-    structured_log,
-)
-from .core.name_wake import NameWakeDecision, classify_name_wake
-from .core.astrbot_media_adapter import (
-    AstrBotMediaAdaptation,
-    adapt_astrbot_media,
-    media_only_current_message,
-)
-from .core.astrbot_tool_executor import (
-    SUPPORTED_SEALED_ACQUISITION_TOOL_NAMES,
-    execute_sealed_acquisition,
-)
-from .core.current_question_anchor import (
-    CurrentQuestionAnchor,
-    build_current_question_anchor,
-)
-from .core.expression_retrieval import retrieve_expression_candidates
-from .core.address_resolver import (
-    AddressResolutionAuthority,
-    StructuredMentionEvidence,
-    StructuredReplyEvidence,
-)
-from .core.opportunity_attention import (
-    OpportunityAttentionAuthority,
-    OpportunityAttentionDecision,
-)
-from .core.participation_engine import (
-    ParticipationAssessment,
-    ParticipationAuthority,
-)
-from .core.participation_cadence import (
-    ParticipationCadenceAuthority,
-    ParticipationCadenceDecision,
-    ParticipationCadencePreflight,
-)
-from .core.participation_semantic import (
-    ParticipationSemanticAuthority,
-    ParticipationSemanticDecisionKind,
-    ParticipationSemanticOutcome,
-    ParticipationSemanticRequest,
-    ParticipationSemanticStatus,
-)
-from .core.participation_reaction import (
-    ParticipationReactionAuthority,
-    ParticipationReactionDecision,
-)
-from .core.proactive_policy import (
-    ProactivePolicyConfig,
-    ProactivePolicyState,
-)
-from .core.proactive_trigger import ProactiveTriggerAuthority
-from .core.proactive_topic import ProactiveTopicAuthority
-from .core.proactive_runtime import (
-    ProactiveComposerRequest,
-    ProactiveExecutionAuthority,
-    ProactiveExecutionStatus,
-    ProactivePresentation,
-    ProactiveSchedulerRuntime,
-)
-from .core.history_normalizer import (
-    HistoryDisposition,
-    HistoryNormalizationContext,
-    normalize_assistant_history,
-)
-from .core.persona import PersonaPackage, load_persona_package
-from .core.persona_expression import (
-    PersonaExpressionPlan,
-    build_persona_expression_plan,
-)
-from .core.response_guard import (
-    contains_nonowner_identity_confusion,
-    contains_internal_reasoning,
-    contains_tool_protocol,
-    extract_and_clean_internal_meme_references,
-)
-from .core.answer_obligation import (
-    AttributionRisk,
-    contains_history_speaker_attribution_confusion,
-)
-from .core.output_validator_v2 import (
-    OutputValidationContext,
-    _preflight_reply_composer_repair_candidate,
-    build_output_validation_context,
-    validate_reply_composer_output,
-)
-from .core.presentation_handoff import PresentationHandoff, build_presentation_handoff
-from .core.repair_controller import (
-    RepairAction,
-    build_grounded_evidence_fallback,
-    build_safe_direct_reply_fallback,
-    build_single_repair_request,
-    decide_output_repair,
-)
-from .core.semantic_guard import (
-    SemanticGuardController,
-    SemanticGuardContract,
-    SemanticGuardPhase,
-    SemanticValidationSeal,
-    validate_semantic_media_guard,
-)
-from .core.reply_composer import (
-    ReplyComposerRequest,
-    build_reply_composer_request,
-    parse_reply_composer_output,
-    parse_semantic_risk_decision,
-    SemanticRiskDecision,
-)
-from .core.model_input_contract import (
-    canonical_model_messages_digest,
-    project_model_identity_prompt_data,
-)
-from .core.relationship_state import (
-    RelationshipMutationResult,
-    RelationshipMutationStatus,
-    RelationshipStateBook,
-)
-from .core.runtime_continuity import RuntimeContinuityStore
-from .core.scene_rules import (
-    DEFAULT_NATURAL_GROUP_PARTICIPATION_RULES,
-    DEFAULT_PROACTIVE_INITIATION_RULES,
-)
-from .core.knowledge_gap import (
-    decide_knowledge_gap,
-    decide_proactive_knowledge_need,
-)
-from .core.tool_broker import (
-    AcquisitionRequest,
-    broker_proactive_read_request,
-    broker_tool_request,
-    build_extract_request_shape,
-    build_knowledge_base_request_shape,
-    build_search_request_shape,
-)
-from .core.grounding_adapter import (
-    EvidenceOutcome,
-    EvidenceOutcomeKind,
-    adapt_grounding_evidence,
-)
-from .core.send_receipt import (
-    InternalSendReceiptLedger,
-    ReplyObservationTracker,
-    SegmentSendStatus,
-)
-from .core.owner_action_adapters import (
-    AdapterConfig,
-    ArtifactPathFlavor,
-    ShellFamily,
-)
-from .core.owner_action_controller import (
-    OwnerActionController,
-)
-from .core.owner_action_durable_finalize import (
-    DurableFinalizeConsumer,
-    OwnerActionDurableFinalizeAuthority,
-)
-from .core.owner_action_lifecycle import (
-    LifecycleHandle,
-    OwnerActionLifecycleStore,
-)
-from .core.owner_action_router import (
-    OwnerActionRouteDecision,
-    OwnerActionRouteStatus,
-    OwnerActionRouter,
-)
-from .core.tool_result import (
-    adapt_tool_call_results,
-    tool_result_trace_metadata,
+from .core.active_event_fence import ActiveEventFence
+from .core.sys001 import (
+    ALL_GROUP_USERS_CAPABILITY_NAMES,
+    SYS001_LIFECYCLE_EXTRA,
+    SYS001_FINAL_AGENT_OBSERVATION_EXTRA,
+    SYS001_TOOL_OBSERVATIONS_EXTRA,
+    SYS001_TURN_EXTRA,
+    FinalAgentObservation,
+    MasterAlertRecord,
+    EntryDecision,
+    master_alert_failure,
+    master_alert_success,
+    master_alert_counts_failure,
+    master_alert_quiet_deadline,
+    parse_final_review_decision,
+    admit_ingress,
+    TurnLifecycle,
+    TurnSnapshot,
+    classify_tool_observation,
+    classify_final_agent_response,
+    create_snapshot,
+    address_decision,
+    visible_wake_match,
+    parse_name_semantic,
+    parse_natural_participation_decision,
+    name_semantic_prompt,
+    decide_entry,
+    is_friendly_sender,
+    project_visible_tools,
+    split_text_components,
+    SegmentedReplyCompatibility,
+    segmented_reply_compatibility,
+    bubble_send_wait_bounds,
+    NaturalCadence,
+    NaturalCadenceRecord,
+    natural_cadence_allows,
+    natural_no_action,
+    natural_reply_completed,
+    prune_natural_cadence,
+    decode_natural_cadence_record,
+    encode_natural_cadence_record,
+    project_official_group_history,
+    text_component_boundaries_are_safe,
+    text_components_survive_standard_strip,
 )
 
 
-PLUGIN_NAME = "astrbot_plugin_shio"
-SHIO_ACTIVE = "_shio_active"
-SHIO_PAYLOAD = "_shio_retry_payload"
-SHIO_IDENTITY_SCOPE = "_shio_identity_scope"
-SHIO_SEND_OBSERVATION = "_shio_send_observation"
-SHIO_NATURAL_WAKE = "_shio_natural_name_wake"
-SHIO_TYPED_HISTORY_SOURCE = "_shio_typed_history_source"
-SHIO_PLATFORM_GROUP_HISTORY = "_shio_platform_group_history_v1"
-
-_CONFIG_GROUP_BY_KEY = {
-    **dict.fromkeys(
-        (
-            "enabled",
-            "persona_name",
-            "replyer_provider_id",
-            "enable_chat_bubbles",
-            "chat_max_bubbles",
-            "bubble_interval_min_ms",
-            "bubble_interval_max_ms",
-        ),
-        "basic_settings",
-    ),
-    **dict.fromkeys(
-        (
-            "natural_name_wake_enabled",
-            "natural_name_wake_mode",
-            "natural_name_wake_aliases",
-            "natural_name_wake_group_whitelist",
-        ),
-        "wake_settings",
-    ),
-    **dict.fromkeys(
-        (
-            "natural_group_participation_enabled",
-            "natural_group_participation_rules",
-            "natural_group_participation_allowlist",
-            "natural_group_participation_min_context_messages",
-            "natural_group_participation_cooldown_seconds",
-            "natural_group_participation_window_minutes",
-            "natural_group_participation_max_joins_per_window",
-            "social_feedback_enabled",
-            "social_feedback_window_minutes",
-        ),
-        "participation_settings",
-    ),
-    **dict.fromkeys(
-        (
-            "proactive_initiation_enabled",
-            "proactive_initiation_rules",
-            "proactive_min_bubbles",
-            "proactive_group_allowlist",
-            "proactive_active_hour_start",
-            "proactive_active_hour_end",
-            "proactive_timezone_offset_minutes",
-            "proactive_observation_minutes",
-            "proactive_idle_minutes",
-            "proactive_cooldown_minutes",
-            "proactive_daily_limit",
-            "proactive_scheduler_interval_seconds",
-        ),
-        "proactive_settings",
-    ),
-    **dict.fromkeys(
-        (
-            "prefer_livingmemory_group_history",
-            "max_context_messages",
-            "max_context_chars",
-            "inject_verified_context",
-        ),
-        "context_settings",
-    ),
-    **dict.fromkeys(
-        (
-            "owner_ids",
-            "trusted_bot_identities",
-            "permission_guard_enabled",
-            "guest_allowed_tools",
-            "permission_audit_log",
-            "owner_action_enabled",
-            "owner_action_artifact_read_exact_enabled",
-            "owner_action_artifact_grep_enabled",
-            "owner_action_memory_write_literal_enabled",
-            "owner_action_sandbox_shell_once_enabled",
-            "owner_action_artifact_root",
-            "owner_action_artifact_path_flavor",
-            "owner_action_shell_family",
-        ),
-        "permission_settings",
-    ),
-    **dict.fromkeys(
-        (
-            "inference_max_parallel",
-            "inference_max_waiters",
-            "inference_queue_timeout_seconds",
-            "inference_active_timeout_seconds",
-            "performance_window_samples",
-            "continuity_max_scopes",
-            "continuity_max_subjects",
-            "debug_log",
-        ),
-        "performance_settings",
-    ),
-}
-_MISSING_CONFIG_VALUE = object()
-SHIO_TYPED_INBOUND_RECORDED = "_shio_typed_inbound_recorded"
-SHIO_TYPED_INBOUND_RECORD = "_shio_typed_inbound_record_v1"
-SHIO_ASSEMBLED_CONTEXT_V2 = "_shio_assembled_context_v2"
-SHIO_CAPABILITY_POLICY = "_shio_capability_policy"
-SHIO_EFFECTIVE_TOOL_NAMES = "_shio_effective_tool_names_v1"
-SHIO_TYPED_RUNTIME = "_shio_typed_runtime"
-SHIO_TYPED_RUNTIME_DECISION = "_shio_typed_runtime_decision"
-SHIO_TYPED_PIPELINE_ACTIVE = "_shio_typed_pipeline_active"
-SHIO_PLANNED_ACTION = "_shio_planned_action_v1"
-SHIO_CONTENT_INTENT = "_shio_content_intent_v1"
-SHIO_EXPRESSION_INTENT = "_shio_expression_intent_v1"
-SHIO_MEME_COMPLEMENT_DECISION = "_shio_meme_complement_decision_v1"
-SHIO_MEME_PRESENTATION_RECEIPT = "_shio_meme_presentation_receipt_v1"
-SHIO_PRESENTATION_SEND_EVIDENCE = "_shio_presentation_send_evidence_v1"
-SHIO_AFFECT_APPRAISAL = "_shio_affect_appraisal_v1"
-SHIO_PERSONA_EXPRESSION = "_shio_persona_expression_v1"
-SHIO_ACQUISITION_REQUEST = "_shio_acquisition_request_v1"
-SHIO_EVIDENCE_OUTCOME = "_shio_evidence_outcome_v1"
-SHIO_ACTIVE_CAPABILITY_POLICY = "_shio_active_capability_policy"
-SHIO_REPLY_COMPOSER_REQUEST = "_shio_reply_composer_request"
-SHIO_SEMANTIC_RISK_DECISION = "_shio_semantic_risk_decision"
-SHIO_OUTPUT_VALIDATION_CONTEXT = "_shio_output_validation_context"
-SHIO_SEMANTIC_GUARD_CONTRACT = "_shio_semantic_guard_contract"
-SHIO_SEMANTIC_VALIDATION_SEAL = "_shio_semantic_validation_seal"
-SHIO_REPAIR_ATTEMPTS = "_shio_repair_attempts"
-SHIO_PRESENTATION_HANDOFF = "_shio_presentation_handoff"
-SHIO_LEDGER_OUTBOUND_IDS = "_shio_ledger_outbound_ids"
-SHIO_INGRESS_CANDIDATE = "_shio_ingress_candidate"
-SHIO_INGRESS_DECISION = "_shio_ingress_decision"
-SHIO_ADMISSION_RESULT = "_shio_admission_result"
-SHIO_CONVERSATION_EVENT = "_shio_conversation_event"
-SHIO_PLUGIN_SOURCE_EVIDENCE = "_shio_plugin_source_evidence"
-SHIO_TYPED_ADAPTER_BOT_FLAG = "_shio_typed_adapter_bot_flag"
-SHIO_GATE_OBSERVATION = "_shio_gate_observation"
-SHIO_PRODUCT_TRACE = "_shio_product_trace"
-SHIO_RENEBAN_HOOK_EVIDENCE = "_shio_reneban_hook_evidence"
-SHIO_MEDIA_ADAPTATION = "_shio_media_adaptation"
-SHIO_GROUP_SCENE_MUTATION = "_shio_group_scene_mutation"
-SHIO_GROUP_SCENE_SNAPSHOT = "_shio_group_scene_snapshot"
-SHIO_LIVINGMEMORY_ADAPTER = "_shio_livingmemory_adapter_v1"
-SHIO_MEMORY_POLICY_RESULT = "_shio_memory_policy_result_v1"
-SHIO_MEMORY_READER_EVIDENCE = "_shio_memory_reader_evidence_v1"
-SHIO_ADDRESS_DECISION = "_shio_address_decision"
-SHIO_CURRENT_QUESTION_ANCHOR = "_shio_current_question_anchor_v1"
-SHIO_ACCEPTED_TURN_DISPATCH = "_shio_accepted_turn_dispatch_v1"
-SHIO_OWNER_ACTION_TICKET = "_shio_owner_action_ticket_v1"
-SHIO_OPPORTUNITY_ATTENTION_TICKET = "_shio_opportunity_attention_ticket_v1"
-SHIO_OPPORTUNITY_ATTENTION = "_shio_opportunity_attention_v1"
-SHIO_PARTICIPATION_ASSESSMENT = "_shio_participation_assessment_v1"
-SHIO_PARTICIPATION_CADENCE_PREFLIGHT = "_shio_participation_cadence_preflight_v1"
-SHIO_PARTICIPATION_CADENCE = "_shio_participation_cadence_v1"
-SHIO_PARTICIPATION_REACTION = "_shio_participation_reaction_v1"
-SHIO_PARTICIPATION_SEMANTIC_REQUEST = "_shio_participation_semantic_request_v1"
-SHIO_PARTICIPATION_SEMANTIC_OUTCOME = "_shio_participation_semantic_outcome_v1"
-SHIO_OWNER_ACTION_ROUTE = "_shio_owner_action_route_v1"
-SHIO_OWNER_ACTION_SOURCE = "_shio_owner_action_source_v1"
-SHIO_ACTION_OUTCOME = "_shio_action_outcome_v1"
-SHIO_OWNER_ACTION_LIFECYCLE_HANDLE = "_shio_owner_action_lifecycle_handle_v1"
-SHIO_OWNER_ACTION_SEND_EVIDENCE = "_shio_owner_action_send_evidence_v1"
-SHIO_AFFECT_STATE_MUTATION = "_shio_affect_state_mutation_v1"
-SHIO_AFFECT_OUTBOUND_MUTATION = "_shio_affect_outbound_mutation_v1"
-SHIO_AFFECT_RENDER_CONTEXT = "_shio_affect_render_context_v1"
-SHIO_RELATIONSHIP_STATE_MUTATION = "_shio_relationship_state_mutation_v1"
-SHIO_RELATIONSHIP_OUTBOUND_MUTATION = "_shio_relationship_outbound_mutation_v1"
-SHIO_RELATIONSHIP_RENDER_CONTEXT = "_shio_relationship_render_context_v1"
-SHIO_INFERENCE_PERMIT = "_shio_inference_permit_v1"
-SHIO_PRIMARY_PROVIDER_STARTED_AT = "_shio_primary_provider_started_at_v1"
-SHIO_PERFORMANCE_SNAPSHOT = "_shio_performance_snapshot_v1"
-SHIO_MEME_MANAGER_TOOL = "_shio_meme_manager_tool_v1"
-SHIO_MEME_MANAGER_PROMPT = "_shio_meme_manager_prompt_v1"
-SHIO_MEME_MANAGER_REFERENCE = "_shio_meme_manager_reference_v1"
-SHIO_MEME_MANAGER_PRESENTATION_MODE = "_shio_meme_manager_presentation_mode_v1"
-SHIO_MEME_MANAGER_CATEGORY_MARKERS = "_shio_meme_manager_category_markers_v1"
-
-_MEME_MANAGER_SEMANTIC_PROMPT_RE = re.compile(
-    r"<!-- meme_manager_semantic_prompt:start -->[\s\S]*?"
-    r"<!-- meme_manager_semantic_prompt:end -->"
-)
-_MEME_MANAGER_LEGACY_PROMPT_RE = re.compile(
-    r"<!-- meme_manager_prompt:start -->[\s\S]*?"
-    r"<!-- meme_manager_prompt:end -->"
-)
-_MEME_MANAGER_STRICT_MARKER_RE = re.compile(r"&&([^&\r\n]{1,96})&&")
-_MEME_MANAGER_SAFE_CATEGORY_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
-
-RECOVERABLE_QUESTION_RE = re.compile(
-    r"[？?]|(?:怎么|如何|为啥|为什么|是不是|有没有|能不能|可不可以|什么|谁|哪里|多少|"
-    r"帮我|告诉我|解释|讲讲|说说|看看|分析|排查|解决)"
-)
-
-_SENSITIVE_DEPENDENCY_LOGGERS = (
-    "openai",
-    "openai._base_client",
-    "httpx",
-    "httpcore",
-)
+_SHIO_AGENT_REQUEST_EXTRA = "shio.sys001.agent_request"
+_SHIO_AGENT_RUN_TOKEN_EXTRA = "shio.sys001.agent_run_token"
+_SHIO_AGENT_RUN_CONTEXT_EXTRA = "shio.sys001.agent_run_context"
+_SHIO_AGENT_ERROR_TOKEN_EXTRA = "shio.sys001.agent_error_token"
 
 
-class _ProactiveMemeEvent:
-    """Small group-addressed event surface; it never impersonates a member."""
+@dataclass(slots=True)
+class _ContinuousScopeState:
+    """Bounded scheduling state only; message text and media stay in AstrBot."""
 
-    __slots__ = (
-        "_context",
-        "_extras",
-        "group_id",
-        "persona_id",
-        "session_id",
-        "unified_msg_origin",
-    )
-
-    def __init__(self, context: Context, request: ProactiveComposerRequest) -> None:
-        target = request.plan.target
-        self._context = context
-        self._extras: dict[str, Any] = {}
-        self.group_id = target.group_id
-        self.session_id = target.group_id
-        self.unified_msg_origin = target.unified_msg_origin
-        self.persona_id = ""
-
-    def get_extra(self, key: str, default: Any = None) -> Any:
-        return self._extras.get(key, default)
-
-    def set_extra(self, key: str, value: Any) -> None:
-        self._extras[str(key)] = value
-
-    def get_sender_id(self) -> str:
-        return ""
-
-    def get_group_id(self) -> str:
-        return self.group_id
-
-    def get_platform_name(self) -> str:
-        return self.unified_msg_origin.split(":", 1)[0] or "aiocqhttp"
-
-    async def send(self, chain: MessageChain) -> Any:
-        return await self._context.send_message(self.unified_msg_origin, chain)
+    first_message_id: str
+    first_terminal: asyncio.Event = field(default_factory=asyncio.Event)
+    winner_message_id: str = ""
+    generation: int = 0
+    deadline: float = 0.0
+    terminal_deadline: float = 0.0
+    wakeup: asyncio.Event = field(default_factory=asyncio.Event)
 
 
-def _suppress_sensitive_dependency_debug_logs() -> None:
-    """Keep third-party request bodies out of AstrBot's DEBUG root bridge."""
+@dataclass(frozen=True, slots=True)
+class _BatchMessage:
+    """One real inbound event retained only until its scope batch is terminal."""
 
-    for logger_name in _SENSITIVE_DEPENDENCY_LOGGERS:
-        logging.getLogger(logger_name).setLevel(logging.WARNING)
+    event: AstrMessageEvent
+    snapshot: TurnSnapshot
+    mandatory: bool
+    component_facts: tuple[dict[str, str], ...]
+    history_row_id: int | None
+    token: object = field(default_factory=object, compare=False)
 
 
-def _llm_response_diagnostics(response: Any) -> dict[str, str | int | bool]:
-    """Return content-free diagnostics for one provider response object."""
+@dataclass(frozen=True, slots=True)
+class _BoundaryReservation:
+    """Opaque ordering fact for one untouched official boundary event."""
 
-    if response is None:
-        return {
-            "repair_response_received": False,
-            "repair_visible_chars": 0,
-            "repair_reasoning_chars": 0,
-            "repair_response_role_code": "none",
-            "repair_output_token_count": 0,
-        }
-    completion = str(getattr(response, "completion_text", "") or "")
-    reasoning = ""
-    for attribute in ("reasoning_content", "reasoning_text", "reasoning"):
-        value = getattr(response, attribute, None)
-        if value:
-            reasoning = str(value)
-            break
-    usage = getattr(response, "usage", None)
-    output_tokens = 0
-    for field_name in ("output_tokens", "completion_tokens"):
-        if isinstance(usage, dict):
-            value = usage.get(field_name, 0)
-        else:
-            value = getattr(usage, field_name, 0) if usage is not None else 0
-        try:
-            output_tokens = max(output_tokens, int(value or 0))
-        except (TypeError, ValueError):
-            continue
-    role = str(getattr(response, "role", "") or "unknown").strip().casefold()
-    if role not in {"assistant", "tool", "err", "error", "unknown"}:
-        role = "unknown"
-    return {
-        "repair_response_received": True,
-        "repair_visible_chars": len(completion),
-        "repair_reasoning_chars": len(reasoning),
-        "repair_response_role_code": role,
-        "repair_output_token_count": output_tokens,
-    }
+    message_id: str
+    token: object
+    sequence: int
+
+
+@dataclass(slots=True)
+class _BatchScopeState:
+    """The sole R37 scheduler for one real UMO.
+
+    It owns at most one current batch and one waiting batch.  Text/provenance
+    are retained only in the in-memory waiting/current batch so the watermark
+    event can provide them explicitly to the official request; nothing is
+    persisted or fabricated into AstrBot history.
+    """
+
+    generation: int = 0
+    current: tuple[_BatchMessage, ...] = ()
+    current_watermark_id: str = ""
+    current_watermark_token: object | None = None
+    active_boundary: _BoundaryReservation | None = None
+    boundary_queue: tuple[_BoundaryReservation, ...] = ()
+    boundary_sequence: int = 0
+    waiting: tuple[_BatchMessage, ...] = ()
+    waiting_deadline: float = 0.0
+    wakeup: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalReviewOutcome:
+    """A bounded auxiliary review result for one existing Agent response."""
+
+    text: str
+    exhausted: bool = False
+    accepted_last_reply: bool = False
+    stale: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _AuxiliaryBinding:
+    """One auxiliary await bound to this live plugin instance and event."""
+
+    epoch: int
+    event_id: int
+    token: object
+    natural_scope: str = ""
+    natural_generation: int | None = None
+    natural_candidate: int | None = None
+    fence_natural_generation: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingBubbleDelivery:
+    """One already-decorated, event-bound remainder for the public send hook."""
+
+    units: tuple[tuple[Any, ...], ...]
+    event_id: int
+    snapshot_id: int
+    lifecycle_id: int
+    message_id: str
+    generation: int | None
+    epoch: int
+    instance_token: object
+
+
+_AUXILIARY_DEADLINE_EXHAUSTED = object()
 
 
 class ShioPlugin(Star):
-    """用 typed behavior → content → Persona Renderer 管线接管角色聊天。"""
+    """Natural conversation enhancements over AstrBot's public event APIs."""
+
+    _NATURAL_KV_AWAIT_SECONDS = 8.0
+    _KV_UNAVAILABLE = object()
 
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
-        _suppress_sensitive_dependency_debug_logs()
         super().__init__(context)
+        self.context = context
         self.config = config
-        data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
-        assets_dir = Path(__file__).resolve().parent / "assets"
-        self.runtime = ConversationRuntime(data_dir, logger)
-        self.runtime_continuity = RuntimeContinuityStore(
-            data_dir / "continuity",
-            max_scopes=max(
-                1,
-                min(8192, self._config_int("continuity_max_scopes", 2048)),
-            ),
-            max_subjects=max(
-                1,
-                min(8192, self._config_int("continuity_max_subjects", 256)),
-            ),
-        )
-        self.send_receipts = InternalSendReceiptLedger()
-        self.generation_epochs = GenerationEpochRegistry()
-        self.generation_tasks = GenerationTaskRegistry(self.generation_epochs)
-        self.scope_concurrency = TurnScopeCoordinator(self.generation_epochs)
-        self.conversation_revisions = ConversationRevisionBook(
-            continuity_store=self.runtime_continuity,
-        )
-        self.ingress_admission = IngressAdmissionController(
-            self.conversation_revisions,
-        )
-        self.accepted_turn_authority = AcceptedTurnAuthority(
-            self.ingress_admission,
-        )
-        self.address_resolution_authority = AddressResolutionAuthority()
-        self.ledger = ConversationLedger(
-            state_path=data_dir / "public_group_ledger.json",
-        )
-        self.group_scenes = GroupSceneBook(
-            revision_book=self.conversation_revisions,
-            conversation_ledger=self.ledger,
-        )
-        self.opportunity_attention_authority = OpportunityAttentionAuthority(
-            self.accepted_turn_authority,
-            self.address_resolution_authority,
-        )
-        self.participation_authority = ParticipationAuthority(
-            self.opportunity_attention_authority,
-            self.group_scenes,
-        )
-        self.participation_cadence_authority = ParticipationCadenceAuthority(
-            self.participation_authority,
-            continuity_store=self.runtime_continuity,
-            join_cooldown_seconds=float(
-                max(
-                    1,
-                    min(
-                        3600,
-                        self._config_int(
-                            "natural_group_participation_cooldown_seconds",
-                            45,
-                        ),
-                    ),
-                )
-            ),
-            window_seconds=float(
-                max(
-                    1,
-                    min(
-                        1440,
-                        self._config_int(
-                            "natural_group_participation_window_minutes",
-                            5,
-                        ),
-                    ),
-                )
-                * 60
-            ),
-            max_joins_per_window=max(
-                1,
-                min(
-                    20,
-                    self._config_int(
-                        "natural_group_participation_max_joins_per_window",
-                        2,
-                    ),
-                ),
-            ),
-        )
-        self.participation_semantic_authority = ParticipationSemanticAuthority(
-            self.participation_authority,
-            self.participation_cadence_authority,
-            self.group_scenes,
-        )
-        self.participation_reaction_authority = ParticipationReactionAuthority(
-            self.participation_cadence_authority,
-        )
-        self.proactive_trigger_authority = ProactiveTriggerAuthority()
-        self.proactive_policy_state = ProactivePolicyState(
-            data_dir / "proactive",
-            trigger_authority=self.proactive_trigger_authority,
-            policy=self._build_proactive_policy_config(),
-        )
-        self.affect_states = AffectStateBook(
-            accepted_turn_authority=self.accepted_turn_authority,
-            revision_book=self.conversation_revisions,
-        )
-        self.relationship_states = RelationshipStateBook(
-            accepted_turn_authority=self.accepted_turn_authority,
-        )
-        self.owner_action_router = OwnerActionRouter(
-            self.accepted_turn_authority,
-        )
-        self.planned_action_authority = PlannedActionAuthority()
-        self.inference_budget = InferenceBudgetAuthority(
-            self.generation_epochs,
-            self.planned_action_authority,
-            max_active=max(
-                1,
-                min(16, self._config_int("inference_max_parallel", 4)),
-            ),
-            max_waiters=max(
-                1,
-                min(512, self._config_int("inference_max_waiters", 128)),
-            ),
-            queue_timeout_seconds=float(
-                max(
-                    1,
-                    min(
-                        300,
-                        self._config_int("inference_queue_timeout_seconds", 30),
-                    ),
-                )
-            ),
-            active_timeout_seconds=float(
-                max(
-                    5,
-                    min(
-                        1800,
-                        self._config_int("inference_active_timeout_seconds", 300),
-                    ),
-                )
-            ),
-        )
-        self.performance_window = PerformanceWindow(
-            max_samples_per_kind=max(
-                16,
-                min(
-                    8192,
-                    self._config_int("performance_window_samples", 512),
-                ),
-            )
-        )
-        self.expression_intent_authority = ExpressionIntentAuthority()
-        self.meme_manager_conformance = MemeManagerConformanceCollector(
-            production_meme_manager_runtime_profile(),
-        )
-        self.meme_execution_authority = MemeExecutionAuthority(
-            planned_action_authority=self.planned_action_authority,
-            expression_intent_authority=self.expression_intent_authority,
-            generation_registry=self.generation_epochs,
-            conformance_collector=self.meme_manager_conformance,
-        )
-        self.owner_action_controller = OwnerActionController(
-            self.accepted_turn_authority,
-            self.owner_action_router,
-            self.planned_action_authority,
-        )
-        self.action_outcome_authority = ActionOutcomeAuthority.issue_for_runtime(
-            self.owner_action_controller,
-            self.planned_action_authority,
-        )
-        self.owner_action_enabled = self._config_bool(
-            "owner_action_enabled",
-            False,
-        )
-        self.owner_action_adapter_config = self._build_owner_action_adapter_config()
-        self.owner_action_lifecycle_store: OwnerActionLifecycleStore | None = None
-        self.owner_action_durable_authority: (
-            OwnerActionDurableFinalizeAuthority | None
-        ) = None
-        self._owner_action_data_dir = data_dir / "owner_action"
-        self._owner_action_runtime_lock = threading.RLock()
-        self.memory_policy = MemoryPolicy()
-        self.semantic_guard_controller = SemanticGuardController()
-        self._admission_lock = threading.RLock()
-        self._trusted_bot_registry, self._trusted_bot_config_valid = (
-            self._build_trusted_bot_registry()
-        )
-        self._persona_packages = self._load_persona_packages(assets_dir / "personas")
-        proactive_personas: list[PersonaPackage] = []
-        for persona in self._persona_packages.values():
-            if not any(persona is registered for registered in proactive_personas):
-                proactive_personas.append(persona)
-        self.proactive_topic_authority = ProactiveTopicAuthority(
-            self.proactive_policy_state,
-            self.group_scenes,
-            tuple(proactive_personas),
-        )
-        self.proactive_execution_authority = ProactiveExecutionAuthority.issue_for_runtime(
-            self.proactive_topic_authority,
-            scene_rules=str(
-                self._config(
-                    "proactive_initiation_rules",
-                    DEFAULT_PROACTIVE_INITIATION_RULES,
-                )
-                or DEFAULT_PROACTIVE_INITIATION_RULES
-            ).strip(),
-            min_bubbles=min(
-                min(3, max(1, self._config_int("chat_max_bubbles", 3))),
-                max(1, self._config_int("proactive_min_bubbles", 2)),
-            ),
-            max_bubbles=min(
-                3,
-                max(1, self._config_int("chat_max_bubbles", 3)),
-            ),
-        )
-        self.proactive_scheduler_runtime = ProactiveSchedulerRuntime.issue_for_runtime(
-            self.proactive_execution_authority,
-            self.proactive_trigger_authority,
-            self.proactive_policy_state,
-            self.proactive_topic_authority,
-        )
-        self._proactive_scheduler_log_signature: tuple[tuple[str, object], ...] | None = None
-        self._proactive_scheduler_group_log_signatures: dict[
-            str,
-            tuple[str, str, bool],
-        ] = {}
-        self._proactive_scheduler_task: asyncio.Task[None] | None = None
-        bind_name_wake_plugin(self)
-        self._ensure_proactive_scheduler_started()
-
-    def _config(self, key: str, default: Any) -> Any:
-        group_name = _CONFIG_GROUP_BY_KEY.get(key)
-        if group_name:
-            group = self.config.get(group_name, _MISSING_CONFIG_VALUE)
-            if hasattr(group, "get"):
-                value = group.get(key, _MISSING_CONFIG_VALUE)
-                if value is not _MISSING_CONFIG_VALUE:
-                    return default if value is None else value
-        value = self.config.get(key, default)
-        return default if value is None else value
-
-    def _config_bool(self, key: str, default: bool = False) -> bool:
-        value = self._config(key, default)
-        return value if type(value) is bool else default
-
-    def _config_int(self, key: str, default: int) -> int:
-        value = self._config(key, default)
-        return value if type(value) is int else default
-
-    def _build_temporal_context(self, *, now: float) -> TemporalContext:
-        """Build the sole chat/proactive wall-clock authority from frozen config."""
-
-        offset = self._config_int("proactive_timezone_offset_minutes", 480)
-        try:
-            return build_temporal_context(
-                now=now,
-                timezone_offset_minutes=offset,
-            )
-        except ContractViolation as exc:
-            structured_log(
-                logger,
-                "error",
-                "temporal.context_config_invalid",
-                failure_kind=safe_exception_kind(exc),
-            )
-            return build_temporal_context(
-                now=now,
-                timezone_offset_minutes=480,
-            )
-
-    def _build_proactive_policy_config(self) -> ProactivePolicyConfig:
-        raw_allowlist = self._config("proactive_group_allowlist", [])
-        if type(raw_allowlist) is str:
-            raw_values: object = tuple(
-                value for value in re.split(r"[,;，；\s]+", raw_allowlist) if value
-            )
-        elif type(raw_allowlist) in {list, tuple}:
-            raw_values = tuple(raw_allowlist)
-        else:
-            raw_values = ()
-        valid_allowlist = bool(
-            type(raw_values) is tuple
-            and all(
-                type(value) is str
-                and bool(value.strip())
-                and value == value.strip()
-                for value in raw_values
-            )
-        )
-        allowlist = (
-            tuple(sorted(set(raw_values)))
-            if valid_allowlist
-            else ()
-        )
-        try:
-            return ProactivePolicyConfig(
-                enabled=self._config_bool("proactive_initiation_enabled", False),
-                group_allowlist=allowlist,
-                active_hour_start=self._config_int("proactive_active_hour_start", 9),
-                active_hour_end=self._config_int("proactive_active_hour_end", 23),
-                timezone_offset_minutes=self._config_int(
-                    "proactive_timezone_offset_minutes",
-                    480,
-                ),
-                observation_seconds=self._config_int(
-                    "proactive_observation_minutes",
-                    30,
-                )
-                * 60,
-                idle_seconds=self._config_int("proactive_idle_minutes", 20) * 60,
-                cooldown_seconds=self._config_int(
-                    "proactive_cooldown_minutes",
-                    180,
-                )
-                * 60,
-                daily_limit=self._config_int("proactive_daily_limit", 1),
-            )
-        except ContractViolation as exc:
-            structured_log(
-                logger,
-                "error",
-                "proactive.policy_config_invalid",
-                failure_kind=safe_exception_kind(exc),
-            )
-            return ProactivePolicyConfig()
-
-    def _build_owner_action_adapter_config(self) -> AdapterConfig:
-        master = bool(getattr(self, "owner_action_enabled", False))
-        # The retained UI flag is observed for audit/config-shape parity only.
-        # It is deliberately discarded and can never reach AdapterConfig.
-        self._config_bool("owner_action_sandbox_shell_once_enabled", False)
-        path_flavor_value = str(
-            self._config("owner_action_artifact_path_flavor", "") or ""
-        ).strip()
-        shell_family_value = str(
-            self._config("owner_action_shell_family", "") or ""
-        ).strip()
-        path_flavor = next(
-            (
-                value
-                for value in ArtifactPathFlavor
-                if value.value == path_flavor_value
-            ),
-            None,
-        )
-        shell_family = next(
-            (
-                value
-                for value in ShellFamily
-                if value.value == shell_family_value
-            ),
-            None,
-        )
-        return AdapterConfig(
-            artifact_read_exact_enabled=(
-                master
-                and self._config_bool(
-                    "owner_action_artifact_read_exact_enabled",
-                    False,
-                )
-            ),
-            artifact_grep_enabled=(
-                master
-                and self._config_bool(
-                    "owner_action_artifact_grep_enabled",
-                    False,
-                )
-            ),
-            memory_write_literal_enabled=(
-                master
-                and self._config_bool(
-                    "owner_action_memory_write_literal_enabled",
-                    False,
-                )
-            ),
-            # Shell remains code-level hard-disabled even if a stale config has
-            # the UI flag set.  The value is deliberately never propagated.
-            sandbox_shell_once_enabled=False,
-            artifact_root=str(
-                self._config("owner_action_artifact_root", "") or ""
-            ).strip(),
-            path_flavor=path_flavor,
-            shell_family=shell_family,
-        )
-
-    def _owner_action_secret(self) -> bytes:
-        """Load or create the local lifecycle HMAC secret without logging it."""
-
-        self._owner_action_data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        secret_path = self._owner_action_data_dir / ".install_secret"
-        try:
-            value = secret_path.read_bytes()
-        except FileNotFoundError:
-            value = secrets.token_bytes(32)
-            descriptor = -1
-            try:
-                descriptor = os.open(
-                    secret_path,
-                    os.O_WRONLY
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | getattr(os, "O_BINARY", 0),
-                    0o600,
-                )
-                with os.fdopen(descriptor, "wb") as stream:
-                    descriptor = -1
-                    stream.write(value)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-            except FileExistsError:
-                value = secret_path.read_bytes()
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
-        if type(value) is not bytes or len(value) != 32:
-            raise RuntimeError("owner_action_install_secret_invalid")
-        if os.name != "nt":
-            os.chmod(secret_path, 0o600)
-        return value
-
-    def _ensure_owner_action_durable_runtime(
-        self,
-    ) -> tuple[OwnerActionLifecycleStore, OwnerActionDurableFinalizeAuthority]:
-        with self._owner_action_runtime_lock:
-            store = self.owner_action_lifecycle_store
-            authority = self.owner_action_durable_authority
-            if store is not None and authority is not None and store.enabled:
-                return store, authority
-            if store is not None:
-                store.close()
-            store = OwnerActionLifecycleStore(
-                self._owner_action_data_dir / "lifecycle",
-                install_secret=self._owner_action_secret(),
-                recovery_now=time.time(),
-                max_records=512,
-                tombstone_ttl_seconds=900.0,
-            )
-            if not store.enabled:
-                raise RuntimeError("owner_action_lifecycle_unavailable")
-            authority = OwnerActionDurableFinalizeAuthority.issue_for_runtime(
-                store,
-                self.owner_action_controller,
-                self.action_outcome_authority,
-                max_dispatches=512,
-            )
-            self.owner_action_lifecycle_store = store
-            self.owner_action_durable_authority = authority
-            return store, authority
-
-    @staticmethod
-    def _load_persona_packages(persona_dir: Path) -> dict[str, PersonaPackage]:
-        """Load replaceable persona assets without making one role a core rule."""
-
-        packages: dict[str, PersonaPackage] = {}
-        for path in sorted(persona_dir.glob("*.json")):
-            try:
-                package = load_persona_package(path)
-            except ValueError as exc:
-                structured_log(
-                    logger,
-                    "warning",
-                    "persona.load_failed",
-                    package_digest=diagnostic_digest(path.name),
-                    failure_kind=safe_exception_kind(exc),
-                )
-                continue
-            for key in {
-                package.package_id.casefold(),
-                package.display_name.casefold(),
-            }:
-                if key:
-                    packages.setdefault(key, package)
-        return packages
-
-    def _configured_persona_package(self) -> PersonaPackage | None:
-        configured = str(self._config("persona_name", "亚托莉") or "").strip()
-        if not configured:
-            return None
-        return self._persona_packages.get(configured.casefold())
-
-    def _typed_turn_gate(
-        self,
-        *,
-        envelope: TurnEnvelope,
-        principal: PrincipalContext,
-    ) -> TypedTurnGate:
-        return validate_typed_turn(
-            envelope=envelope,
-            principal=principal,
-        )
-
-    def _typed_runtime_decision(
-        self,
-        event: AstrMessageEvent | None = None,
-        *,
-        envelope: TurnEnvelope | None = None,
-        principal: PrincipalContext | None = None,
-        turn_ready: bool = False,
-        planned_action: PlannedAction | None = None,
-        refresh: bool = False,
-        turn_status: str = "not_evaluated",
-        turn_reason_count: int = 0,
-    ) -> TypedRuntimeDecision:
-        """Return the event-local typed-only runtime decision."""
-
-        if event is not None and not refresh:
-            cached = event.get_extra(SHIO_TYPED_RUNTIME_DECISION, None)
-            if isinstance(cached, TypedRuntimeDecision):
-                return cached
-
-        gate: TypedTurnGate | None = None
-        if event is not None and envelope is not None and principal is not None:
-            gate = self._typed_turn_gate(
-                envelope=envelope,
-                principal=principal,
-            )
-        activation_ready = bool(
-            gate is not None
-            and gate.activation_ready
-            and turn_ready
-        )
-        decision = typed_runtime_decision(
-            activation_ready=activation_ready,
-            planned_action=planned_action,
-        )
-        if event is not None:
-            metadata = decision.trace_metadata()
-            if gate is not None:
-                metadata.update(gate.trace_metadata())
-            metadata.update(
-                {
-                    "typed_plan_status": turn_status,
-                    "typed_plan_reason_count": max(0, int(turn_reason_count)),
-                }
-            )
-            event.set_extra(SHIO_TYPED_RUNTIME_DECISION, decision)
-            event.set_extra(SHIO_TYPED_RUNTIME, metadata)
-        return decision
-
-    def _owner_ids(self) -> set[str]:
-        raw = self._config("owner_ids", [])
-        if isinstance(raw, str):
-            values = re.split(r"[,;\s]+", raw)
-        elif isinstance(raw, (list, tuple, set)):
-            values = raw
-        else:
-            values = []
-        return {str(item).strip() for item in values if str(item).strip()}
-
-    def _string_set(self, key: str, default: Any = None) -> set[str]:
-        raw = self._config(key, [] if default is None else default)
-        if isinstance(raw, str):
-            values = re.split(r"[,;\s]+", raw)
-        elif isinstance(raw, (list, tuple, set)):
-            values = raw
-        else:
-            values = []
-        return {str(item).strip() for item in values if str(item).strip()}
-
-    def _natural_group_participation_enabled(self, envelope: TurnEnvelope) -> bool:
-        """Keep opportunistic joining independent from cold-silence scheduling."""
-
-        if envelope.chat_type != "group" or not self._config_bool(
-            "natural_group_participation_enabled",
-            False,
-        ):
-            return False
-        allowlist = self._string_set("natural_group_participation_allowlist")
-        return bool(allowlist and envelope.group_id in allowlist)
-
-    def _build_trusted_bot_registry(self) -> tuple[TrustedBotRegistry, bool]:
-        """Build an exact structural bot registry from ``platform|sender`` rows."""
-
-        raw = self._config("trusted_bot_identities", [])
-        if isinstance(raw, str):
-            values: Any = [item for item in re.split(r"[,;，；\n]+", raw) if item]
-        elif isinstance(raw, (list, tuple, set)):
-            values = raw
-        else:
-            values = []
-        pairs: list[tuple[str, str]] = []
-        valid = True
-        for value in values:
-            if isinstance(value, dict):
-                platform_id = str(value.get("platform_id", "") or "").strip()
-                sender_id = str(value.get("sender_id", "") or "").strip()
-            else:
-                rendered = str(value or "").strip()
-                parts = rendered.split("|", 1)
-                if len(parts) != 2:
-                    valid = False
-                    continue
-                platform_id, sender_id = (part.strip() for part in parts)
-            if not platform_id or not sender_id or "*" in {platform_id, sender_id}:
-                valid = False
-                continue
-            pairs.append((platform_id, sender_id))
-        try:
-            registry = TrustedBotRegistry.from_configured_pairs(pairs)
-        except Exception as exc:
-            structured_log(
-                logger,
-                "error",
-                "trusted_bot.config_invalid",
-                failure_kind=safe_exception_kind(exc),
-            )
-            return TrustedBotRegistry.from_configured_pairs(()), False
-        if not valid:
-            structured_log(
-                logger,
-                "error",
-                "trusted_bot.config_invalid",
-                failure_kind="malformed_identity_pair",
-            )
-        return registry, valid
-
-    def _name_wake_aliases(self) -> list[str]:
-        raw = self._config(
-            "natural_name_wake_aliases",
-            ["亚托莉", "ATRI", "アトリ", "萝卜子"],
-        )
-        if isinstance(raw, str):
-            values = re.split(r"[,;，；\n]+", raw)
-        elif isinstance(raw, (list, tuple, set)):
-            values = raw
-        else:
-            values = []
-        aliases: list[str] = []
-        for value in values:
-            alias = str(value or "").strip()
-            if alias and alias.casefold() not in {item.casefold() for item in aliases}:
-                aliases.append(alias)
-        persona_name = str(self._config("persona_name", "亚托莉") or "").strip()
-        if persona_name and persona_name.casefold() not in {
-            item.casefold() for item in aliases
-        }:
-            aliases.insert(0, persona_name)
-        return aliases
-
-    def _classify_natural_name_wake(
-        self,
-        event: AstrMessageEvent,
-        message: str,
-        group_id: str,
-    ) -> NameWakeDecision:
-        if not bool(self._config("natural_name_wake_enabled", True)):
-            return NameWakeDecision("none", reason="功能已关闭")
-        whitelist = self._string_set("natural_name_wake_group_whitelist", [])
-        if whitelist and group_id not in whitelist:
-            return NameWakeDecision("none", reason="当前群不在白名单")
-        try:
-            components = list(event.get_messages() or [])
-        except Exception:
-            components = []
-        # 只有引用段里出现名字不算当前用户直呼；当前纯文本仍会正常参与判断。
-        if not str(message or "").strip() and any(
-            component.__class__.__name__ == "Reply" for component in components
-        ):
-            return NameWakeDecision("none", reason="名字只出现在引用内容中")
-        return classify_name_wake(
-            message,
-            self._name_wake_aliases(),
-            mode=str(self._config("natural_name_wake_mode", "natural")),
-        )
-
-    @staticmethod
-    def _structured_address_evidence(
-        event: AstrMessageEvent,
-        envelope: TurnEnvelope,
-    ) -> tuple[
-        tuple[StructuredMentionEvidence, ...],
-        StructuredReplyEvidence | None,
-        InboundIdentityMetadata,
-    ]:
-        """Adapt only structural At/Reply fields; never infer from display names."""
-
-        get_messages = getattr(event, "get_messages", None)
-        try:
-            components = list(get_messages() or ()) if callable(get_messages) else []
-        except Exception:
-            components = []
-        mention_components: list[tuple[Any, str, str]] = []
-        reply_component: Any | None = None
-        for component in components:
-            raw_type = getattr(component, "type", "")
-            component_type = str(
-                getattr(raw_type, "value", raw_type) or ""
-            ).strip().lower()
-            class_name = component.__class__.__name__.strip().lower()
-            if component_type == "at" or class_name in {"at", "atall"}:
-                target_sender_id = str(getattr(component, "qq", "") or "").strip()
-                if target_sender_id and target_sender_id.casefold() != "all":
-                    target_sender_key = build_sender_key(
-                        envelope.scope_key,
-                        target_sender_id,
-                    )
-                    mention_components.append(
-                        (component, target_sender_id, target_sender_key)
-                    )
-            if component_type == "reply" or class_name == "reply":
-                reply_component = component
-
-        structured_reply = None
-        if (
-            reply_component is not None
-            and envelope.reply_to_message_id
-            and envelope.reply_to_sender_id
-        ):
-            quoted_content = str(
-                getattr(reply_component, "message_str", "")
-                or getattr(reply_component, "text", "")
-                or ""
-            )
-            structured_reply = StructuredReplyEvidence(
-                source_message_id=envelope.message_id,
-                referenced_message_id=envelope.reply_to_message_id,
-                referenced_sender_id=envelope.reply_to_sender_id,
-                quoted_content=quoted_content,
-            )
-        referenced_sender_key = ""
-        if structured_reply is not None:
-            referenced_sender_key = build_sender_key(
-                envelope.scope_key,
-                structured_reply.referenced_sender_id,
-            )
-        protected_identity_literals = identity_literals_for_sender_keys(
-            (
-                envelope.sender_key,
-                referenced_sender_key,
-                *(target_key for _component, _target_id, target_key in mention_components),
-            ),
-            extra_literals=(
-                envelope.sender_id,
-                envelope.bot_id,
-                envelope.group_id,
-                envelope.session_id,
-                envelope.reply_to_sender_id,
-                *(target_id for _component, target_id, _target_key in mention_components),
-            ),
-        )
-
-        mentions: list[StructuredMentionEvidence] = []
-        mention_targets: list[ParticipantDisplay] = []
-        for component, target_sender_id, target_sender_key in mention_components:
-            mentions.append(
-                StructuredMentionEvidence(
-                    source_message_id=envelope.message_id,
-                    target_sender_id=target_sender_id,
-                )
-            )
-            if not target_sender_key:
-                continue
-            target_display = select_display_name_metadata(
-                (
-                    getattr(component, "name", ""),
-                    getattr(component, "display_name", ""),
-                ),
-                source="mention_component",
-                identity_literals=protected_identity_literals,
-            )
-            mention_targets.append(
-                ParticipantDisplay(
-                    sender_key=target_sender_key,
-                    display=target_display,
-                )
-            )
-
-        referenced_sender = None
-        if structured_reply is not None:
-            if referenced_sender_key:
-                reply_display = select_display_name_metadata(
-                    (
-                        getattr(reply_component, "sender_nickname", ""),
-                        getattr(reply_component, "sender_name", ""),
-                        getattr(reply_component, "name", ""),
-                    ),
-                    source="reply_component",
-                    identity_literals=protected_identity_literals,
-                )
-                referenced_sender = ParticipantDisplay(
-                    sender_key=referenced_sender_key,
-                    display=reply_display,
-                )
-        get_sender_name = getattr(event, "get_sender_name", None)
-        try:
-            sender_display_name = (
-                str(get_sender_name() or "") if callable(get_sender_name) else ""
-            )
-        except Exception:
-            sender_display_name = ""
-        identity_metadata = build_inbound_identity_metadata(
-            display_name=sender_display_name,
-            display_name_source="event_sender",
-            display_name_identity_literals=protected_identity_literals,
-            referenced_sender=referenced_sender,
-            mention_targets=mention_targets,
-            has_reply_edge=bool(envelope.reply_to_message_id),
-            open_group=envelope.chat_type == "group",
-        )
-        return tuple(mentions), structured_reply, identity_metadata
-
-    def _effective_sender(
-        self,
-        event: AstrMessageEvent,
-    ) -> tuple[str, str]:
-        sender_id = str(event.get_sender_id() or "").strip()
-        try:
-            raw_sender_name = event.get_sender_name()
-        except Exception:
-            raw_sender_name = ""
-        sender_display = build_display_name_metadata(
-            raw_sender_name,
-            source="event_sender",
-            identity_literals=(sender_id,),
-        )
-        return sender_id, sender_display.value
-
-    def _effective_principal(
-        self,
-        event: AstrMessageEvent,
-    ) -> PrincipalContext:
-        return ensure_principal_context(event, self._owner_ids())
-
-    @staticmethod
-    def _event_value(event: AstrMessageEvent, method_name: str) -> str:
-        method = getattr(event, method_name, None)
-        if not callable(method):
-            return ""
-        try:
-            return str(method() or "").strip()
-        except Exception:
-            return ""
-
-    @classmethod
-    def _canonical_event_message(cls, event: AstrMessageEvent) -> str:
-        """Return the same untruncated canonical text used for ingress binding."""
-
-        text = cls._event_value(event, "get_message_str") or cls._event_value(
-            event,
-            "get_message_outline",
-        )
-        if text:
-            return text
-        get_messages = getattr(event, "get_messages", None)
-        try:
-            message_chain = get_messages() if callable(get_messages) else ()
-        except Exception:
-            message_chain = ()
-        return media_only_current_message(message_chain)
-
-    def _identity_scope(
-        self,
-        event: AstrMessageEvent,
-        sender_id: str,
-    ) -> dict[str, str]:
-        envelope = ensure_turn_envelope(event)
-        platform_id = envelope.platform_id
-        platform_name = self._event_value(event, "get_platform_name")
-        bot_id = envelope.bot_id
-        group_id = envelope.group_id
-        session_id = envelope.session_id
-        chat_type = envelope.chat_type
-        scope_key = build_scope_key(
-            platform_id=platform_id,
-            bot_id=bot_id,
-            chat_type=chat_type,
-            group_id=group_id,
-            session_id=session_id,
-        )
-        identity_key = build_sender_key(scope_key, sender_id)
-        return {
-            "platform_id": platform_id,
-            "platform_name": platform_name,
-            "bot_id": bot_id,
-            "chat_type": chat_type,
-            "group_id": group_id,
-            "session_id": session_id,
-            "scope_key": scope_key,
-            "identity_key": identity_key,
-        }
-
-    def _livingmemory_adapter(self, event: AstrMessageEvent) -> LivingMemoryAdapter:
-        """Resolve only Shio-injected or AstrBot-public LivingMemory state.
-
-        AstrBot's public star metadata verifies installation/activation, but it
-        does not expose a supported recent-message reader. A reader therefore
-        has to be injected through Shio's typed adapter boundary; an active
-        plugin without one is an explicit interface degradation.
-        """
-
-        injected = event.get_extra(SHIO_LIVINGMEMORY_ADAPTER, None)
-        if isinstance(injected, LivingMemoryAdapter):
-            event.set_extra(
-                SHIO_MEMORY_READER_EVIDENCE,
-                {
-                    "memory_recent_reader_status": injected.status.value,
-                    "memory_recent_reader_reason_code": "injected_adapter",
-                    "memory_recent_reader_degraded": (
-                        injected.status is not PluginEvidenceStatus.VERIFIED
-                    ),
-                    "memory_provided_only": False,
-                },
-            )
-            return injected
-
-        if not bool(self._config("prefer_livingmemory_group_history", True)):
-            adapter = LivingMemoryAdapter.degraded(
-                PluginEvidenceStatus.DISABLED,
-                reason_code="plugin_disabled",
-            )
-            event.set_extra(
-                SHIO_MEMORY_READER_EVIDENCE,
-                {
-                    "memory_recent_reader_status": "disabled",
-                    "memory_recent_reader_reason_code": "plugin_disabled",
-                    "memory_recent_reader_degraded": True,
-                    "memory_provided_only": False,
-                },
-            )
-            return adapter
-
-        get_registered_star = getattr(self.context, "get_registered_star", None)
-        if not callable(get_registered_star):
-            adapter = LivingMemoryAdapter.degraded(
-                PluginEvidenceStatus.INTERFACE_CHANGED,
-                reason_code="public_registry_unavailable",
-            )
-            event.set_extra(
-                SHIO_MEMORY_READER_EVIDENCE,
-                {
-                    "memory_recent_reader_status": "interface_changed",
-                    "memory_recent_reader_reason_code": "public_registry_unavailable",
-                    "memory_recent_reader_degraded": True,
-                    "memory_provided_only": False,
-                },
-            )
-            return adapter
-        reader_reason = "public_adapter_unavailable"
-        try:
-            metadata = get_registered_star(LIVINGMEMORY_PLUGIN_NAME)
-        except TimeoutError:
-            adapter = LivingMemoryAdapter.degraded(
-                PluginEvidenceStatus.TIMEOUT,
-                reason_code="public_registry_timeout",
-            )
-        except (AttributeError, TypeError):
-            adapter = LivingMemoryAdapter.degraded(
-                PluginEvidenceStatus.INTERFACE_CHANGED,
-                reason_code="public_registry_interface_changed",
-            )
-        except Exception:
-            adapter = LivingMemoryAdapter.degraded(
-                PluginEvidenceStatus.ERROR,
-                reason_code="public_registry_error",
-            )
-        else:
-            if metadata is None:
-                adapter = LivingMemoryAdapter.degraded(
-                    PluginEvidenceStatus.MISSING,
-                    reason_code="plugin_missing",
-                )
-            else:
-                try:
-                    plugin_name = str(getattr(metadata, "name", "") or "").strip()
-                    activated = getattr(metadata, "activated")
-                except (AttributeError, TypeError):
-                    adapter = LivingMemoryAdapter.degraded(
-                        PluginEvidenceStatus.INTERFACE_CHANGED,
-                        reason_code="public_metadata_interface_changed",
-                    )
-                else:
-                    if (
-                        plugin_name != LIVINGMEMORY_PLUGIN_NAME
-                        or type(activated) is not bool
-                    ):
-                        adapter = LivingMemoryAdapter.degraded(
-                            PluginEvidenceStatus.INTERFACE_CHANGED,
-                            reason_code="public_metadata_interface_changed",
-                        )
-                    elif not activated:
-                        adapter = LivingMemoryAdapter.degraded(
-                            PluginEvidenceStatus.DISABLED,
-                            reason_code="plugin_disabled",
-                        )
-                    else:
-                        reader_reason = "public_reader_unavailable"
-                        adapter = LivingMemoryAdapter.degraded(
-                            PluginEvidenceStatus.INTERFACE_CHANGED,
-                            reason_code="public_reader_unavailable",
-                        )
-        event.set_extra(
-            SHIO_MEMORY_READER_EVIDENCE,
-            {
-                "memory_recent_reader_status": adapter.status.value,
-                "memory_recent_reader_reason_code": reader_reason,
-                "memory_recent_reader_degraded": (
-                    adapter.status is not PluginEvidenceStatus.VERIFIED
-                ),
-                "memory_provided_only": False,
-            },
-        )
-        return adapter
-
-    async def _ensure_memory_policy_result(
-        self,
-        *,
-        event: AstrMessageEvent,
-        request: ProviderRequest,
-        admission: AdmissionResult,
-        conversation_event: ConversationEvent,
-    ) -> MemoryPolicyResult:
-        if (
-            not isinstance(admission, AdmissionResult)
-            or not admission.decision.allows_state_mutation
-            or not isinstance(conversation_event, ConversationEvent)
-            or admission.decision.binding != conversation_event.binding
-        ):
-            raise ValueError("memory_policy_binding_invalid")
-
-        existing = event.get_extra(SHIO_MEMORY_POLICY_RESULT, None)
-        if isinstance(existing, MemoryPolicyResult):
-            if existing.decision.binding != conversation_event.binding:
-                raise ValueError("memory_policy_result_binding_mismatch")
-            return existing
-
-        try:
-            configured_limit = int(self._config("max_context_messages", 16))
-        except (TypeError, ValueError):
-            configured_limit = 16
-        semantic_required = has_provided_recall(request)
-        adapter = self._livingmemory_adapter(event)
-        reader_evidence = event.get_extra(SHIO_MEMORY_READER_EVIDENCE, {})
-        if not isinstance(reader_evidence, dict):
-            reader_evidence = {}
-        include_recent = True
-        policy_adapter = adapter
-        if (
-            semantic_required
-            and reader_evidence.get("memory_recent_reader_reason_code")
-            == "public_reader_unavailable"
-        ):
-            # The current ProviderRequest is itself the supported, bound recall
-            # transport. Preserve it while separately tracing that no public
-            # recent-reader contract exists; never recover through private state.
-            policy_adapter = LivingMemoryAdapter.verified(reader=None)
-            include_recent = False
-            reader_evidence = {
-                **reader_evidence,
-                "memory_provided_only": True,
-            }
-            event.set_extra(SHIO_MEMORY_READER_EVIDENCE, reader_evidence)
-        result = await self.memory_policy.decide(
-            admission.decision,
-            conversation_event,
-            adapter=policy_adapter,
-            provided_recall=request,
-            include_recent=include_recent,
-            semantic_required=semantic_required,
-            max_results=5,
-            recent_limit=min(20, max(2, configured_limit)),
-        )
-        event.set_extra(SHIO_MEMORY_POLICY_RESULT, result)
-        if (
-            result.plugin_evidence.status is not PluginEvidenceStatus.VERIFIED
-            or bool(reader_evidence.get("memory_recent_reader_degraded", False))
-        ):
-            structured_log(
-                logger,
-                "warning",
-                "memory.policy_degraded",
-                trace_id=get_trace_id(event),
-                **result.trace_metadata(),
-                **reader_evidence,
-            )
-        return result
-
-    async def _identity_aware_history(
-        self,
-        event: AstrMessageEvent,
-        native_contexts: list[dict] | None,
-        current_message: str,
-        sender_id: str,
-        group_id: str,
-        max_messages: int,
-        max_chars: int,
-    ) -> tuple[list[dict[str, str]], str]:
-        # request.contexts 只作兼容输入。群聊的主历史源是 AstrBot 公开的
-        # message_history_manager；每条平台记录仍须与 Shio 已接纳的人类
-        # inbound ledger 对齐，避免把自发消息、已拦用户或插件回声带入 Prompt。
-        envelope = ensure_turn_envelope(event)
-        platform_history = await read_astrbot_group_history(
-            context=self.context,
-            event=event,
-            accepted_records=self.ledger.records(
-                envelope.scope_key,
-                source_kinds=(LedgerSourceKind.INBOUND,),
-            ),
-            scope_key=envelope.scope_key,
-            session_id=envelope.session_id,
-            max_records=max_messages,
-        )
-        event.set_extra(SHIO_PLATFORM_GROUP_HISTORY, platform_history)
-        history_metadata = platform_history.trace_metadata()
-        record_pipeline_stage(
-            event,
-            "group_history",
-            **history_metadata,
-        )
-        structured_log(
-            logger,
-            "info",
-            "group_history.read",
-            trace_id=get_trace_id(event),
-            **history_metadata,
-        )
-        event.set_extra(SHIO_TYPED_HISTORY_SOURCE, list(native_contexts or []))
-        trusted = clean_contexts(
-            event,
-            native_contexts,
-            current_message,
-            max_messages,
-            max_chars,
-            group_id=group_id,
-            current_sender_id=sender_id,
-        )
-        if platform_history.status is PlatformGroupHistoryStatus.VERIFIED:
-            source = "astrbot_platform_history"
-        elif trusted:
-            source = "request_contexts_compat"
-        else:
-            source = platform_history.status.value
-        return trusted, source
-
-    def _record_typed_inbound_once(
-        self,
-        event: AstrMessageEvent,
-        envelope: TurnEnvelope,
-        current_message: str,
-        *,
-        identity_metadata: InboundIdentityMetadata | None = None,
-        structured_reply: StructuredReplyEvidence | None = None,
-    ) -> LedgerRecord:
-        if identity_metadata is None:
-            _, structured_reply, identity_metadata = (
-                self._structured_address_evidence(event, envelope)
-            )
-        structured_mentions, _ignored_reply, _ignored_metadata = (
-            self._structured_address_evidence(event, envelope)
-        )
-        existing = event.get_extra(SHIO_TYPED_INBOUND_RECORD, None)
-        if type(existing) is LedgerRecord:
-            if (
-                existing.source_kind is not LedgerSourceKind.INBOUND
-                or existing.role is not LedgerRole.USER
-                or existing.scope_key != envelope.scope_key
-                or existing.session_id != envelope.session_id
-                or existing.message_id != envelope.message_id
-                or existing.sender_key != envelope.sender_key
-                or existing.content_digest != ledger_content_digest(current_message)
-                or identity_metadata_integrity(existing.identity_metadata)
-                != identity_metadata_integrity(identity_metadata)
-            ):
-                raise ContractViolation("typed_inbound_record_corrupt")
-            return existing
-        record = self.ledger.record_inbound(
-            envelope,
-            current_message,
-            unified_msg_origin=str(
-                getattr(event, "unified_msg_origin", "") or ""
-            ),
-            identity_metadata=identity_metadata,
-            mention_sender_ids=tuple(
-                item.target_sender_id for item in structured_mentions
-            ),
-        )
-        if envelope.reply_to_message_id:
-            self.ledger.record_reference(
-                envelope,
-                referenced_content=(
-                    structured_reply.quoted_content
-                    if structured_reply is not None
-                    else ""
-                ),
-                referenced_sender_key=(
-                    identity_metadata.referenced_sender.sender_key
-                    if identity_metadata.referenced_sender is not None
-                    else ""
-                ),
-                identity_metadata=identity_metadata,
-            )
-        event.set_extra(SHIO_TYPED_INBOUND_RECORD, record)
-        event.set_extra(SHIO_TYPED_INBOUND_RECORDED, True)
-        return record
-
-    def _build_typed_context(
-        self,
-        *,
-        event: AstrMessageEvent,
-        envelope: TurnEnvelope,
-        principal: PrincipalContext,
-        reply_target: ReplyTarget | None,
-        reference_context: ReferenceContext | None,
-        current_message: str,
-        scope_key: str,
-        identity_scope: dict[str, str],
-    ) -> dict[str, Any]:
-        runtime_decision = self._typed_runtime_decision(event)
-        metadata: dict[str, Any] = {
-            **runtime_decision.trace_metadata(),
-            "v2_typed_history_count": 0,
-            "v2_sender_thread_count": 0,
-            "v2_unknown_assistant_count": 0,
-            "v2_inbound_recorded": False,
-            "v2_fact_count": 0,
-            "v2_current_subject_fact_count": 0,
-            "v2_unknown_subject_fact_count": 0,
-            "v2_must_include_fact_count": 0,
-            "v2_other_subject_fact_count": 0,
-            "v2_planner_record_count": 0,
-            "v2_replyer_thread_count": 0,
-            "v2_public_background_count": 0,
-            "v2_history_candidate_count": 0,
-            "v2_history_accepted_count": 0,
-            "v2_history_dropped_count": 0,
-            "v2_history_receipt_verified_count": 0,
-        }
-        event.set_extra(SHIO_ASSEMBLED_CONTEXT_V2, None)
-        if not scope_key:
-            return metadata
-
-        admitted_event = event.get_extra(SHIO_CONVERSATION_EVENT, None)
-        if (
-            not isinstance(admitted_event, ConversationEvent)
-            or admitted_event.envelope != envelope
-            or admitted_event.binding.current_sender_key != principal.sender_key
-        ):
-            return metadata
-        memory_result = event.get_extra(SHIO_MEMORY_POLICY_RESULT, None)
-        if (
-            not isinstance(memory_result, MemoryPolicyResult)
-            or memory_result.decision.binding != admitted_event.binding
-        ):
-            return metadata
-
-        raw_history = event.get_extra(SHIO_TYPED_HISTORY_SOURCE, [])
-        platform_history = event.get_extra(SHIO_PLATFORM_GROUP_HISTORY, None)
-        platform_records = (
-            platform_history.records
-            if type(platform_history) is PlatformGroupHistoryRead
-            else ()
-        )
-        platform_matched_message_ids = (
-            set(platform_history.matched_ledger_message_ids)
-            if type(platform_history) is PlatformGroupHistoryRead
-            else set()
-        )
-        legacy_history = tuple(
-            record
-            for record in adapt_astrbot_history(
-                list(raw_history or []),
-                scope_key=scope_key,
-                session_id=str(identity_scope.get("session_id", "")),
-                group_id=str(identity_scope.get("group_id", "")),
-                bot_sender_key=build_sender_key(
-                    scope_key,
-                    str(identity_scope.get("bot_id", "")),
-                ),
-            )
-            if not (
-                record.timestamp > 0
-                and envelope.timestamp > 0
-                and record.timestamp > envelope.timestamp
-            )
-        )
-        typed_facts = memory_result.decision.selected_facts
-        fact_selection = FactSelection(
-            must_include_candidates=memory_result.current_subject_facts,
-            uncertain_target_facts=(),
-            public_background=memory_result.public_background_facts,
-            other_subject_facts=(),
-        )
-
-        current_inbound_record: LedgerRecord | None = None
-        if envelope.scope_key == scope_key and envelope.message_id:
-            current_inbound_record = self._record_typed_inbound_once(
-                event,
-                envelope,
-                current_message,
-            )
-
-        ledger_records = self.ledger.records(scope_key)
-        if platform_matched_message_ids:
-            ledger_records = tuple(
-                record
-                for record in ledger_records
-                if not (
-                    record.source_kind is LedgerSourceKind.INBOUND
-                    and record.message_id in platform_matched_message_ids
-                )
-            )
-        if current_inbound_record is not None:
-            ledger_records = tuple(
-                record
-                for record in ledger_records
-                if record.sequence <= current_inbound_record.sequence
-            )
-        history_candidates = (
-            *platform_records,
-            *legacy_history,
-            *ledger_records,
-        )
-        normalization_context = HistoryNormalizationContext(
-            binding=admitted_event.binding,
-            current_action_id=(
-                f"turn_revision_{admitted_event.binding.conversation_revision}"
-            ),
-        )
-        assistant_records = tuple(
-            record
-            for record in history_candidates
-            if record.role is LedgerRole.ASSISTANT
-        )
-        receipt_ids: set[str] = set()
-        receipts = []
-        for record in assistant_records:
-            if record.source_kind is not LedgerSourceKind.OUTBOUND:
-                continue
-            internal_reply_id = record.message_id.rsplit(":", 1)[0]
-            if not internal_reply_id or internal_reply_id in receipt_ids:
-                continue
-            receipt = self.send_receipts.sent_reply_record(internal_reply_id)
-            if receipt is not None:
-                receipt_ids.add(internal_reply_id)
-                receipts.append(receipt)
-        assistant_decisions = normalize_assistant_history(
-            assistant_records,
-            receipts=receipts,
-            context=normalization_context,
-        )
-        accepted_assistant_records = {
-            record
-            for record, decision in zip(
-                assistant_records,
-                assistant_decisions,
-                strict=True,
-            )
-            if decision.disposition is HistoryDisposition.CHARACTER_THREAD
-        }
-        reference_message_id = (
-            reference_context.message_id if reference_context is not None else ""
-        )
-        normalized_history: list[LedgerRecord] = []
-        normalized_keys: set[tuple[str, str, str]] = set()
-        public_group_context_allowed = envelope.chat_type == "group"
-        for record in history_candidates:
-            if record.role is LedgerRole.ASSISTANT:
-                if record in accepted_assistant_records:
-                    normalized_history.append(record)
-                continue
-            if record.role is not LedgerRole.USER:
-                continue
-            is_current_sender = record.sender_key == principal.sender_key
-            is_exact_reference = bool(
-                reference_message_id
-                and record.message_id == reference_message_id
-                and (
-                    reference_context is None
-                    or not reference_context.sender_key
-                    or record.sender_key == reference_context.sender_key
-                )
-            )
-            source_verified = (
-                record.source_kind is LedgerSourceKind.INBOUND
-                and record.attribution_status == "verified"
-            ) or (
-                record.source_kind is LedgerSourceKind.LEGACY_HISTORY
-                and record.attribution_status == "verified_sender"
-            ) or (
-                record.source_kind is LedgerSourceKind.PLATFORM_GROUP_HISTORY
-                and record.attribution_status
-                == "verified_platform_sender_and_admission"
-            )
-            is_safe_public_group_context = bool(
-                public_group_context_allowed
-                and record.source_kind
-                in {
-                    LedgerSourceKind.INBOUND,
-                    LedgerSourceKind.LEGACY_HISTORY,
-                    LedgerSourceKind.PLATFORM_GROUP_HISTORY,
-                }
-                and record.message_id != envelope.message_id
-            )
-            if source_verified and (
-                is_current_sender
-                or is_exact_reference
-                or is_safe_public_group_context
-            ):
-                normalized_key = (
-                    record.message_id,
-                    record.sender_key,
-                    record.content_digest,
-                )
-                if normalized_key in normalized_keys:
-                    continue
-                normalized_keys.add(normalized_key)
-                normalized_history.append(record)
-
-        typed_history = tuple(normalized_history)
-        sender_thread = records_for_sender_thread(typed_history, principal.sender_key)
-
-        assembled = (
-            assemble_context_views(
-                typed_history,
-                reply_target=reply_target,
-                reference=reference_context,
-                fact_selection=fact_selection,
-                current_record=current_inbound_record,
-            )
-            if reply_target is not None
-            else None
-        )
-        event.set_extra(SHIO_ASSEMBLED_CONTEXT_V2, assembled)
-
-        metadata.update(
-            {
-                **memory_result.trace_metadata(),
-                "v2_typed_history_count": len(typed_history),
-                "v2_sender_thread_count": len(sender_thread),
-                "v2_unknown_assistant_count": sum(
-                    decision.disposition is HistoryDisposition.DROP
-                    for decision in assistant_decisions
-                ),
-                "v2_inbound_recorded": bool(
-                    event.get_extra(SHIO_TYPED_INBOUND_RECORDED, False)
-                ),
-                "v2_fact_count": len(typed_facts),
-                "v2_current_subject_fact_count": sum(
-                    1
-                    for fact in typed_facts
-                    if fact.subject_key and fact.subject_key == principal.sender_key
-                ),
-                "v2_unknown_subject_fact_count": sum(
-                    1 for fact in typed_facts if not fact.subject_key
-                ),
-                "v2_must_include_fact_count": len(
-                    fact_selection.must_include_candidates
-                ),
-                "v2_other_subject_fact_count": len(
-                    fact_selection.other_subject_facts
-                ),
-                "v2_planner_record_count": (
-                    len(assembled.planner_records) if assembled is not None else 0
-                ),
-                "v2_replyer_thread_count": (
-                    len(assembled.replyer_thread) if assembled is not None else 0
-                ),
-                "v2_public_background_count": (
-                    len(assembled.public_background) if assembled is not None else 0
-                ),
-                "v2_history_candidate_count": len(history_candidates),
-                "v2_history_accepted_count": len(typed_history),
-                "v2_history_dropped_count": (
-                    len(history_candidates) - len(typed_history)
-                ),
-                "v2_history_receipt_verified_count": len(
-                    accepted_assistant_records
-                ),
-            }
-        )
-        return metadata
-
-    @staticmethod
-    def _xml_attrs(values: dict[str, str]) -> str:
-        return " ".join(
-            f'{key}="{html.escape(str(value), quote=True)}"'
-            for key, value in values.items()
-        )
-
-    def _guest_allowed_tool_names(self) -> list[str]:
-        raw = self._config(
-            "guest_allowed_tools",
-            ["astr_kb_search", "anysearch_search", "anysearch_extract"],
-        )
-        if isinstance(raw, str):
-            values = re.split(r"[,;\s]+", raw)
-        elif isinstance(raw, (list, tuple, set)):
-            values = raw
-        else:
-            values = []
-        result: list[str] = []
-        for item in values:
-            name = str(item or "").strip()
-            if name and name not in result:
-                result.append(name)
-        return result
-
-    @staticmethod
-    def _capability_policy_metadata(
-        *,
-        policy: Any,
-        available_tools: list[Any],
-    ) -> dict[str, str | int | bool]:
-        """Record content-free metrics for the active capability policy."""
-
-        classifications = [classify_tool(tool) for tool in available_tools]
-        decisions = [decide_tool(policy, value) for value in classifications]
-        allowed_count = sum(1 for decision in decisions if decision.allowed)
-        return {
-            "capability_policy_status": (
-                f"{policy.policy_kind}_degraded"
-                if policy.is_degraded
-                else f"{policy.policy_kind}_active"
-            ),
-            "capability_available_count": len(available_tools),
-            "capability_allowed_count": allowed_count,
-            "capability_denied_count": len(decisions) - allowed_count,
-            "capability_unknown_count": sum(
-                1
-                for value in classifications
-                if value.capability.value == "unknown"
-            ),
-            "capability_untrusted_source_denied_count": sum(
-                1
-                for decision in decisions
-                if not decision.allowed
-                and decision.reason_code
-                in {
-                    "audited_name_source_mismatch",
-                    "declared_capability_source_missing",
-                    "classification_source_unattested",
-                }
-            ),
-            "capability_policy_degraded": policy.is_degraded,
-            "capability_policy_degradation_count": len(policy.degradation_reasons),
-            "capability_external_tool_budget": policy.max_external_tool_calls,
-            "capability_local_presentation_budget": (
-                policy.max_local_presentation_calls
-            ),
-        }
-
-    @staticmethod
-    def _get_tools(tool_set: Any) -> list[Any]:
-        if tool_set is None:
-            return []
-        tools = getattr(tool_set, "tools", None)
-        if tools is None:
-            tools = getattr(tool_set, "func_list", [])
-        return list(tools or [])
-
-    def _available_tools(self, request_tool_set: Any) -> list[Any]:
-        """合并当前请求与 AstrBot 全局插件工具，按名称去重。"""
-        candidates = self._get_tools(request_tool_set)
-        try:
-            manager = self.context.get_llm_tool_manager()
-            global_tool_set = (
-                manager.get_full_tool_set()
-                if hasattr(manager, "get_full_tool_set")
-                else manager
-            )
-            candidates.extend(self._get_tools(global_tool_set))
-        except Exception as exc:
-            if bool(self._config("debug_log", False)):
-                structured_log(
-                    logger,
-                    "warning",
-                    "tools.inventory_failed",
-                    failure_kind=safe_exception_kind(exc),
-                )
-        try:
-            if not any(
-                str(getattr(tool, "name", "") or "").strip() == "astr_kb_search"
-                for tool in candidates
-            ):
-                from astrbot.core.tools.knowledge_base_tools import (
-                    KnowledgeBaseQueryTool,
-                )
-
-                candidates.append(KnowledgeBaseQueryTool())
-        except Exception as exc:
-            if bool(self._config("debug_log", False)):
-                structured_log(
-                    logger,
-                    "warning",
-                    "knowledge_base.tool_unavailable",
-                    failure_kind=safe_exception_kind(exc),
-                )
-
-        tools_by_name: dict[str, Any] = {}
-        for tool in candidates:
-            name = str(getattr(tool, "name", "") or "").strip()
-            if not name or not bool(getattr(tool, "active", True)):
-                continue
-            if name not in tools_by_name:
-                tools_by_name[name] = tool
-        return list(tools_by_name.values())
-
-    @staticmethod
-    def _get_tool_names(tool_set: Any) -> list[str]:
-        if tool_set is None:
-            return []
-        names = getattr(tool_set, "names", None)
-        if callable(names):
-            try:
-                return [str(name) for name in names()]
-            except Exception:
-                pass
-        return [
-            str(getattr(tool, "name", "unknown"))
-            for tool in ShioPlugin._get_tools(tool_set)
-        ]
-
-    @staticmethod
-    def _response_guard_tool_names(event: AstrMessageEvent) -> tuple[str, ...]:
-        """Return the closed protocol taxonomy used only by the send guard.
-
-        Final Persona rendering intentionally receives no tools.  Detection must
-        therefore not depend on that empty renderer ToolSet or on the removed
-        legacy payload inventory.  Seed it from the code-owned executors and add
-        only the exact typed acquisition selected for this turn.
-        """
-
-        names = {
-            "search_memes",
-            *SUPPORTED_SEALED_ACQUISITION_TOOL_NAMES,
-        }
-        acquisition = event.get_extra(SHIO_ACQUISITION_REQUEST, None)
-        if isinstance(acquisition, AcquisitionRequest):
-            exact_name = str(acquisition.selection.tool_name or "").strip()
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,127}", exact_name):
-                names.add(exact_name)
-        return tuple(sorted(names))
-
-    def _capture_meme_manager_tool_prompt(
-        self,
-        event: AstrMessageEvent,
-        req: ProviderRequest,
-    ) -> tuple[object | None, str, str]:
-        """Capture Manager's normal-hook presentation mode without owning it."""
-
-        manager_mode = str(
-            event.get_extra("meme_manager_semantic_mode", "") or ""
-        ).strip()
-        system_prompt = str(getattr(req, "system_prompt", "") or "")
-        if (
-            bool(event.get_extra("meme_manager_semantic_active", False))
-            and manager_mode == "tool"
-        ):
-            tool = next(
-                (
-                    candidate
-                    for candidate in self._available_tools(req.func_tool)
-                    if str(getattr(candidate, "name", "") or "")
-                    == "search_memes"
-                ),
-                None,
-            )
-            prompt_match = _MEME_MANAGER_SEMANTIC_PROMPT_RE.search(system_prompt)
-            if tool is not None and prompt_match is not None:
-                return tool, prompt_match.group(0).strip(), "semantic_tool"
-            return None, "", "unavailable"
-        if (
-            bool(event.get_extra("meme_manager_semantic_active", False))
-            and manager_mode == "llm"
-        ):
-            return None, "", "semantic_llm"
-        prompt_match = _MEME_MANAGER_LEGACY_PROMPT_RE.search(system_prompt)
-        if prompt_match is not None:
-            return None, prompt_match.group(0).strip(), "legacy_category"
-        return None, "", "unavailable"
-
-    @staticmethod
-    def _extract_meme_manager_category_markers(
-        raw_output: str,
-        *,
-        trusted_legacy_mode: bool,
-    ) -> tuple[str, tuple[str, ...]]:
-        """Remove strict Manager markers; preserve only trusted legacy tags."""
-
-        markers: list[str] = []
-
-        def replace(match: re.Match[str]) -> str:
-            category = str(match.group(1) or "").strip()
-            if (
-                trusted_legacy_mode
-                and _MEME_MANAGER_SAFE_CATEGORY_RE.fullmatch(category)
-                and category not in markers
-            ):
-                markers.append(category)
-            return ""
-
-        cleaned = _MEME_MANAGER_STRICT_MARKER_RE.sub(
-            replace,
-            str(raw_output or ""),
-        )
-        cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
-        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-        return cleaned, tuple(markers[:4])
-
-    def _clean_meme_manager_model_output(
-        self,
-        event: AstrMessageEvent,
-        raw_output: str,
-    ) -> str:
-        """Separate Manager-owned machine markers from visible validation text."""
-
-        mode = str(
-            event.get_extra(SHIO_MEME_MANAGER_PRESENTATION_MODE, "") or ""
-        ).strip()
-        cleaned_output = str(raw_output or "")
-        event.set_extra(SHIO_MEME_MANAGER_REFERENCE, "")
-        event.set_extra(SHIO_MEME_MANAGER_CATEGORY_MARKERS, ())
-        if mode == "semantic_tool":
-            cleaned_output, manager_references = (
-                extract_and_clean_internal_meme_references(
-                    cleaned_output,
-                    self._response_guard_tool_names(event),
-                )
-            )
-            event.set_extra(
-                SHIO_MEME_MANAGER_REFERENCE,
-                manager_references[0] if len(manager_references) == 1 else "",
-            )
-        cleaned_output, category_markers = (
-            self._extract_meme_manager_category_markers(
-                cleaned_output,
-                trusted_legacy_mode=mode == "legacy_category",
-            )
-        )
-        event.set_extra(SHIO_MEME_MANAGER_CATEGORY_MARKERS, category_markers)
-        return cleaned_output
-
-    @staticmethod
-    def _collect_text_components(components: Any) -> list[Any]:
-        """Collect mutable text components, including those nested in Node.
-
-        Meme Manager may decorate an LLM reply as a merged-forward ``Node``.
-        Looking only at the top-level chain leaves its nested ``Plain`` text
-        outside the final output guard.
-        """
-        result: list[Any] = []
-        visited: set[int] = set()
-
-        def visit(component: Any) -> None:
-            marker = id(component)
-            if marker in visited:
+        self._active_event_fence = ActiveEventFence()
+        self._natural_generations: dict[str, int] = {}
+        self._natural_candidate_sequences: dict[str, int] = {}
+        self._natural_candidates: dict[str, dict[int, int]] = {}
+        self._natural_active_candidate_watermarks: dict[str, int] = {}
+        self._natural_cadence: dict[str, NaturalCadence] = {}
+        self._natural_bindings: dict[str, NaturalCadenceRecord] = {}
+        self._natural_ready: dict[str, bool] = {}
+        self._natural_locks: dict[str, asyncio.Lock] = {}
+        self._natural_terminated = False
+        self._natural_candidate_sequences.clear()
+        self._natural_candidates.clear()
+        self._natural_active_candidate_watermarks.clear()
+        self._auxiliary_epoch = 0
+        self._auxiliary_terminated = False
+        self._auxiliary_tasks: set[asyncio.Task[Any]] = set()
+        self._initialize_lock = asyncio.Lock()
+        self._initialized = False
+        self._continuous_scopes: dict[str, _ContinuousScopeState] = {}
+        self._continuous_locks: dict[str, asyncio.Lock] = {}
+        self._continuous_terminated = False
+        self._batch_scopes: dict[str, _BatchScopeState] = {}
+        self._batch_scheduler_lock = asyncio.Lock()
+        self._batch_terminated = False
+        self._bubble_epoch = 0
+        self._bubble_terminated = False
+        # AstrBot reload purges the plugin module before constructing its next
+        # instance.  Epoch values alone therefore cannot distinguish a stale
+        # plan retained by an old module/instance from a fresh epoch zero.
+        self._bubble_instance_token = object()
+        self._master_alert_record = MasterAlertRecord()
+        self._master_alert_ready = False
+        # Every local Master-record publish advances this in-process authority
+        # revision.  A delayed initialize read may only publish when the
+        # revision it observed before the public KV await is still current.
+        self._master_alert_revision = 0
+        self._master_alert_lock = asyncio.Lock()
+        self._master_alert_timer: asyncio.Task[None] | None = None
+        self._master_alert_terminated = False
+        self._master_alert_terminating = False
+        self._master_alert_send_tasks: set[asyncio.Task[Any]] = set()
+        self._kv_tasks: set[asyncio.Task[Any]] = set()
+
+    def _mark_kv_unavailable(self, subsystem: str, scope: str = "") -> None:
+        """Fail closed; cancelling our waiter does not cancel AstrBot's FIFO write."""
+        if subsystem == "natural" and scope:
+            self._natural_ready[scope] = False
+        # Master authority is deliberately not changed here.  This callback
+        # runs outside the Master mutex, while every Master fail-close must
+        # advance the same local revision under that mutex.  Locked callers
+        # use ``_fail_close_master_alert_locked`` after the public await.
+
+    def _track_kv_task(self, task: asyncio.Task[Any]) -> None:
+        tasks = getattr(self, "_kv_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = set()
+            self._kv_tasks = tasks
+        tasks.add(task)
+
+        def consume(completed: asyncio.Task[Any]) -> None:
+            tasks.discard(completed)
+            if completed.cancelled():
                 return
-            visited.add(marker)
-            if isinstance(getattr(component, "text", None), str):
-                result.append(component)
-            for attribute in ("content", "chain"):
-                children = getattr(component, attribute, None)
-                if isinstance(children, (list, tuple)):
-                    for child in children:
-                        visit(child)
-
-        if isinstance(components, (list, tuple)):
-            for component in components:
-                visit(component)
-        elif components is not None:
-            visit(components)
-        return result
-
-    def _provider(self, provider_id: str, umo: str) -> Any:
-        if provider_id.strip():
-            provider = self.context.get_provider_by_id(provider_id.strip())
-            if provider is not None and hasattr(provider, "text_chat"):
-                return provider
-            structured_log(
-                logger,
-                "warning",
-                "provider.not_found",
-                provider_digest=diagnostic_digest(provider_id),
-            )
-        return self.context.get_using_provider(umo)
-
-    def log_name_wake_filter_error(self, exc: Exception) -> None:
-        structured_log(
-            logger,
-            "warning",
-            "name_wake.ingest_failed",
-            failure_kind=safe_exception_kind(exc),
-        )
-
-    def prepare_ingress_candidate(self, event: AstrMessageEvent) -> bool:
-        """Collect only event-local wake evidence during AstrBot WakingCheck."""
-
-        if not bool(self._config("enabled", True)):
-            return False
-        group_id = self._event_value(event, "get_group_id")
-        sender_id = self._event_value(event, "get_sender_id")
-        bot_id = self._event_value(event, "get_self_id")
-        platform_id = self._event_value(event, "get_platform_id")
-        session_id = self._event_value(event, "get_session_id")
-        if not sender_id or not bot_id or not platform_id or not (group_id or session_id):
-            return False
-
-        message = self._canonical_event_message(event)
-        if not message:
-            return False
-        is_direct_wake = bool(getattr(event, "is_at_or_wake_command", False))
-        name_wake = (
-            NameWakeDecision("none")
-            if is_direct_wake or not group_id
-            else self._classify_natural_name_wake(event, message, group_id)
-        )
-        candidate = IngressWakeCandidate(
-            should_observe=True,
-            was_native_wake=is_direct_wake,
-            natural_direct=name_wake.is_direct,
-            alias=name_wake.alias,
-            reason_code=name_wake.reason or "none",
-        )
-        event.set_extra(SHIO_INGRESS_CANDIDATE, candidate)
-        return candidate.should_observe
-
-    def ingest_name_wake_event(self, event: AstrMessageEvent) -> bool:
-        """Compatibility shim: classify a wake candidate without side effects."""
-
-        if not self.prepare_ingress_candidate(event):
-            return False
-        candidate = event.get_extra(SHIO_INGRESS_CANDIDATE, None)
-        return bool(
-            isinstance(candidate, IngressWakeCandidate)
-            and candidate.natural_direct
-        )
-
-    def _ingress_sender_kind(
-        self,
-        event: AstrMessageEvent,
-        envelope: TurnEnvelope,
-    ) -> tuple[SenderKind, PluginSourceEvidence | None]:
-        source_evidence = event.get_extra(SHIO_PLUGIN_SOURCE_EVIDENCE, None)
-        if source_evidence is not None and not isinstance(
-            source_evidence,
-            PluginSourceEvidence,
-        ):
-            return SenderKind.UNKNOWN_AUTOMATION, None
-        if isinstance(source_evidence, PluginSourceEvidence):
-            return (
-                SenderKind.SELF
-                if source_evidence.source.value == "shio_reply"
-                else SenderKind.PLUGIN_ECHO,
-                source_evidence,
-            )
-
-        adapter_flag = event.get_extra(SHIO_TYPED_ADAPTER_BOT_FLAG, None)
-        if adapter_flag is not None and not isinstance(
-            adapter_flag,
-            TypedAdapterBotFlag,
-        ):
-            return SenderKind.UNKNOWN_AUTOMATION, None
-        try:
-            trust = self._trusted_bot_registry.resolve(
-                BotIdentityObservation(
-                    platform_id=envelope.platform_id,
-                    sender_id=envelope.sender_id,
-                    current_adapter_self_id=envelope.bot_id,
-                    adapter_bot_flag=adapter_flag,
-                )
-            )
-        except Exception:
-            return SenderKind.UNKNOWN, None
-        if trust.is_trusted_bot:
-            return trust.sender_kind, None
-        if not self._trusted_bot_config_valid:
-            return SenderKind.UNKNOWN, None
-        return SenderKind.HUMAN, None
-
-    def _reneban_arrival_gate(
-        self,
-        event: AstrMessageEvent,
-        ingress_event: IngressEvent,
-    ) -> GateObservation:
-        """Bind successful priority-90 arrival to the already-run gate chain.
-
-        ReNeBan owns the ban verdict and stops matching events at priority 114;
-        this handler never re-reads its private state.  It verifies public
-        AstrBot registration metadata before treating arrival as not-banned.
-        """
-
-        registry_loader = getattr(
-            self.context,
-            "shio_reneban_registry_loader",
-            None,
-        )
-        evidence = inspect_reneban_hook(
-            self.context,
-            registry_loader=(registry_loader if callable(registry_loader) else None),
-        )
-        event.set_extra(SHIO_RENEBAN_HOOK_EVIDENCE, evidence)
-        if not evidence.is_verified:
-            structured_log(
-                logger,
-                "error",
-                "ingress.reneban_gate_degraded",
-                **evidence.trace_metadata(),
-            )
-            return self.ingress_admission.issue_gate_observation(
-                ingress_event,
-                status=evidence.status,
-                banned=None,
-            )
-        return self.ingress_admission.issue_gate_observation(
-            ingress_event,
-            status=PluginEvidenceStatus.VERIFIED,
-            banned=False,
-        )
-
-    @staticmethod
-    def _record_ingress_product_trace(
-        event: AstrMessageEvent,
-        result: AdmissionResult,
-    ) -> ProductTrace:
-        accepted = result.decision.allows_state_mutation
-        committed = result.conversation_event
-        trace = ProductTrace(
-            trace_id=result.ingress_event.trace_id,
-            conversation_revision=(
-                committed.binding.conversation_revision
-                if committed is not None
-                else 0
-            ),
-            generation_epoch=(
-                committed.binding.generation_epoch
-                if committed is not None
-                else 0
-            ),
-        )
-        disposition = result.decision.disposition
-        degraded = disposition is IngressDisposition.DEGRADED_EXTERNAL_GATE
-        reason_code = (
-            result.decision.reason_codes[0]
-            if result.decision.reason_codes
-            else "ingress_accepted"
-        )
-        trace.append(
-            ProductStage.INGRESS,
-            elapsed_ms=0.0,
-            payload=ProductTracePayload(
-                status=(
-                    ProductTraceStatus.ACCEPTED
-                    if accepted
-                    else (
-                        ProductTraceStatus.DEGRADED
-                        if degraded
-                        else ProductTraceStatus.DROPPED
-                    )
-                ),
-                reason_code=reason_code,
-                source_verified=result.gate_status
-                is PluginEvidenceStatus.VERIFIED,
-                degraded=degraded,
-            ),
-        )
-        trace.append(
-            ProductStage.SENDER_SOURCE,
-            elapsed_ms=0.0,
-            payload=ProductTracePayload(
-                status=(
-                    ProductTraceStatus.ACCEPTED
-                    if accepted
-                    else ProductTraceStatus.DROPPED
-                ),
-                reason_code=(
-                    "sender_source_bound"
-                    if accepted
-                    else reason_code
-                ),
-                current_subject_only=accepted,
-                source_verified=result.decision.sender_kind
-                not in {SenderKind.UNKNOWN, SenderKind.UNKNOWN_AUTOMATION},
-                degraded=degraded,
-            ),
-        )
-        if not accepted:
-            trace.terminate(
-                ProductOutcome.DROPPED,
-                elapsed_ms=0.0,
-                reason_code=reason_code,
-            )
-        event.set_extra(SHIO_PRODUCT_TRACE, trace)
-        return trace
-
-    def _bind_accepted_turn_authority(
-        self,
-        event: AstrMessageEvent,
-        result: AdmissionResult,
-        *,
-        current_message: str,
-    ) -> None:
-        """Dispatch the raw proof once and terminalize every unused consumer."""
-
-        conversation_event = result.conversation_event
-        if not isinstance(conversation_event, ConversationEvent):
-            raise RuntimeError("accepted_turn_event_required")
-        dispatch = self.accepted_turn_authority.dispatch(result)
-        binding = conversation_event.binding
-        owner_ticket = self.accepted_turn_authority.ticket_for(
-            dispatch,
-            AcceptedTurnConsumer.OWNER_ACTION,
-        )
-        affect_ticket = self.accepted_turn_authority.ticket_for(
-            dispatch,
-            AcceptedTurnConsumer.AFFECT_STATE,
-        )
-        relationship_ticket = self.accepted_turn_authority.ticket_for(
-            dispatch,
-            AcceptedTurnConsumer.RELATIONSHIP_STATE,
-        )
-        attention_ticket = self.accepted_turn_authority.ticket_for(
-            dispatch,
-            AcceptedTurnConsumer.OPPORTUNITY_ATTENTION,
-        )
-        try:
-            route = self.owner_action_router.route(
-                owner_ticket,
-                current_message=current_message,
-            )
-            affect_evidence = issue_affect_admission_evidence(
-                affect_ticket,
-                dispatch=dispatch,
-                accepted_turn_authority=self.accepted_turn_authority,
-            )
-            envelope = ensure_turn_envelope(event)
-            principal = ensure_principal_context(event, self._owner_ids())
-            target = ensure_direct_reply_target(
-                event,
-                envelope,
-                current_message,
-            )
-            appraisal = appraise_affect(
-                principal=principal,
-                reply_target=target,
-                current_message=current_message,
-                conversation_mode="direct_reply",
-            )
-            affect_mutation = self.affect_states.record_human(
-                affect_evidence,
-                appraisal=self._continuous_affect_appraisal(appraisal),
-                now=time.time(),
-            )
-            event.set_extra(SHIO_AFFECT_STATE_MUTATION, affect_mutation)
-            relationship_mutation = self.relationship_states.record_human(
-                relationship_ticket,
-                current_message=current_message,
-                now=time.time(),
-            )
-            event.set_extra(
-                SHIO_RELATIONSHIP_STATE_MUTATION,
-                relationship_mutation,
-            )
-            if affect_mutation.status is not AffectMutationStatus.ACCEPTED_HUMAN:
-                affect_context = self.accepted_turn_authority.context_for(
-                    affect_ticket,
-                    consumer=AcceptedTurnConsumer.AFFECT_STATE,
-                    binding=binding,
-                )
-                self.accepted_turn_authority.finalize_unclaimed_ticket(
-                    affect_ticket,
-                    consumer=AcceptedTurnConsumer.AFFECT_STATE,
-                    binding=binding,
-                    context=affect_context,
-                    disposition=AcceptedTurnDisposition.REJECTED,
-                )
-            if (
-                relationship_mutation.status
-                is not RelationshipMutationStatus.ACCEPTED_HUMAN
-            ):
-                relationship_context = self.accepted_turn_authority.context_for(
-                    relationship_ticket,
-                    consumer=AcceptedTurnConsumer.RELATIONSHIP_STATE,
-                    binding=binding,
-                )
-                self.accepted_turn_authority.finalize_unclaimed_ticket(
-                    relationship_ticket,
-                    consumer=AcceptedTurnConsumer.RELATIONSHIP_STATE,
-                    binding=binding,
-                    context=relationship_context,
-                    disposition=AcceptedTurnDisposition.REJECTED,
-                )
-            if route.status is not OwnerActionRouteStatus.MATCHED:
-                self.owner_action_router.finalize_noop_route(
-                    route,
-                    ticket=owner_ticket,
-                )
-        except BaseException:
             try:
-                self.accepted_turn_authority.finalize_unclaimed_turn(
-                    dispatch,
-                    binding=binding,
-                    disposition=AcceptedTurnDisposition.ABORTED,
-                )
+                completed.exception()
             except Exception:
                 pass
-            raise
-        event.set_extra(SHIO_ACCEPTED_TURN_DISPATCH, dispatch)
-        event.set_extra(SHIO_OWNER_ACTION_TICKET, owner_ticket)
-        event.set_extra(SHIO_OPPORTUNITY_ATTENTION_TICKET, attention_ticket)
-        event.set_extra(SHIO_OWNER_ACTION_ROUTE, route)
 
-    @staticmethod
-    def _continuous_affect_appraisal(
-        appraisal: AffectAppraisal,
-    ) -> ModelAffectAppraisal:
-        """Project the typed current-turn appraisal into the state impulse set."""
+        task.add_done_callback(consume)
 
-        kind_by_trigger = {
-            AffectTrigger.PRAISE: AffectAppraisalKind.POSITIVE_SOCIAL,
-            AffectTrigger.GRATITUDE: AffectAppraisalKind.POSITIVE_SOCIAL,
-            AffectTrigger.DISAGREEMENT: AffectAppraisalKind.NEGATIVE_SOCIAL,
-            AffectTrigger.PLAYFUL_PROVOCATION: AffectAppraisalKind.PLAYFUL,
-            AffectTrigger.BEING_SEEN_THROUGH: AffectAppraisalKind.PLAYFUL,
-            AffectTrigger.CONCERN_FOR_AGENT: AffectAppraisalKind.CARE,
-            AffectTrigger.USER_NEEDS_CARE: AffectAppraisalKind.CARE,
-            AffectTrigger.CORRECTION_OR_MISTAKE: AffectAppraisalKind.REPAIR,
-            AffectTrigger.APOLOGY: AffectAppraisalKind.REPAIR,
-        }
-        return ModelAffectAppraisal(
-            appraisal_hint=kind_by_trigger.get(
-                appraisal.trigger,
-                AffectAppraisalKind.NEUTRAL_FACT,
-            ),
-            confidence=appraisal.confidence,
-        )
-
-    def _settle_affect_after_send(
-        self,
-        event: AstrMessageEvent,
-    ) -> AffectMutationResult | None:
-        tracker = self._send_observation_tracker(event)
-        if tracker is None:
-            return None
-        evidence = issue_shio_receipt_evidence(
-            self.send_receipts,
-            internal_reply_id=tracker.internal_reply_id,
-        )
-        mutation = self.affect_states.record_shio_receipt(
-            evidence,
-            now=time.time(),
-        )
-        event.set_extra(SHIO_AFFECT_OUTBOUND_MUTATION, mutation)
-        relationship_mutation = self.relationship_states.record_shio_receipt(
-            evidence,
-            now=time.time(),
-        )
-        event.set_extra(
-            SHIO_RELATIONSHIP_OUTBOUND_MUTATION,
-            relationship_mutation,
-        )
-        return mutation
-
-    def _finalize_owner_action_noop(self, event: AstrMessageEvent) -> None:
-        route = event.get_extra(SHIO_OWNER_ACTION_ROUTE, None)
-        ticket = event.get_extra(SHIO_OWNER_ACTION_TICKET, None)
-        if not isinstance(route, OwnerActionRouteDecision) or ticket is None:
-            return
-        try:
-            self.owner_action_router.finalize_noop_route(route, ticket=ticket)
-        except Exception:
-            return
-
-    def _finalize_opportunity_attention_noop(
-        self,
-        event: AstrMessageEvent,
-        *,
-        disposition: AcceptedTurnDisposition = AcceptedTurnDisposition.REJECTED,
-    ) -> None:
-        ticket = event.get_extra(SHIO_OPPORTUNITY_ATTENTION_TICKET, None)
-        conversation_event = event.get_extra(SHIO_CONVERSATION_EVENT, None)
-        if ticket is None or not isinstance(conversation_event, ConversationEvent):
-            return
-        try:
-            context = self.accepted_turn_authority.context_for(
-                ticket,
-                consumer=AcceptedTurnConsumer.OPPORTUNITY_ATTENTION,
-                binding=conversation_event.binding,
-            )
-            self.accepted_turn_authority.finalize_unclaimed_ticket(
-                ticket,
-                consumer=AcceptedTurnConsumer.OPPORTUNITY_ATTENTION,
-                binding=conversation_event.binding,
-                context=context,
-                disposition=disposition,
-            )
-        except Exception:
-            return
-
-    async def _execute_proactive_request(
-        self,
-        request: ProactiveComposerRequest,
-    ) -> ProactiveExecutionStatus:
-        """Run one exact request with optional sealed read and canonical presentation."""
-
-        try:
-            status = await self.scope_concurrency.run_proactive(
-                request,
-                self.proactive_execution_authority,
-                work_factory=lambda: self._execute_proactive_request_serialized(request),
-            )
-        except Exception as exc:
-            structured_log(
-                logger,
-                "warning",
-                "proactive.outer_failed",
-                failure_kind=safe_exception_kind(exc),
-            )
-            raise
-        structured_log(
-            logger,
-            "info",
-            "proactive.outer_terminal",
-            outcome=status.value,
-        )
-        return status
-
-    async def _run_observed_provider_call(
-        self,
-        *,
-        call_kind: ModelCallKind,
-        latency_kind: LatencyKind,
-        work_factory: Any,
+    async def _await_kv(
+        self, awaitable: Any, *, subsystem: str, scope: str = "",
+        mark_unavailable: bool = True,
     ) -> Any:
-        """Measure provider work only after all admission permits exist."""
-
-        provider_started = time.perf_counter()
-        self.performance_window.record_model_call(call_kind)
+        """Bound one public KV await without assuming cancellation rolls back FIFO writes."""
+        task = asyncio.create_task(awaitable)
+        self._track_kv_task(task)
         try:
-            return await work_factory()
-        except BaseException:
-            self.performance_window.record_model_failure(call_kind)
+            return await asyncio.wait_for(
+                asyncio.shield(task), timeout=self._NATURAL_KV_AWAIT_SECONDS
+            )
+        except asyncio.CancelledError:
+            if mark_unavailable:
+                self._mark_kv_unavailable(subsystem, scope)
             raise
-        finally:
-            self.performance_window.observe_latency(
-                latency_kind,
-                float((time.perf_counter() - provider_started) * 1000.0),
-            )
+        except Exception:
+            if mark_unavailable:
+                self._mark_kv_unavailable(subsystem, scope)
+            return self._KV_UNAVAILABLE
 
-    async def _run_semantic_risk_preflight(
-        self,
-        *,
-        event: AstrMessageEvent,
-        req: ProviderRequest,
-        snapshot: Any,
-        principal: PrincipalContext,
-        planned_action: PlannedAction,
-        composer_request: ReplyComposerRequest,
-    ) -> SemanticRiskDecision:
-        """Use the request-selected provider once to classify semantic risk.
+    async def initialize(self) -> None:
+        """Restore every configured natural scope before it may enter the gate."""
+        lock = getattr(self, "_initialize_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._initialize_lock = lock
+        async with lock:
+            # A plugin instance is monotonic: initialization is a one-time
+            # restore, never a way to revive a terminated lifecycle epoch.
+            if (
+                getattr(self, "_initialized", False)
+                or getattr(self, "_auxiliary_terminated", False)
+                or getattr(self, "_natural_terminated", False)
+                or getattr(self, "_master_alert_terminated", False)
+                or getattr(self, "_master_alert_terminating", False)
+            ):
+                return
+            self._initialized = True
+            self._auxiliary_epoch = getattr(self, "_auxiliary_epoch", 0) + 1
+            epoch = self._auxiliary_epoch
+            await self._initialize_once(epoch)
 
-        This call is deliberately separate from primary generation, but shares the
-        same event snapshot, principal, plan and selected provider.  Any failure
-        is an UNCERTAIN decision; callers must not fall back to text heuristics.
-        """
-        provider_id = str(getattr(req, "provider_id", "") or "").strip()
-        provider = self._provider(provider_id, event.unified_msg_origin)
-        selected = self.context.get_using_provider(event.unified_msg_origin)
-        if (
-            provider is None
-            or not hasattr(provider, "text_chat")
-            or (provider_id and provider is not selected)
-        ):
-            return SemanticRiskDecision.UNCERTAIN
-        current = composer_request.current_model_message
-        if current is None:
-            return SemanticRiskDecision.UNCERTAIN
-        observed_at = getattr(composer_request.temporal_context, "observed_at", None)
-        identity = project_model_identity_prompt_data(
-            composer_request.model_messages,
-            current_sender_key=composer_request.target_sender_key,
-            current_message=current,
-            server_now=observed_at,
+    def _initialization_is_current(self, epoch: int) -> bool:
+        return (
+            epoch == getattr(self, "_auxiliary_epoch", 0)
+            and not getattr(self, "_auxiliary_terminated", False)
+            and not getattr(self, "_natural_terminated", False)
+            and not getattr(self, "_master_alert_terminated", False)
+            and not getattr(self, "_master_alert_terminating", False)
         )
-        evidence = list(identity["history"])
-        for record, message in zip(evidence, composer_request.model_messages, strict=True):
-            record["content"] = message.content
-            record["source_kind"] = message.source_kind
-            record["sequence"] = record["message_index"]
-        current_payload = dict(identity["current_message"])
-        current_payload["content"] = current.content
-        current_payload["source_kind"] = current.source_kind
-        current_payload["sequence"] = len(evidence) + 1
-        prompt = json.dumps(
-            {
-                "task": "Classify whether the requested reply requires structured actor attribution.",
-                "output": {"decision": "ATTRIBUTION_REQUIRED|NONE|UNCERTAIN"},
-                "current": current_payload,
-                "history": evidence,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+
+    async def _initialize_once(self, epoch: int) -> None:
+        """Initialize a fresh, process-local Master alert record."""
+        async with self._master_alert_mutex():
+            if not self._initialization_is_current(epoch):
+                return
+            self._publish_master_alert_record_locked(MasterAlertRecord())
+        # New group-number settings do not reveal real UMO keys.  They restore
+        # lazily after an admitted event identifies the exact UMO.  Preserve
+        # the R22 behavior only for already-saved real-UMO values, which are
+        # themselves the exact durable keys and never a synthesized scope.
+        for scope in self._legacy_natural_umo_scopes():
+            if not self._initialization_is_current(epoch):
+                return
+            await self._ensure_natural_scope_ready(scope)
+
+    @staticmethod
+    def _natural_kv_key(scope: str) -> str:
+        return f"natural_respondstage_completed:{scope}"
+
+    def _natural_lock(self, scope: str) -> asyncio.Lock:
+        locks = getattr(self, "_natural_locks", None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._natural_locks = locks
+        lock = locks.get(scope)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[scope] = lock
+        return lock
+
+    def _natural_cadence_settings(self) -> tuple[int, int, int, int, int]:
+        """Return schema defaults if a hand-edited runtime config is malformed."""
+        group = self._group_settings()
+
+        def bounded(key: str, default: int, lower: int, upper: int) -> int:
+            value = group.get(key, default)
+            if isinstance(value, bool):
+                return default
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return default
+            return parsed if lower <= parsed <= upper else default
+
+        cooldown = bounded("natural_reply_cooldown_seconds", 45, 1, 3600)
+        window_minutes = bounded("natural_frequency_window_minutes", 5, 1, 1440)
+        maximum = bounded("natural_max_replies_per_window", 2, 1, 20)
+        backoff_base = bounded("natural_no_action_backoff_base_seconds", 2, 1, 300)
+        backoff_maximum = bounded("natural_no_action_backoff_max_seconds", 30, 1, 3600)
+        if backoff_maximum < backoff_base:
+            backoff_maximum = backoff_base
+        return cooldown, window_minutes * 60, maximum, backoff_base, backoff_maximum
+
+    def _continuous_settings(self) -> tuple[bool, float, int]:
+        group = self._group_settings()
+        enabled = bool(group.get("continuous_window_enabled", True))
         try:
-            response = await self.inference_budget.run_event_call(
-                snapshot,
-                principal,
-                planned_action,
-                purpose=InferencePurpose.RISK,
-                work_factory=lambda: self._run_observed_provider_call(
-                        call_kind=ModelCallKind.RISK,
-                        latency_kind=LatencyKind.RISK_PROVIDER,
-                        work_factory=lambda: self.generation_tasks.run(
-                            snapshot,
-                            provider.text_chat(
-                                prompt=prompt,
-                                contexts=[],
-                                system_prompt=(
-                                    "Return exactly one JSON object with decision equal to "
-                                    "ATTRIBUTION_REQUIRED, NONE, or UNCERTAIN."
-                                ),
-                                image_urls=[],
-                                audio_urls=[],
-                                func_tool=None,
-                                request_max_retries=1,
-                            ),
-                            cancel_safe=provider_supports_cancellation(provider),
-                        ),
-                ),
-                permit_observer=self._observe_inference_permit,
-            )
-        except BaseException:
-            return SemanticRiskDecision.UNCERTAIN
-        return parse_semantic_risk_decision(
-            getattr(response, "completion_text", "")
+            seconds = int(group.get("continuous_window_seconds", 3))
+        except (TypeError, ValueError):
+            seconds = 3
+        try:
+            capacity = int(group.get("continuous_window_max_scopes", 128))
+        except (TypeError, ValueError):
+            capacity = 128
+        return enabled, float(seconds if 1 <= seconds <= 60 else 3), (
+            capacity if 1 <= capacity <= 256 else 128
         )
 
     @staticmethod
-    def _semantic_risk_snapshot(
-        request: ReplyComposerRequest,
-    ) -> tuple[str, str]:
-        """Opaque binding for one canonical Composer request; never text-derived."""
-        return (
-            diagnostic_digest(
-                (request.action_id, request.target_message_id, request.target_sender_key)
-            ),
-            diagnostic_digest((
-                canonical_model_messages_digest(
-                    (*request.model_messages, request.current_model_message)
-                ),
-                json.dumps(
-                    project_model_identity_prompt_data(
-                        request.model_messages,
-                        current_sender_key=request.target_sender_key,
-                        current_message=request.current_model_message,
-                        server_now=getattr(request.temporal_context, "observed_at", None),
-                    ),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            )),
-        )
+    def _continuous_terminal_grace(seconds: float) -> float:
+        """Bound a missing official terminal signal without polling forever."""
+        return max(1.0, min(30.0, seconds))
 
-    async def _bind_proactive_grounding(
-        self,
-        request: ProactiveComposerRequest,
-    ) -> bool:
-        """Bind at most one sealed public-read result; never invent a topic."""
+    def _continuous_lock(self, scope: str) -> asyncio.Lock:
+        locks = getattr(self, "_continuous_locks", None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._continuous_locks = locks
+        lock = locks.get(scope)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[scope] = lock
+        return lock
 
-        decision = decide_proactive_knowledge_need(request.plan.topic_text)
-        if not decision.requires_evidence:
-            return True
-        runtime_tools = self._available_tools(None)
-        configured_names = tuple(self._guest_allowed_tool_names())
-        acquisition_clock = time.monotonic()
-        event = SimpleNamespace(
-            unified_msg_origin=request.plan.target.unified_msg_origin,
-            get_sender_id=lambda: "",
-            is_admin=lambda: False,
-            is_stopped=lambda: False,
-        )
-        try:
-            acquisition = broker_proactive_read_request(
-                proactive_request=request,
-                capability=decision.capability,
-                runtime_tools=tuple(classify_tool(tool) for tool in runtime_tools),
-                configured_tool_names=configured_names,
-                now=acquisition_clock,
-            )
-            self.proactive_scheduler_runtime.mark_provider_cancel_safe(
-                request,
-                cancel_safe=True,
-            )
-            sealed_execution = await execute_sealed_acquisition(
-                request=acquisition,
-                runtime_tools=tuple(runtime_tools),
-                plugin_context=self.context,
-                event=event,
-                clock=time.monotonic,
-                epoch_current=lambda binding: (
-                    binding == acquisition.binding
-                    and self.proactive_scheduler_runtime.is_current(request)
-                ),
-            )
-            observed_at = time.monotonic()
-            typed_results = (
-                adapt_tool_call_results(
-                    sealed_execution.batch,
-                    tools=tuple(runtime_tools),
-                    scope_key=acquisition.binding.scope_key,
-                    target_sender_key=acquisition.binding.current_sender_key,
-                    acquisition_request=acquisition,
-                    observed_at=observed_at,
-                )
-                if (
-                    sealed_execution.succeeded
-                    and sealed_execution.batch is not None
-                    and observed_at <= acquisition.selection.deadline
-                    and self.proactive_scheduler_runtime.is_current(request)
-                )
-                else ()
-            )
-            evidence = adapt_grounding_evidence(
-                request=acquisition,
-                results=typed_results,
-                current_binding=acquisition.binding,
-                now=observed_at,
-            )
-            if evidence.kind is not EvidenceOutcomeKind.ACCEPTED or not evidence.facts:
-                raise RuntimeError("proactive_grounding_not_accepted")
-            self.proactive_execution_authority.bind_grounding(
-                request,
-                tuple(fact.claim for fact in evidence.facts),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            structured_log(
-                logger,
-                "warning",
-                "proactive.grounding_unavailable",
-                failure_kind=safe_exception_kind(exc),
-                capability=(
-                    decision.capability.value
-                    if decision.capability is not None
-                    else "none"
-                ),
-                reason_code=decision.reason_code,
-            )
+    def _continuous_states(self) -> dict[str, _ContinuousScopeState]:
+        states = getattr(self, "_continuous_scopes", None)
+        if not isinstance(states, dict):
+            states = {}
+            self._continuous_scopes = states
+        return states
+
+    async def _continuous_begin(self, scope: str, message_id: str) -> str:
+        """Register a qualified real event: immediate, wait, or fail-closed drop."""
+        enabled, seconds, capacity = self._continuous_settings()
+        if not enabled or not scope or not message_id:
+            return "immediate"
+        async with self._continuous_lock(scope):
+            if getattr(self, "_continuous_terminated", False):
+                return "drop"
+            states = self._continuous_states()
+            state = states.get(scope)
+            if state is None:
+                if len(states) >= capacity:
+                    return "drop"
+                states[scope] = _ContinuousScopeState(first_message_id=message_id)
+                return "immediate"
+            if state.first_message_id == message_id or state.winner_message_id == message_id:
+                return "drop"
+            state.generation += 1
+            state.winner_message_id = message_id
+            state.deadline = asyncio.get_running_loop().time() + seconds
+            state.terminal_deadline = state.deadline + self._continuous_terminal_grace(seconds)
+            state.wakeup.set()
+            state.wakeup = asyncio.Event()
+            return "wait"
+
+    async def _continuous_extend_nonqual(self, scope: str) -> bool:
+        """A real but non-qualified group message only resets an existing deadline."""
+        enabled, seconds, _capacity = self._continuous_settings()
+        if not enabled or not scope:
             return False
-        structured_log(
-            logger,
-            "info",
-            "proactive.grounding_bound",
-            capability=(
-                decision.capability.value
-                if decision.capability is not None
-                else "none"
-            ),
-            reason_code=decision.reason_code,
-        )
-        return True
-
-    async def _execute_proactive_meme_after_text(
-        self,
-        *,
-        request: ProactiveComposerRequest,
-        presentation: ProactivePresentation,
-        internal_reply_id: str,
-    ) -> None:
-        """Use Manager's official category bridge after validated proactive text."""
-
-        self.proactive_execution_authority.inspect_completed_send(
-            presentation,
-            ledger=self.send_receipts,
-            internal_reply_id=internal_reply_id,
-        )
-        decision = decide_semantic_meme_handoff(
-            current_message=request.plan.topic_text,
-            final_visible_text=presentation.final_visible_text,
-        )
-        structured_log(
-            logger,
-            "info",
-            "proactive.meme_decision",
-            meme_complement_eligible=decision.eligible,
-            meme_complement_reason=decision.reason_code,
-            meme_selection_owner="proactive_provider_manager_category_contract",
-        )
-        if not decision.eligible:
-            return
-        category = presentation.meme_category
-        conformance = self.meme_manager_conformance.collect(self.context)
-        if (
-            conformance.status is not MemeManagerConformanceStatus.VERIFIED
-            or conformance.evidence is None
-        ):
-            structured_log(
-                logger,
-                "info",
-                "proactive.meme_terminal",
-                **conformance.trace_metadata(),
-                meme_execution_status=MemeExecutionStatus.SUPPRESSED.value,
-                meme_selection_owner="proactive_provider_manager_category_contract",
-                meme_execution_reason_code="manager_unavailable",
-            )
-            return
-        adapter_event = _ProactiveMemeEvent(self.context, request)
-        receipt = await execute_meme_manager_category(
-            self.meme_manager_conformance,
-            conformance.evidence,
-            category=category,
-            event=adapter_event,
-            is_current=lambda: self.proactive_scheduler_runtime.is_current(request),
-        )
-        structured_log(
-            logger,
-            "info",
-            "proactive.meme_terminal",
-            **conformance.trace_metadata(),
-            **receipt.trace_metadata(),
-            meme_selection_owner="proactive_provider_manager_category_contract",
-        )
-
-    def _observe_inference_permit(self, permit: InferencePermit) -> None:
-        self.inference_budget.inspect(permit)
-        self.performance_window.observe_latency(
-            LatencyKind.INFERENCE_QUEUE,
-            float(permit.wait_seconds * 1000.0),
-        )
-
-    async def _render_proactive_presentation(
-        self,
-        *,
-        provider: Any,
-        request: ProactiveComposerRequest,
-        system_prompt: str,
-        user_prompt: str,
-    ) -> tuple[ProactiveExecutionStatus, ProactivePresentation | None]:
-        """Render once and, only after rejection, retry the same sealed contract."""
-
-        for attempt in range(2):
-            if not self.proactive_scheduler_runtime.is_current(request):
-                return ProactiveExecutionStatus.SUPERSEDED, None
-            response = await self._run_observed_provider_call(
-                call_kind=(
-                    ModelCallKind.PROACTIVE
-                    if attempt == 0
-                    else ModelCallKind.REPAIR
-                ),
-                latency_kind=(
-                    LatencyKind.PROACTIVE_PROVIDER
-                    if attempt == 0
-                    else LatencyKind.REPAIR_PROVIDER
-                ),
-                work_factory=lambda attempt=attempt: provider.text_chat(
-                    prompt=(
-                        user_prompt
-                        if attempt == 0
-                        else user_prompt
-                        + "\n上一次候选未通过同一场景的输出校验。请重新渲染，"
-                        f"只输出 {request.min_bubbles} 至 {request.max_bubbles} 行最终可见群聊气泡，"
-                        "并按 system 合同在最后另起一行保留一个合法隐藏表情类别标记；不解释错误。"
-                    ),
-                    contexts=self.proactive_execution_authority.provider_contexts(
-                        request
-                    ),
-                    system_prompt=(
-                        system_prompt
-                        if attempt == 0
-                        else system_prompt
-                        + "\n这是唯一一次无工具修复。必须继续遵守完全相同的 Persona、"
-                        "公开上下文、可信事实和冷场续题规则；不得补写新事实。"
-                    ),
-                    image_urls=[],
-                    audio_urls=[],
-                    func_tool=None,
-                    tool_calls_result=None,
-                    request_max_retries=1,
-                ),
-            )
-            if not self.proactive_scheduler_runtime.is_current(request):
-                return ProactiveExecutionStatus.SUPERSEDED, None
-            if getattr(response, "role", "assistant") == "err":
-                return ProactiveExecutionStatus.PROVIDER_FAILED, None
-            try:
-                presentation = self.proactive_execution_authority.validate_output(
-                    request,
-                    str(getattr(response, "completion_text", "") or ""),
-                )
-            except Exception as exc:
-                structured_log(
-                    logger,
-                    "warning",
-                    "proactive.output_rejected",
-                    failure_kind=safe_exception_kind(exc),
-                    validation_attempt=attempt + 1,
-                    repair_scheduled=attempt == 0,
-                )
-                if attempt == 0:
-                    continue
-                return ProactiveExecutionStatus.OUTPUT_REJECTED, None
-            return ProactiveExecutionStatus.SENT, presentation
-        return ProactiveExecutionStatus.OUTPUT_REJECTED, None
-
-    async def _execute_proactive_request_serialized(
-        self,
-        request: ProactiveComposerRequest,
-    ) -> ProactiveExecutionStatus:
-        """Execute after the exact proactive scope lane has been acquired."""
-
-        try:
-            self.proactive_execution_authority.inspect_request(request)
-            provider = self._provider(
-                str(self._config("replyer_provider_id", "")),
-                request.plan.target.unified_msg_origin,
-            )
-        except Exception as exc:
-            structured_log(
-                logger,
-                "warning",
-                "proactive.provider_unavailable",
-                failure_kind=safe_exception_kind(exc),
-            )
-            return ProactiveExecutionStatus.PROVIDER_UNAVAILABLE
-        if provider is None:
-            return ProactiveExecutionStatus.PROVIDER_UNAVAILABLE
-        proactive_provider_id = str(self._config("replyer_provider_id", "")).strip()
-        structured_log(
-            logger,
-            "info",
-            "proactive.provider_route",
-            proactive_provider_owner="shio_proactive_config",
-            proactive_provider_digest=diagnostic_digest(
-                proactive_provider_id or type(provider).__name__
-            ),
-            provider_context_count=len(request.model_messages),
-        )
-        if not await self._bind_proactive_grounding(request):
-            return ProactiveExecutionStatus.GROUNDING_UNAVAILABLE
-        provider_system_prompt, provider_user_prompt = (
-            self.proactive_execution_authority.provider_prompts(request)
-        )
-        cancel_safe = provider_supports_cancellation(provider)
-        try:
-            self.proactive_scheduler_runtime.mark_provider_cancel_safe(
-                request,
-                cancel_safe=cancel_safe,
-            )
-            render_status, presentation = await self.inference_budget.run_proactive_call(
-                request,
-                self.proactive_execution_authority,
-                work_factory=lambda: self._render_proactive_presentation(
-                    provider=provider,
-                    request=request,
-                    system_prompt=provider_system_prompt,
-                    user_prompt=provider_user_prompt,
-                ),
-                permit_observer=self._observe_inference_permit,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            structured_log(
-                logger,
-                "warning",
-                "proactive.provider_failed",
-                failure_kind=safe_exception_kind(exc),
-            )
-            return ProactiveExecutionStatus.PROVIDER_FAILED
-        if render_status is not ProactiveExecutionStatus.SENT:
-            return render_status
-        if not isinstance(presentation, ProactivePresentation):
-            return ProactiveExecutionStatus.OUTPUT_REJECTED
-        if not self.proactive_scheduler_runtime.claim_send(request):
-            return ProactiveExecutionStatus.SUPERSEDED
-        try:
-            reply = self.send_receipts.begin_proactive_presentation_reply(
-                presentation,
-            )
-            min_delay = max(
-                0,
-                self._config_int("bubble_interval_min_ms", 450),
-            ) / 1000
-            max_delay = max(
-                0,
-                self._config_int("bubble_interval_max_ms", 1200),
-            ) / 1000
-            if max_delay < min_delay:
-                min_delay, max_delay = max_delay, min_delay
-            send_failed = False
-            for index, segment in enumerate(reply.segments):
-                if index and not self.proactive_scheduler_runtime.is_current(request):
-                    for remaining in reply.segments[index:]:
-                        self.send_receipts.mark_attempted(remaining.segment_id)
-                        self.send_receipts.mark_failed(
-                            remaining.segment_id,
-                            failure_kind="ProactiveSuperseded",
-                        )
-                    send_failed = True
-                    break
-                if index and max_delay:
-                    await asyncio.sleep(random.uniform(min_delay, max_delay))
-                self.send_receipts.mark_attempted(segment.segment_id)
-                try:
-                    sent = await self.context.send_message(
-                        request.plan.target.unified_msg_origin,
-                        MessageChain().message(segment.visible_text),
-                    )
-                except Exception as exc:
-                    self.send_receipts.mark_failed(
-                        segment.segment_id,
-                        failure_kind=safe_exception_kind(exc),
-                    )
-                    send_failed = True
-                else:
-                    if sent is True:
-                        self.send_receipts.mark_succeeded(segment.segment_id)
-                    else:
-                        self.send_receipts.mark_failed(
-                            segment.segment_id,
-                            failure_kind="ContextSendRejected",
-                        )
-                        send_failed = True
-                if send_failed:
-                    for remaining in reply.segments[index + 1 :]:
-                        self.send_receipts.mark_attempted(remaining.segment_id)
-                        self.send_receipts.mark_failed(
-                            remaining.segment_id,
-                            failure_kind="PriorSegmentFailed",
-                        )
-                    break
-            status = self.proactive_execution_authority.complete_send(
-                presentation,
-                ledger=self.send_receipts,
-            )
-            terminal_metadata = presentation.trace_metadata()
-            if status is ProactiveExecutionStatus.SENT:
-                try:
-                    await self._execute_proactive_meme_after_text(
-                        request=request,
-                        presentation=presentation,
-                        internal_reply_id=reply.internal_reply_id,
-                    )
-                except Exception as exc:
-                    structured_log(
-                        logger,
-                        "warning",
-                        "proactive.meme_failed_after_text",
-                        failure_kind=safe_exception_kind(exc),
-                    )
-                scene_mutation = self.group_scenes.record_proactive_outbound(
-                    presentation,
-                    ledger=self.send_receipts,
-                    internal_reply_id=reply.internal_reply_id,
-                )
-                if (
-                    scene_mutation.status
-                    is not SceneMutationStatus.ACCEPTED_SHIO_OUTBOUND
-                ):
-                    structured_log(
-                        logger,
-                        "warning",
-                        "proactive.scene_outbound_rejected",
-                        **scene_mutation.trace_metadata(),
-                    )
-        except Exception as exc:
-            structured_log(
-                logger,
-                "warning",
-                "proactive.send_failed",
-                failure_kind=safe_exception_kind(exc),
-            )
-            return ProactiveExecutionStatus.SEND_FAILED
-        structured_log(
-            logger,
-            "info",
-            "proactive.terminal",
-            outcome=status.value,
-            **terminal_metadata,
-        )
-        return status
-
-    async def _run_proactive_scheduler_once(self, *, now: float) -> int:
-        persona = self._configured_persona_package()
-        if persona is None:
-            return 0
-        requests = await self.proactive_scheduler_runtime.tick(
-            now=now,
-            persona=persona,
-            temporal_context=self._build_temporal_context(now=now),
-            executor=self._execute_proactive_request,
-        )
-        metadata = self.proactive_scheduler_runtime.trace_metadata()
-        signature = tuple(
-            sorted(
-                (key, value)
-                for key, value in metadata.items()
-                if key.startswith("proactive_scheduler_last_")
-                or key == "proactive_scheduler_terminal_error_count"
-            )
-        )
-        if signature != self._proactive_scheduler_log_signature:
-            self._proactive_scheduler_log_signature = signature
-            structured_log(
-                logger,
-                "info",
-                "proactive.scheduler_tick",
-                **metadata,
-            )
-        current_group_digests: set[str] = set()
-        for diagnostic in self.proactive_scheduler_runtime.last_group_diagnostics():
-            group_digest = diagnostic_digest(diagnostic.group_id)
-            current_group_digests.add(group_digest)
-            group_signature = (
-                diagnostic.stage_kind,
-                diagnostic.reason_code,
-                diagnostic.admitted,
-            )
+        async with self._continuous_lock(scope):
+            state = self._continuous_states().get(scope)
             if (
-                self._proactive_scheduler_group_log_signatures.get(group_digest)
-                == group_signature
+                getattr(self, "_continuous_terminated", False)
+                or state is None
+                or not state.winner_message_id
             ):
-                continue
-            self._proactive_scheduler_group_log_signatures[group_digest] = (
-                group_signature
-            )
-            structured_log(
-                logger,
-                "info",
-                "proactive.scheduler_group",
-                group_digest=group_digest,
-                proactive_group_stage_kind=diagnostic.stage_kind,
-                proactive_group_reason_code=diagnostic.reason_code,
-                proactive_group_admitted=diagnostic.admitted,
-            )
-        for stale_digest in set(self._proactive_scheduler_group_log_signatures) - current_group_digests:
-            del self._proactive_scheduler_group_log_signatures[stale_digest]
-        return len(requests)
+                return False
+            state.deadline = asyncio.get_running_loop().time() + seconds
+            state.terminal_deadline = state.deadline + self._continuous_terminal_grace(seconds)
+            state.wakeup.set()
+            state.wakeup = asyncio.Event()
+            return True
 
-    async def _proactive_scheduler_loop(self) -> None:
-        interval = max(
-            15,
-            min(3600, self._config_int("proactive_scheduler_interval_seconds", 60)),
-        )
-        while self.proactive_scheduler_runtime.operational:
-            try:
-                await self._run_proactive_scheduler_once(now=float(time.time()))
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                structured_log(
-                    logger,
-                    "error",
-                    "proactive.scheduler_failed",
-                    failure_kind=safe_exception_kind(exc),
-                )
-            await asyncio.sleep(float(interval))
-
-    def _ensure_proactive_scheduler_started(self) -> bool:
-        """Start exactly one scheduler for startup and plugin hot reload alike."""
-
-        if not self.proactive_scheduler_runtime.operational:
-            return False
-        task = self._proactive_scheduler_task
-        if task is not None and not task.done():
-            return False
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return False
-        self._proactive_scheduler_task = loop.create_task(
-            self._proactive_scheduler_loop(),
-            name="shio-proactive-scheduler",
-        )
-        structured_log(
-            logger,
-            "info",
-            "proactive.scheduler_started",
-            scheduler_interval_seconds=max(
-                15,
-                min(
-                    3600,
-                    self._config_int("proactive_scheduler_interval_seconds", 60),
-                ),
-            ),
-        )
-        return True
-
-    @filter.on_astrbot_loaded()
-    async def start_proactive_scheduler(self) -> None:
-        self._ensure_proactive_scheduler_started()
-
-    def admit_ingress_event(self, event: AstrMessageEvent) -> AdmissionResult | None:
-        """Commit a structurally admitted event exactly once after outer gates."""
-
-        existing = event.get_extra(SHIO_ADMISSION_RESULT, None)
-        if isinstance(existing, AdmissionResult):
-            return existing
-        if not bool(self._config("enabled", True)):
-            return None
-        candidate = event.get_extra(SHIO_INGRESS_CANDIDATE, None)
-        if not isinstance(candidate, IngressWakeCandidate):
-            if not self.prepare_ingress_candidate(event):
-                return None
-            candidate = event.get_extra(SHIO_INGRESS_CANDIDATE, None)
-        if not isinstance(candidate, IngressWakeCandidate):
-            return None
-
-        message = self._canonical_event_message(event)
-        envelope = ensure_turn_envelope(event)
-        principal = ensure_principal_context(event, self._owner_ids())
-        if not all(
-            (
-                message,
-                envelope.scope_key,
-                envelope.session_id,
-                envelope.message_id,
-                envelope.sender_key,
-            )
-        ):
-            return None
-
-        with self._admission_lock:
-            existing = event.get_extra(SHIO_ADMISSION_RESULT, None)
-            if isinstance(existing, AdmissionResult):
-                return existing
-            sender_kind, source_evidence = self._ingress_sender_kind(event, envelope)
-            revision_candidate = self.conversation_revisions.peek(envelope.scope_key)
-            generation_epoch = self.generation_epochs.next_epoch(envelope)
-            ingress = build_ingress_event(
-                envelope=envelope,
-                principal=principal,
-                sender_kind=sender_kind,
-                content=message,
-                revision_candidate=revision_candidate,
-                plugin_source_evidence=source_evidence,
-                generation_epoch=generation_epoch,
-            )
-            gate_observation = event.get_extra(SHIO_GATE_OBSERVATION, None)
-            if not isinstance(gate_observation, GateObservation):
-                gate_observation = self._reneban_arrival_gate(
-                    event,
-                    ingress,
-                )
-            result = self.ingress_admission.admit(
-                ingress,
-                gate_observation=gate_observation,
-            )
-            event.set_extra(SHIO_ADMISSION_RESULT, result)
-            event.set_extra(SHIO_INGRESS_DECISION, result.decision)
-            if not result.decision.allows_state_mutation:
-                self._record_ingress_product_trace(event, result)
-                structured_log(
-                    logger,
-                    "info",
-                    "ingress.dropped",
-                    **result.decision.trace_metadata(),
-                )
-                return result
-
-            conversation_event = result.conversation_event
-            if not isinstance(conversation_event, ConversationEvent):
-                return result
-            try:
-                self._bind_accepted_turn_authority(
-                    event,
-                    result,
-                    current_message=message,
-                )
-            except Exception as exc:
-                structured_log(
-                    logger,
-                    "error",
-                    "accepted_turn.dispatch_failed",
-                    failure_kind=safe_exception_kind(exc),
-                )
-                return result
-            event.set_extra(SHIO_CONVERSATION_EVENT, conversation_event)
-            scene_ready = True
-            address_ready = True
-            participation_assessment: ParticipationAssessment | None = None
-            participation_preflight: ParticipationCadencePreflight | None = None
-            participation_semantic_request: ParticipationSemanticRequest | None = None
-            participation_cadence: ParticipationCadenceDecision | None = None
-            participation_reaction: ParticipationReactionDecision | None = None
-            attention_ticket = event.get_extra(
-                SHIO_OPPORTUNITY_ATTENTION_TICKET,
-                None,
-            )
-            attention_context = None
-            try:
-                attention_context = self.accepted_turn_authority.context_for(
-                    attention_ticket,
-                    consumer=AcceptedTurnConsumer.OPPORTUNITY_ATTENTION,
-                    binding=conversation_event.binding,
-                )
-            except Exception as exc:
-                address_ready = False
-                structured_log(
-                    logger,
-                    "error",
-                    "attention.context_failed",
-                    failure_kind=safe_exception_kind(exc),
-                )
-            if envelope.chat_type == "group":
-                structured_mentions: tuple[StructuredMentionEvidence, ...] = ()
-                structured_reply: StructuredReplyEvidence | None = None
-                identity_metadata = build_inbound_identity_metadata(
-                    open_group=True,
-                )
-                try:
-                    (
-                        structured_mentions,
-                        structured_reply,
-                        identity_metadata,
-                    ) = self._structured_address_evidence(event, envelope)
-                    scene_mutation = self.group_scenes.record_human(
-                        conversation_event,
-                        decision=result.decision,
-                        public_content=message,
-                        identity_metadata=identity_metadata,
-                    )
-                except Exception as exc:
-                    scene_ready = False
-                    structured_log(
-                        logger,
-                        "error",
-                        "scene.ingress_failed",
-                        failure_kind=safe_exception_kind(exc),
-                    )
-                else:
-                    scene_ready = (
-                        scene_mutation.status
-                        is SceneMutationStatus.ACCEPTED_HUMAN
-                    )
-                    event.set_extra(SHIO_GROUP_SCENE_MUTATION, scene_mutation)
-                    event.set_extra(
-                        SHIO_GROUP_SCENE_SNAPSHOT,
-                        scene_mutation.snapshot,
-                    )
-                    if scene_ready:
-                        try:
-                            self._record_typed_inbound_once(
-                                event,
-                                envelope,
-                                message,
-                                identity_metadata=identity_metadata,
-                                structured_reply=structured_reply,
-                            )
-                        except Exception as exc:
-                            structured_log(
-                                logger,
-                                "error",
-                                "ledger.inbound_failed",
-                                failure_kind=safe_exception_kind(exc),
-                            )
-                    if not scene_ready:
-                        structured_log(
-                            logger,
-                            "error",
-                            "scene.ingress_rejected",
-                            **scene_mutation.trace_metadata(),
-                        )
-                if scene_ready and address_ready:
-                    try:
-                        address_decision = self.address_resolution_authority.resolve_group(
-                            attention_context,
-                            conversation_event,
-                            ingress=result.decision,
-                            message_text=message,
-                            aliases=self._name_wake_aliases(),
-                            structured_mentions=structured_mentions,
-                            structured_reply=structured_reply,
-                            name_wake_candidate=candidate,
-                            group_scene=scene_mutation.snapshot,
-                        )
-                    except Exception as exc:
-                        address_ready = False
-                        structured_log(
-                            logger,
-                            "error",
-                            "address.resolve_failed",
-                            failure_kind=safe_exception_kind(exc),
-                        )
-                    else:
-                        pass
-                else:
-                    address_ready = False
+    async def _continuous_wait_for_turn(self, scope: str, message_id: str) -> bool:
+        """Let only the current winner continue its own event exactly once."""
+        while True:
+            async with self._continuous_lock(scope):
+                state = self._continuous_states().get(scope)
+                if (
+                    getattr(self, "_continuous_terminated", False)
+                    or state is None
+                    or state.winner_message_id != message_id
+                ):
+                    return False
+                generation = state.generation
+                deadline = state.deadline
+                wakeup = state.wakeup
+                first_terminal = state.first_terminal
+            now = asyncio.get_running_loop().time()
+            # Once the window has elapsed, a winner waits for the first real
+            # turn's terminal signal (or a replacement/reload wakeup) instead
+            # of repeatedly polling ``timeout=0``.
+            terminal_deadline = state.terminal_deadline
+            if now < deadline:
+                delay: float | None = max(0.0, deadline - now)
+            elif first_terminal.is_set():
+                delay = 0.0
             else:
-                if address_ready:
-                    try:
-                        address_decision = self.address_resolution_authority.resolve_private(
-                            attention_context,
-                            conversation_event,
-                            result.decision,
-                        )
-                    except Exception as exc:
-                        address_ready = False
-                        structured_log(
-                            logger,
-                            "error",
-                            "address.resolve_failed",
-                            failure_kind=safe_exception_kind(exc),
-                        )
-            if address_ready:
-                try:
-                    opportunity_attention = (
-                        self.opportunity_attention_authority.issue(
-                            attention_ticket,
-                            address_decision,
-                        )
-                    )
-                except Exception as exc:
-                    address_ready = False
-                    structured_log(
-                        logger,
-                        "error",
-                        "attention.issue_failed",
-                        failure_kind=safe_exception_kind(exc),
-                    )
-                else:
-                    event.set_extra(SHIO_ADDRESS_DECISION, address_decision)
-                    event.set_extra(
-                        SHIO_OPPORTUNITY_ATTENTION,
-                        opportunity_attention,
-                    )
-                    try:
-                        persona_package = self._configured_persona_package()
-                        if persona_package is None:
-                            raise RuntimeError("persona_package_unavailable")
-                        participation_assessment = self.participation_authority.issue(
-                            opportunity_attention,
-                            persona=persona_package,
-                            current_message=message,
-                            scene=(
-                                scene_mutation.snapshot
-                                if envelope.chat_type == "group"
-                                else None
-                            ),
-                            opportunistic_join_enabled=(
-                                self._natural_group_participation_enabled(envelope)
-                            ),
-                            minimum_context_messages=max(
-                                2,
-                                min(
-                                    16,
-                                    self._config_int(
-                                        "natural_group_participation_min_context_messages",
-                                        2,
-                                    ),
-                                ),
-                            ),
-                        )
-                        participation_now = float(time.monotonic())
-                        if (
-                            participation_assessment.decision.level
-                            is ParticipationLevel.MAY_JOIN
-                        ):
-                            participation_preflight = (
-                                self.participation_cadence_authority.preflight(
-                                    participation_assessment,
-                                    now=participation_now,
-                                )
-                            )
-                            if participation_preflight.allowed:
-                                if envelope.chat_type != "group":
-                                    raise RuntimeError(
-                                        "participation_semantic_group_required"
-                                    )
-                                participation_semantic_request = (
-                                    self.participation_semantic_authority.issue_request(
-                                        participation_assessment,
-                                        participation_preflight,
-                                        scene=scene_mutation.snapshot,
-                                        assistant_display_name="星汐",
-                                    )
-                                )
-                            else:
-                                participation_cadence = (
-                                    self.participation_cadence_authority.finalize(
-                                        participation_preflight,
-                                        outcome=ParticipationLevel.WAIT,
-                                        reason_code=(
-                                            participation_preflight.reason_codes[0]
-                                            if participation_preflight.reason_codes
-                                            else "participation_cadence_preflight_blocked"
-                                        ),
-                                    )
-                                )
-                        else:
-                            participation_cadence = (
-                                self.participation_cadence_authority.issue(
-                                    participation_assessment,
-                                    now=participation_now,
-                                )
-                            )
-                        if participation_cadence is not None:
-                            participation_reaction = (
-                                self.participation_reaction_authority.issue(
-                                    participation_cadence,
-                                    current_message=message,
-                                )
-                            )
-                    except Exception as exc:
-                        address_ready = False
-                        structured_log(
-                            logger,
-                            "error",
-                            "participation.issue_failed",
-                            failure_kind=safe_exception_kind(exc),
-                        )
-                    else:
-                        event.set_extra(
-                            SHIO_PARTICIPATION_ASSESSMENT,
-                            participation_assessment,
-                        )
-                        if participation_preflight is not None:
-                            event.set_extra(
-                                SHIO_PARTICIPATION_CADENCE_PREFLIGHT,
-                                participation_preflight,
-                            )
-                        if participation_semantic_request is not None:
-                            event.set_extra(
-                                SHIO_PARTICIPATION_SEMANTIC_REQUEST,
-                                participation_semantic_request,
-                            )
-                        if participation_cadence is not None:
-                            event.set_extra(
-                                SHIO_PARTICIPATION_CADENCE,
-                                participation_cadence,
-                            )
-                        if participation_reaction is not None:
-                            event.set_extra(
-                                SHIO_PARTICIPATION_REACTION,
-                                participation_reaction,
-                            )
-                        admission_trace = participation_assessment.trace_metadata()
-                        if participation_preflight is not None:
-                            admission_trace.update(
-                                {
-                                    key: value
-                                    for key, value in participation_preflight.trace_metadata().items()
-                                    if key != "schema_version"
-                                }
-                            )
-                        if participation_semantic_request is not None:
-                            admission_trace.update(
-                                {
-                                    key: value
-                                    for key, value in participation_semantic_request.trace_metadata().items()
-                                    if key != "schema_version"
-                                }
-                            )
-                        if participation_cadence is not None:
-                            admission_trace.update(
-                                {
-                                    key: value
-                                    for key, value in participation_cadence.trace_metadata().items()
-                                    if key != "schema_version"
-                                }
-                            )
-                        if participation_semantic_request is not None:
-                            admission_stage = "semantic_candidate"
-                            admission_reason = "participation_semantic_request_issued"
-                        elif participation_preflight is not None:
-                            admission_stage = "preflight_gate"
-                            admission_reason = (
-                                participation_preflight.reason_codes[0]
-                                if participation_preflight.reason_codes
-                                else "participation_cadence_preflight_blocked"
-                            )
-                        else:
-                            admission_stage = "deterministic_terminal"
-                            admission_reason = (
-                                participation_cadence.reason_codes[0]
-                                if participation_cadence is not None
-                                and participation_cadence.reason_codes
-                                else participation_assessment.reason_codes[0]
-                            )
-                        structured_log(
-                            logger,
-                            "info",
-                            "participation.admission_evaluated",
-                            participation_stage=admission_stage,
-                            reason_code=admission_reason,
-                            **admission_trace,
-                        )
-                        if (
-                            participation_reaction is not None
-                            and participation_reaction.decision.level in {
-                            ParticipationLevel.MUST_REPLY,
-                            ParticipationLevel.MAY_JOIN,
-                            ParticipationLevel.REACT_ONLY,
-                            }
-                        ):
-                            try:
-                                generation_snapshot = self.generation_epochs.advance(
-                                    envelope,
-                                    expected_epoch=(
-                                        conversation_event.binding.generation_epoch
-                                    ),
-                                )
-                            except Exception as exc:
-                                address_ready = False
-                                structured_log(
-                                    logger,
-                                    "error",
-                                    "generation.advance_failed",
-                                    failure_kind=safe_exception_kind(exc),
-                                )
-                            else:
-                                event.set_extra(
-                                    GENERATION_EPOCH_EXTRA,
-                                    generation_snapshot,
-                                )
-                                self.generation_tasks.cancel_older(
-                                    generation_snapshot
-                                )
-                        else:
-                            try:
-                                passive_snapshot = (
-                                    self.generation_epochs.issue_passive(
-                                        envelope,
-                                        expected_epoch=(
-                                            conversation_event.binding.generation_epoch
-                                        ),
-                                    )
-                                )
-                            except Exception as exc:
-                                address_ready = False
-                                structured_log(
-                                    logger,
-                                    "error",
-                                    "generation.passive_issue_failed",
-                                    failure_kind=safe_exception_kind(exc),
-                                )
-                            else:
-                                event.set_extra(
-                                    GENERATION_EPOCH_EXTRA,
-                                    passive_snapshot,
-                                )
-            self._record_ingress_product_trace(event, result)
-
-        if not address_ready or (
-            envelope.chat_type == "group" and not scene_ready
-        ):
-            self._finalize_opportunity_attention_noop(event)
-            self._finalize_owner_action_noop(event)
-            return result
-        if envelope.chat_type == "group":
-            activity_at = float(getattr(event, "created_at", 0.0) or 0.0)
-            if activity_at <= 0:
-                activity_at = float(time.time())
+                delay = max(0.0, terminal_deadline - now)
+            wake_task = asyncio.create_task(wakeup.wait())
+            terminal_task = asyncio.create_task(first_terminal.wait())
             try:
-                self.proactive_policy_state.observe_group_activity(
-                    platform_id=envelope.platform_id,
-                    bot_id=envelope.bot_id,
-                    group_id=envelope.group_id,
-                    observed_at=activity_at,
+                done, pending = await asyncio.wait(
+                    {wake_task, terminal_task}, timeout=delay,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-            except Exception as exc:
-                structured_log(
-                    logger,
-                    "error",
-                    "proactive.activity_observation_failed",
-                    failure_kind=safe_exception_kind(exc),
-                )
-            try:
-                scene_snapshot = event.get_extra(
-                    SHIO_GROUP_SCENE_SNAPSHOT,
-                    None,
-                )
-                if not isinstance(scene_snapshot, GroupSceneSnapshot):
-                    raise ContractViolation("proactive_scene_missing")
-                self.proactive_scheduler_runtime.record_human_activity(
-                    platform_id=envelope.platform_id,
-                    bot_id=envelope.bot_id,
-                    group_id=envelope.group_id,
-                    unified_msg_origin=str(
-                        getattr(event, "unified_msg_origin", "") or ""
-                    ),
-                    scene=scene_snapshot,
-                )
-            except Exception as exc:
-                structured_log(
-                    logger,
-                    "error",
-                    "proactive.runtime_observation_failed",
-                    failure_kind=safe_exception_kind(exc),
-                )
-            self.runtime.ingest(
-                platform_id=envelope.platform_id,
-                bot_id=envelope.bot_id,
-                group_id=envelope.group_id,
-                unified_msg_origin=str(
-                    getattr(event, "unified_msg_origin", "") or ""
-                ),
-                sender_id=envelope.sender_id,
-                sender_name=self._event_value(event, "get_sender_name")
-                or envelope.sender_id,
-                text=message,
-                is_owner=principal.is_owner,
-                is_direct_wake=candidate.was_native_wake
-                or candidate.natural_direct,
-                message_id=envelope.message_id,
-                reply_to_message_id=envelope.reply_to_message_id,
-                observe_feedback=bool(self._config("social_feedback_enabled", True)),
-                created_at=float(getattr(event, "created_at", 0.0) or 0.0)
-                or None,
-            )
+            finally:
+                for task in (wake_task, terminal_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(wake_task, terminal_task, return_exceptions=True)
+            async with self._continuous_lock(scope):
+                state = self._continuous_states().get(scope)
+                if (
+                    getattr(self, "_continuous_terminated", False)
+                    or state is None
+                    or state.winner_message_id != message_id
+                    or state.generation != generation
+                ):
+                    return False
+                now = asyncio.get_running_loop().time()
+                if now < state.deadline:
+                    continue
+                if not state.first_terminal.is_set():
+                    if now < state.terminal_deadline:
+                        continue
+                    # No public final-response/RespondStage signal arrived.
+                    # Drop this winner and release the scope; an old event may
+                    # still finish in AstrBot, but it can no longer change the
+                    # next generation or start a second Shio request.
+                    self._continuous_states().pop(scope, None)
+                    return False
+                state.first_message_id = message_id
+                state.first_terminal = asyncio.Event()
+                state.winner_message_id = ""
+                state.deadline = 0.0
+                state.terminal_deadline = 0.0
+                state.wakeup.set()
+                state.wakeup = asyncio.Event()
+                return True
 
-        participation_should_promote = bool(
-            type(participation_reaction) is ParticipationReactionDecision
-            and participation_reaction.decision.level
-            in {ParticipationLevel.MAY_JOIN, ParticipationLevel.REACT_ONLY}
-        )
-        candidate_should_promote = bool(
-            candidate.should_promote
-            and (
-                str(self._config("natural_name_wake_mode", "natural"))
-                .strip()
-                .lower()
-                == "contains"
-                or (
-                    type(address_decision) is AddressDecision
-                    and address_decision.kind is AddressKind.DIRECT_SELF
-                )
-            )
-        )
-        if candidate_should_promote or participation_should_promote:
-            event.is_at_or_wake_command = True
-            event.is_wake = True
-            event.set_extra(
-                SHIO_NATURAL_WAKE,
-                {
-                    "alias": candidate.alias,
-                    "reason": (
-                        (
-                            "participation_react_only"
-                            if participation_reaction.decision.level
-                            is ParticipationLevel.REACT_ONLY
-                            else "participation_may_join"
-                        )
-                        if participation_should_promote
-                        and not candidate_should_promote
-                        else candidate.reason_code
-                    ),
-                },
-            )
-            structured_log(
-                logger,
-                "info",
-                "name_wake.promoted",
-                group_digest=diagnostic_digest(envelope.group_id),
-                subject_digest=diagnostic_digest(envelope.sender_id),
-                alias_digest=diagnostic_digest(candidate.alias),
-                reason_code=(
-                    (
-                        "participation_react_only"
-                        if participation_reaction.decision.level
-                        is ParticipationLevel.REACT_ONLY
-                        else "participation_may_join"
-                    )
-                    if participation_should_promote
-                    and not candidate_should_promote
-                    else candidate.reason_code
-                ),
-            )
-        return result
+    async def _continuous_mark_terminal(self, scope: str, message_id: str) -> None:
+        if not scope or not message_id:
+            return
+        async with self._continuous_lock(scope):
+            states = self._continuous_states()
+            state = states.get(scope)
+            if state is None or state.first_message_id != message_id:
+                return
+            state.first_terminal.set()
+            if not state.winner_message_id:
+                states.pop(scope, None)
 
-    async def _resolve_participation_semantic(
+    def _batch_lock(self, scope: str) -> asyncio.Lock:
+        # Batch transitions have no await while holding this lock.  A single
+        # plugin-wide lock keeps all scheduler bookkeeping bounded even when
+        # capacity-backpressured scopes are cancelled before gaining a slot.
+        lock = getattr(self, "_batch_scheduler_lock", None)
+        if not isinstance(lock, asyncio.Lock):
+            lock = asyncio.Lock()
+            self._batch_scheduler_lock = lock
+        return lock
+
+    def _batch_states(self) -> dict[str, _BatchScopeState]:
+        states = getattr(self, "_batch_scopes", None)
+        if not isinstance(states, dict):
+            states = {}
+            self._batch_scopes = states
+        return states
+
+    def _batch_capacity_wakeup(self) -> asyncio.Event:
+        wakeup = getattr(self, "_batch_capacity_event", None)
+        if not isinstance(wakeup, asyncio.Event):
+            wakeup = asyncio.Event()
+            self._batch_capacity_event = wakeup
+        return wakeup
+
+    def _batch_release_capacity(self) -> None:
+        wakeup = self._batch_capacity_wakeup()
+        self._batch_capacity_event = asyncio.Event()
+        wakeup.set()
+
+    @staticmethod
+    def _batch_component_facts(event: AstrMessageEvent) -> tuple[dict[str, str], ...]:
+        """Keep a bounded public description of each real message component."""
+        facts: list[dict[str, str]] = []
+        try:
+            components = event.get_messages()
+        except Exception:
+            return ()
+        if not isinstance(components, list):
+            return ()
+        for component in components:
+            raw_kind = getattr(component, "type", "")
+            kind = str(getattr(raw_kind, "value", raw_kind)).lower()
+            item = {"type": kind or "unknown"}
+            text = getattr(component, "text", None)
+            if isinstance(text, str) and text:
+                item["text"] = text
+            target = getattr(component, "qq", getattr(component, "user_id", None))
+            if target not in (None, "", 0):
+                item["target_id"] = str(target)
+            reply_id = getattr(component, "id", getattr(component, "message_id", None))
+            if isinstance(reply_id, str) and reply_id:
+                item["message_id"] = reply_id
+            facts.append(item)
+        return tuple(facts)
+
+    @staticmethod
+    def _has_official_boundary_component(event: AstrMessageEvent) -> bool:
+        """Recognize official enum values without reading or rebuilding media."""
+        try:
+            components = event.get_messages()
+        except Exception:
+            return False
+        if not isinstance(components, list):
+            return False
+        return any(
+            str(getattr(getattr(component, "type", ""), "value", getattr(component, "type", ""))).lower()
+            in {"image", "file", "record", "video", "reply"}
+            for component in components
+        )
+
+    @staticmethod
+    def _batch_history_row_id(event: AstrMessageEvent) -> int | None:
+        value = event.get_extra(
+            "_current_platform_message_history_id",
+            getattr(event, "_current_platform_message_history_id", None),
+        )
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    def _batch_message(
+        self, event: AstrMessageEvent, snapshot: TurnSnapshot, mandatory: bool,
+    ) -> _BatchMessage:
+        return _BatchMessage(
+            event, snapshot, mandatory, self._batch_component_facts(event),
+            self._batch_history_row_id(event),
+        )
+
+    @staticmethod
+    def _batch_contexts(messages: tuple[_BatchMessage, ...]) -> list[dict[str, str]]:
+        """Explicit real-event batch input; it is not a replacement history."""
+        contexts: list[dict[str, str]] = []
+        for position, item in enumerate(messages, start=1):
+            snapshot = item.snapshot
+            content = {
+                "kind": "shio_real_batch_event",
+                "position": position,
+                "platform_message_id": snapshot.message_id,
+                "created_at_utc": snapshot.created_at.isoformat(),
+                "sender_id": snapshot.sender_id,
+                "sender_name": snapshot.sender_name,
+                "components": item.component_facts,
+                "message_text": snapshot.message_text,
+                "at_targets": snapshot.at_targets,
+                "reply_message_id": snapshot.reply_message_id,
+                "reply_sender_id": snapshot.reply_sender_id,
+            }
+            contexts.append({
+                "role": "user",
+                "content": json.dumps(content, ensure_ascii=False, separators=(",", ":")),
+            })
+        return contexts
+
+    async def _batch_join_and_wait(
         self,
         event: AstrMessageEvent,
-    ) -> None:
-        """Resolve one admitted semantic candidate before any wake promotion."""
+        snapshot: TurnSnapshot,
+        *,
+        mandatory: bool,
+    ) -> tuple[tuple[_BatchMessage, ...], bool, int, object] | None:
+        """Collect a quiet-window batch and return only its watermark event.
 
-        request = event.get_extra(SHIO_PARTICIPATION_SEMANTIC_REQUEST, None)
-        if type(request) is not ParticipationSemanticRequest:
+        The actual event handler remains the sole owner of its later
+        ``request_llm`` call.  Earlier handlers simply retire, so no synthetic
+        event, background Provider request, or second send path exists.
+        """
+        enabled, seconds, capacity = self._continuous_settings()
+        if not snapshot.scope or not snapshot.message_id:
+            return None
+        item = self._batch_message(event, snapshot, mandatory)
+        scope = snapshot.scope
+        async with self._batch_lock(scope):
+            if getattr(self, "_batch_terminated", False):
+                return None
+            states = self._batch_states()
+            state = states.get(scope)
+            if state is None:
+                if len(states) >= capacity:
+                    return None
+                state = _BatchScopeState()
+                states[scope] = state
+            now = asyncio.get_running_loop().time()
+            if (
+                not enabled
+                and not state.current
+                and state.active_boundary is None
+                and not state.boundary_queue
+                and not state.waiting
+            ):
+                state.generation += 1
+                state.current = (item,)
+                state.current_watermark_id = snapshot.message_id
+                state.current_watermark_token = item.token
+                event.set_extra("shio.sys001.batch_watermark_token", item.token)
+                return (state.current, mandatory, state.generation, item.token)
+            state.waiting = (*state.waiting, item)
+            state.waiting_deadline = now + (seconds if enabled else 0.0)
+            state.wakeup.set()
+            state.wakeup = asyncio.Event()
+
+        while True:
+            async with self._batch_lock(scope):
+                state = self._batch_states().get(scope)
+                if (
+                    getattr(self, "_batch_terminated", False)
+                    or state is None
+                    or (
+                        not any(candidate.token is item.token for candidate in state.waiting)
+                        and state.current_watermark_token is not item.token
+                    )
+                ):
+                    return None
+                now = asyncio.get_running_loop().time()
+                if state.current and state.current_watermark_token is item.token:
+                    return (
+                        state.current,
+                        any(candidate.mandatory for candidate in state.current),
+                        state.generation,
+                        item.token,
+                    )
+                if state.current or state.active_boundary is not None or state.boundary_queue:
+                    delay = None
+                    wakeup = state.wakeup
+                elif now < state.waiting_deadline:
+                    delay = max(0.0, state.waiting_deadline - now)
+                    wakeup = state.wakeup
+                else:
+                    batch = state.waiting
+                    state.waiting = ()
+                    state.waiting_deadline = 0.0
+                    if not batch:
+                        return None
+                    state.generation += 1
+                    state.current = batch
+                    state.current_watermark_id = batch[-1].snapshot.message_id
+                    state.current_watermark_token = batch[-1].token
+                    state.wakeup.set()
+                    state.wakeup = asyncio.Event()
+                    if state.current_watermark_token is not item.token:
+                        return None
+                    event.set_extra("shio.sys001.batch_watermark_token", item.token)
+                    return (batch, any(candidate.mandatory for candidate in batch), state.generation, item.token)
+            try:
+                if delay is None:
+                    await wakeup.wait()
+                else:
+                    await asyncio.wait_for(wakeup.wait(), timeout=delay)
+            except TimeoutError:
+                pass
+
+    async def _batch_hold_official_boundary(
+        self, event: AstrMessageEvent, snapshot: TurnSnapshot,
+    ) -> None:
+        """Hold a scope for one untouched official media/Reply event."""
+        if not snapshot.scope or not snapshot.message_id:
             return
+        _enabled, _seconds, capacity = self._continuous_settings()
+        scope = snapshot.scope
+        token = event.get_extra("shio.sys001.boundary_token")
+        if token is None:
+            token = object()
+            event.set_extra("shio.sys001.boundary_token", token)
+        while True:
+            async with self._batch_lock(scope):
+                if getattr(self, "_batch_terminated", False):
+                    return
+                states = self._batch_states()
+                state = states.get(scope)
+                if state is None:
+                    if len(states) >= capacity:
+                        capacity_wakeup = self._batch_capacity_wakeup()
+                    else:
+                        capacity_wakeup = None
+                else:
+                    capacity_wakeup = None
+                if state is None and capacity_wakeup is None:
+                    state = _BatchScopeState()
+                    states[scope] = state
+                delay = None
+                if capacity_wakeup is not None:
+                    wakeup = capacity_wakeup
+                else:
+                    known = (
+                        state.active_boundary is not None
+                        and state.active_boundary.token is token
+                    ) or any(item.token is token for item in state.boundary_queue)
+                    if not known:
+                        # A boundary cuts a not-yet-started text window at its
+                        # real arrival position.  Those earlier texts become one
+                        # current request; later text can only wait behind this
+                        # reservation and never crosses into that request.
+                        if state.waiting and not state.current and state.active_boundary is None and not state.boundary_queue:
+                            batch = state.waiting
+                            state.waiting = ()
+                            state.waiting_deadline = 0.0
+                            state.generation += 1
+                            state.current = batch
+                            state.current_watermark_id = batch[-1].snapshot.message_id
+                            state.current_watermark_token = batch[-1].token
+                        state.boundary_sequence += 1
+                        state.boundary_queue = (*state.boundary_queue, _BoundaryReservation(
+                            snapshot.message_id, token, state.boundary_sequence,
+                        ))
+                        state.wakeup.set()
+                        state.wakeup = asyncio.Event()
+                    if (
+                        not state.current
+                        and state.active_boundary is None
+                        and state.boundary_queue
+                        and state.boundary_queue[0].token is token
+                    ):
+                        reservation = state.boundary_queue[0]
+                        state.boundary_queue = state.boundary_queue[1:]
+                        state.generation += 1
+                        state.active_boundary = reservation
+                        event.set_extra("shio.sys001.batch_scope", scope)
+                        event.set_extra("shio.sys001.batch_generation", state.generation)
+                        event.set_extra("shio.sys001.batch_watermark_token", token)
+                        state.wakeup.set()
+                        state.wakeup = asyncio.Event()
+                        return
+                    wakeup = state.wakeup
+            try:
+                if delay is None:
+                    await wakeup.wait()
+                else:
+                    await asyncio.wait_for(wakeup.wait(), timeout=delay)
+            except TimeoutError:
+                pass
+            if (
+                capacity_wakeup is not None
+                and getattr(self, "_batch_capacity_event", None) is wakeup
+            ):
+                # A wake without a released slot is one retry, not a set Event
+                # spin.  Real releases replace this event before waking all
+                # contenders, so they each re-compete under the scope lock.
+                self._batch_capacity_event = asyncio.Event()
+
+    async def _batch_mark_terminal(
+        self, scope: str, message_id: str, generation: int | None,
+        watermark_token: object | None = None,
+    ) -> None:
+        if not scope or not message_id or not isinstance(generation, int):
+            return
+        async with self._batch_lock(scope):
+            state = self._batch_states().get(scope)
+            boundary = state.active_boundary if state is not None else None
+            if (
+                boundary is not None
+                and state.generation == generation
+                and boundary.message_id == message_id
+                and (watermark_token is None or boundary.token is watermark_token)
+            ):
+                state.active_boundary = None
+                state.wakeup.set()
+                state.wakeup = asyncio.Event()
+                if not state.current and not state.waiting and not state.boundary_queue:
+                    self._batch_states().pop(scope, None)
+                    self._batch_release_capacity()
+                return
+            if (
+                state is None
+                or state.generation != generation
+                or state.current_watermark_id != message_id
+                or (watermark_token is not None and state.current_watermark_token is not watermark_token)
+            ):
+                return
+            state.current = ()
+            state.current_watermark_id = ""
+            state.current_watermark_token = None
+            state.wakeup.set()
+            state.wakeup = asyncio.Event()
+            # A queued boundary has already arrived in this same scope.  Keep
+            # its opaque reservation until the boundary can take the owner;
+            # otherwise a later text could create a fresh state and cross it.
+            if not state.waiting and state.active_boundary is None and not state.boundary_queue:
+                self._batch_states().pop(scope, None)
+                self._batch_release_capacity()
+
+    def _settings(self) -> dict[str, Any]:
+        config = getattr(self, "config", {})
+        value = config.get("sys001", {}) if isinstance(config, dict) else {}
+        return value if isinstance(value, dict) else {}
+
+    def _group_settings(self) -> dict[str, Any]:
+        value = self._settings().get("group", {})
+        return value if isinstance(value, dict) else {}
+
+    def _ingress_settings(self) -> dict[str, Any]:
+        value = self._settings().get("ingress", {})
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _ingress_ids(ingress: dict[str, Any], key: str) -> frozenset[str]:
+        values = ingress.get(key, [])
+        return frozenset(value for value in values if isinstance(value, str) and value)
+
+    def _identity_settings(self) -> dict[str, Any]:
+        value = self._settings().get("identity", {})
+        return value if isinstance(value, dict) else {}
+
+    def _presentation_settings(self) -> dict[str, Any]:
+        value = self._settings().get("presentation", {})
+        return value if isinstance(value, dict) else {}
+
+    def _final_review_settings(self) -> dict[str, Any]:
+        value = self._settings().get("final_review", {})
+        return value if isinstance(value, dict) else {}
+
+    async def capture_master_alert_binding(
+        self, event: AstrMessageEvent, snapshot: TurnSnapshot
+    ) -> bool:
+        """Persist only an existing official Master private-session UMO."""
+        settings = self._settings().get("master_alert", {})
+        if not isinstance(settings, dict) or not settings.get("master_alert_enabled", False):
+            return False
+        try:
+            is_private = bool(event.is_private_chat())
+            is_master = bool(event.is_admin())
+            umo = event.unified_msg_origin
+        except Exception:
+            return False
         if (
-            type(event.get_extra(SHIO_PARTICIPATION_SEMANTIC_OUTCOME, None))
-            is ParticipationSemanticOutcome
-            or type(event.get_extra(SHIO_PARTICIPATION_CADENCE, None))
-            is ParticipationCadenceDecision
-            or type(event.get_extra(SHIO_PARTICIPATION_REACTION, None))
-            is ParticipationReactionDecision
+            not is_private
+            or not is_master
+            or not snapshot.is_private
+            or not snapshot.is_master
+            or not isinstance(umo, str)
+            or not umo
+        ):
+            return False
+        async with self._master_alert_mutex():
+            if (
+                getattr(self, "_master_alert_terminated", False)
+                or getattr(self, "_master_alert_terminating", False)
+            ):
+                return False
+            record = getattr(self, "_master_alert_record", None)
+            if not isinstance(record, MasterAlertRecord):
+                record = MasterAlertRecord()
+            candidate = MasterAlertRecord(
+                master_umo=umo, error_type=record.error_type,
+                consecutive_count=record.consecutive_count,
+                window_started_at=record.window_started_at, report_id=record.report_id,
+                report_status=record.report_status, quiet_deadline=record.quiet_deadline,
+                recovered=record.recovered,
+            )
+            self._publish_master_alert_record_locked(candidate)
+        # Scheduling may persist a quiet deadline and therefore takes the same
+        # mutex itself. Publish the bound record first, then schedule outside
+        # this read-modify-write critical section.
+        if candidate.report_status == "pending":
+            await self._schedule_pending_master_alert(candidate)
+        return True
+
+    async def _schedule_pending_master_alert(self, record: MasterAlertRecord) -> None:
+        """Schedule only the current pending Master record.
+
+        Binding and terminal observation intentionally invoke this after their
+        own persistence lock has been released.  Re-checking the record under
+        the same mutex prevents that older candidate from turning a newer
+        ``submitting`` record back into retryable ``pending`` state.
+        """
+        submit_id = ""
+        async with self._master_alert_mutex():
+            current = getattr(self, "_master_alert_record", MasterAlertRecord())
+            if (
+                getattr(self, "_master_alert_terminated", False)
+                or getattr(self, "_master_alert_terminating", False)
+                or not isinstance(current, MasterAlertRecord)
+                or current.report_id != record.report_id
+                or current.report_status != "pending"
+                or not current.master_umo
+            ):
+                return
+            settings = self._master_alert_settings()
+            deadline = 0.0
+            if settings.get("master_alert_quiet_enabled", False):
+                deadline = master_alert_quiet_deadline(
+                    now=time.time(), start=settings.get("quiet_start", "23:00"),
+                    end=settings.get("quiet_end", "08:00"),
+                    offset=settings.get("display_timezone", "+08:00"),
+                ) or 0.0
+            if deadline:
+                candidate = MasterAlertRecord(
+                    master_umo=current.master_umo, error_type=current.error_type,
+                    consecutive_count=current.consecutive_count,
+                    window_started_at=current.window_started_at,
+                    report_id=current.report_id, report_status="pending",
+                    quiet_deadline=deadline, recovered=current.recovered,
+                )
+                self._publish_master_alert_record_locked(candidate)
+                self._schedule_alert_timer_locked(candidate.report_id, deadline)
+                return
+            submit_id = current.report_id
+        if submit_id:
+            await self._submit_master_alert_report(submit_id)
+
+    def _master_alert_settings(self) -> dict[str, Any]:
+        value = self._settings().get("master_alert", {})
+        return value if isinstance(value, dict) else {}
+
+    def _master_alert_mutex(self) -> asyncio.Lock:
+        lock = getattr(self, "_master_alert_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._master_alert_lock = lock
+        return lock
+
+    def _master_alert_revision_value(self) -> int:
+        value = getattr(self, "_master_alert_revision", 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    def _publish_master_alert_record_locked(
+        self, record: MasterAlertRecord, *, ready: bool = True
+    ) -> None:
+        """Publish one Master authority transition while its mutex is held."""
+        self._master_alert_record = record
+        self._master_alert_ready = ready
+        self._master_alert_revision = self._master_alert_revision_value() + 1
+
+    def _fail_close_master_alert_locked(self) -> None:
+        """Publish a local Master fail-close as a revisioned authority change."""
+        record = getattr(self, "_master_alert_record", MasterAlertRecord())
+        if not isinstance(record, MasterAlertRecord):
+            record = MasterAlertRecord()
+        self._publish_master_alert_record_locked(record, ready=False)
+
+    def _track_master_alert_send(self, task: asyncio.Task[Any]) -> None:
+        """Keep the one official alert send visible to bounded termination."""
+        tasks = getattr(self, "_master_alert_send_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = set()
+            self._master_alert_send_tasks = tasks
+        tasks.add(task)
+
+        def consume(completed: asyncio.Task[Any]) -> None:
+            tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                completed.exception()
+            except Exception:
+                pass
+
+        task.add_done_callback(consume)
+
+    async def _submit_master_alert_report(self, report_id: str) -> None:
+        """Submit a fixed, non-content alert once through Context.send_message."""
+        async with self._master_alert_mutex():
+            record = getattr(self, "_master_alert_record", MasterAlertRecord())
+            if (
+                not isinstance(record, MasterAlertRecord)
+                or record.report_id != report_id
+                or record.report_status != "pending"
+                or not record.master_umo
+                or getattr(self, "_master_alert_terminated", False)
+                or getattr(self, "_master_alert_terminating", False)
+            ):
+                return
+            submitting = MasterAlertRecord(
+                master_umo=record.master_umo, error_type=record.error_type,
+                consecutive_count=record.consecutive_count,
+                window_started_at=record.window_started_at,
+                report_id=record.report_id, report_status="submitting",
+                quiet_deadline=0.0, recovered=record.recovered,
+            )
+            self._publish_master_alert_record_locked(submitting)
+            if (
+                getattr(self, "_master_alert_terminated", False)
+                or getattr(self, "_master_alert_terminating", False)
+            ):
+                return
+            summary = "Shio 系统告警：连续回复失败，请检查 AstrBot 配置。"
+            if submitting.recovered:
+                summary = "Shio 系统告警：此前连续回复失败现已恢复，请检查 AstrBot 配置。"
+            send_task = asyncio.create_task(
+                self.context.send_message(
+                    submitting.master_umo,
+                    MessageChain(chain=[Plain(summary)]),
+                )
+            )
+            self._track_master_alert_send(send_task)
+        try:
+            accepted = await send_task
+            status = "submitted" if accepted is not False else "failed"
+        except Exception:
+            status = "failed"
+        async with self._master_alert_mutex():
+            current = getattr(self, "_master_alert_record", MasterAlertRecord())
+            if (
+                not isinstance(current, MasterAlertRecord)
+                or current.report_id != report_id
+                or current.report_status != "submitting"
+                or getattr(self, "_master_alert_terminated", False)
+                or getattr(self, "_master_alert_terminating", False)
+            ):
+                return
+            self._publish_master_alert_record_locked(
+                MasterAlertRecord(
+                    master_umo=current.master_umo, error_type=current.error_type,
+                    consecutive_count=current.consecutive_count,
+                    window_started_at=current.window_started_at,
+                    report_id=current.report_id, report_status=status,
+                    quiet_deadline=0.0,
+                    recovered=current.recovered,
+                )
+            )
+
+    async def _master_alert_timer_worker(self, report_id: str, deadline: float) -> None:
+        delay = max(0.0, deadline - time.time())
+        if delay:
+            await asyncio.sleep(delay)
+        async with self._master_alert_mutex():
+            record = getattr(self, "_master_alert_record", MasterAlertRecord())
+            ready = getattr(self, "_master_alert_ready", False)
+            valid = (
+                ready and not getattr(self, "_master_alert_terminated", False)
+                and not getattr(self, "_master_alert_terminating", False)
+                and isinstance(record, MasterAlertRecord)
+                and record.report_id == report_id
+                and record.report_status == "pending"
+                and record.quiet_deadline == deadline
+                and bool(record.master_umo)
+                and time.time() >= deadline
+            )
+        if valid:
+            await self._submit_master_alert_report(report_id)
+
+    def _schedule_alert_timer_locked(self, report_id: str, deadline: float) -> None:
+        if (
+            getattr(self, "_master_alert_terminated", False)
+            or getattr(self, "_master_alert_terminating", False)
         ):
             return
+        previous = getattr(self, "_master_alert_timer", None)
+        if previous is not None and not previous.done():
+            previous.cancel()
+        self._master_alert_timer = asyncio.create_task(
+            self._master_alert_timer_worker(report_id, deadline)
+        )
 
-        preflight = event.get_extra(SHIO_PARTICIPATION_CADENCE_PREFLIGHT, None)
-        if type(preflight) is not ParticipationCadencePreflight:
-            return
-        current_message = request.current_message.content
-        outcome: ParticipationSemanticOutcome | None = None
-        provider = None
-        try:
-            provider = self.context.get_using_provider(
-                str(getattr(event, "unified_msg_origin", "") or "")
+    async def _cancel_master_alert_timer(self, *, timeout: float | None = None) -> None:
+        timer = getattr(self, "_master_alert_timer", None)
+        self._master_alert_timer = None
+        if timer is not None and not timer.done():
+            timer.cancel()
+            wait_timeout = (
+                self._NATURAL_KV_AWAIT_SECONDS
+                if timeout is None
+                else max(0.0, timeout)
             )
-        except Exception:
-            provider = None
-        try:
-            if provider is None or not callable(getattr(provider, "text_chat", None)):
-                outcome = self.participation_semantic_authority.reject_without_provider(
-                    request,
-                )
-            else:
-                outcome = await self.participation_semantic_authority.evaluate(
-                    request,
-                    provider=provider,
-                    inference_budget=self.inference_budget,
-                    performance_window=self.performance_window,
-                    permit_observer=self._observe_inference_permit,
-                )
-        except asyncio.CancelledError:
-            if self.participation_cadence_authority.is_open(preflight):
+            done, pending = await asyncio.wait((timer,), timeout=wait_timeout)
+            if pending:
+                # A timer can be blocked inside the public send await.  It is
+                # detached only after the lifecycle pre-fence, so it cannot
+                # create another Shio action when cancellation is delayed.
+                def consume(completed: asyncio.Task[Any]) -> None:
+                    if completed.cancelled():
+                        return
+                    try:
+                        completed.exception()
+                    except Exception:
+                        pass
+
+                timer.add_done_callback(consume)
+
+    async def _drain_master_alert_sends(self, *, timeout: float | None = None) -> None:
+        """Cancel owned send waiters within the frozen deadline, then detach late ones.
+
+        AstrBot exposes no delivery-revocation contract for ``send_message``.
+        A cancellation-resistant platform await may therefore outlive this plugin
+        instance, but its task is detached only after the lifecycle pre-fence is
+        set: it can no longer publish Shio state or initiate another action.
+        """
+        tasks = tuple(getattr(self, "_master_alert_send_tasks", set()))
+        if not tasks:
+            return
+        wait_timeout = self._NATURAL_KV_AWAIT_SECONDS if timeout is None else max(0.0, timeout)
+        done, pending = await asyncio.wait(tasks, timeout=wait_timeout)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.sleep(0)
+        still_pending = tuple(task for task in pending if not task.done())
+        for task in done:
+            if not task.cancelled():
                 try:
-                    cadence = self.participation_cadence_authority.finalize(
-                        preflight,
-                        outcome=ParticipationLevel.WAIT,
-                        reason_code="participation_semantic_cancelled",
-                    )
-                    reaction = self.participation_reaction_authority.issue(
-                        cadence,
-                        current_message=current_message,
-                    )
-                    event.set_extra(SHIO_PARTICIPATION_CADENCE, cadence)
-                    event.set_extra(SHIO_PARTICIPATION_REACTION, reaction)
+                    task.exception()
                 except Exception:
                     pass
-            raise
-        except Exception as exc:
-            structured_log(
-                logger,
-                "error",
-                "participation.semantic_evaluation_failed",
-                failure_kind=safe_exception_kind(exc),
+        if still_pending:
+            # Do not turn a platform-side cancellation uncertainty into an
+            # unbounded plugin unload.  The tracked task's done callback still
+            # consumes its eventual exception, while the terminated instance
+            # has already rejected every state/timer/request continuation.
+            tracked = getattr(self, "_master_alert_send_tasks", set())
+            if isinstance(tracked, set):
+                tracked.difference_update(still_pending)
+            logger.warning(
+                "Shio Master alert send exceeded termination deadline; "
+                "external delivery is unknown"
             )
 
-        final_level = ParticipationLevel.WAIT
-        cadence_reason = "participation_semantic_failed_closed"
-        decision_kind: ParticipationSemanticDecisionKind | None = None
-        if type(outcome) is ParticipationSemanticOutcome:
-            event.set_extra(SHIO_PARTICIPATION_SEMANTIC_OUTCOME, outcome)
-            semantic_trace = request.trace_metadata()
-            semantic_trace.update(
-                {
-                    key: value
-                    for key, value in outcome.trace_metadata().items()
-                    if key != "schema_version"
-                }
-            )
-            structured_log(
-                logger,
-                "info",
-                "participation.semantic_outcome",
-                **semantic_trace,
-            )
-            if outcome.status is ParticipationSemanticStatus.DECIDED:
-                try:
-                    semantic_decision = (
-                        self.participation_semantic_authority.claim_decision(outcome)
-                    )
-                except Exception:
-                    cadence_reason = "participation_semantic_stale_at_claim"
-                else:
-                    decision_kind = semantic_decision.decision
-                    cadence_reason = (
-                        "participation_semantic_"
-                        + semantic_decision.reason_code.value
-                    )
-                    if decision_kind is ParticipationSemanticDecisionKind.REPLY:
-                        final_level = ParticipationLevel.MAY_JOIN
-                    elif decision_kind is ParticipationSemanticDecisionKind.NO_ACTION:
-                        final_level = ParticipationLevel.NO_ACTION
-            else:
-                cadence_reason = outcome.reason_code
-
-        conversation_event = event.get_extra(SHIO_CONVERSATION_EVENT, None)
-        if (
-            final_level is ParticipationLevel.MAY_JOIN
-            and (
-                not isinstance(conversation_event, ConversationEvent)
-                or self.generation_epochs.current(request.binding.scope_key)
-                != request.binding.generation_epoch - 1
-            )
-        ):
-            final_level = ParticipationLevel.WAIT
-            cadence_reason = "participation_semantic_generation_stale"
-
-        try:
-            cadence = self.participation_cadence_authority.finalize(
-                preflight,
-                outcome=final_level,
-                reason_code=cadence_reason,
-            )
-            reaction = self.participation_reaction_authority.issue(
-                cadence,
-                current_message=current_message,
-            )
-        except Exception as exc:
-            structured_log(
-                logger,
-                "error",
-                "participation.semantic_finalize_failed",
-                failure_kind=safe_exception_kind(exc),
-            )
-            return
-        event.set_extra(SHIO_PARTICIPATION_CADENCE, cadence)
-        event.set_extra(SHIO_PARTICIPATION_REACTION, reaction)
-        cadence_trace = cadence.trace_metadata()
-        cadence_trace.update(
-            {
-                key: value
-                for key, value in reaction.trace_metadata().items()
-                if key != "schema_version"
-            }
-        )
-        structured_log(
-            logger,
-            "info",
-            "participation.cadence_finalized",
-            semantic_decision=(
-                decision_kind.value if decision_kind is not None else "failed_closed"
-            ),
-            reason_code=(
-                cadence.reason_codes[0]
-                if cadence.reason_codes
-                else "participation_cadence_finalized"
-            ),
-            **cadence_trace,
-        )
-        if reaction.decision.level not in {
-            ParticipationLevel.MAY_JOIN,
-            ParticipationLevel.REACT_ONLY,
-        }:
-            return
-        if not isinstance(conversation_event, ConversationEvent):
-            return
-        try:
-            generation_snapshot = self.generation_epochs.advance(
-                conversation_event.envelope,
-                expected_epoch=request.binding.generation_epoch,
-            )
-        except Exception as exc:
-            structured_log(
-                logger,
-                "error",
-                "participation.semantic_promotion_failed",
-                failure_kind=safe_exception_kind(exc),
-            )
-            return
-        event.set_extra(GENERATION_EPOCH_EXTRA, generation_snapshot)
-        self.generation_tasks.cancel_older(generation_snapshot)
-        event.is_at_or_wake_command = True
-        event.is_wake = True
-        promotion_reason = (
-            "participation_react_only"
-            if reaction.decision.level is ParticipationLevel.REACT_ONLY
-            else "participation_may_join"
-        )
-        event.set_extra(
-            SHIO_NATURAL_WAKE,
-            {"alias": "星汐", "reason": promotion_reason},
-        )
-        structured_log(
-            logger,
-            "info",
-            "participation.semantic_promoted",
-            scope_digest=diagnostic_digest(request.binding.scope_key),
-            message_digest=request.messages_digest,
-            reason_code=promotion_reason,
-        )
-
-    @filter.custom_filter(NaturalNameWakeFilter, False, priority=90)
-    async def admit_inbound_event(self, event: AstrMessageEvent):
-        """Run after external gates; never emit or globally stop an event."""
-
-        self.admit_ingress_event(event)
-        await self._resolve_participation_semantic(event)
-
-        if False:  # 保持 AstrBot 对异步生成器过滤器的调用契约。
-            yield event
-        return
-
-    def _set_inactive(self, event: AstrMessageEvent) -> None:
-        self._discard_semantic_validation_seal(event)
-        event.set_extra(SHIO_ACTIVE, False)
-        event.set_extra(SHIO_PAYLOAD, None)
-        event.set_extra(SHIO_TYPED_RUNTIME_DECISION, None)
-        event.set_extra(SHIO_TYPED_RUNTIME, None)
-        event.set_extra(SHIO_TYPED_PIPELINE_ACTIVE, False)
-        event.set_extra(SHIO_PLANNED_ACTION, None)
-        event.set_extra(SHIO_CONTENT_INTENT, None)
-        event.set_extra(SHIO_EXPRESSION_INTENT, None)
-        event.set_extra(SHIO_MEME_COMPLEMENT_DECISION, None)
-        event.set_extra(SHIO_MEME_PRESENTATION_RECEIPT, None)
-        event.set_extra(SHIO_PRESENTATION_SEND_EVIDENCE, None)
-        event.set_extra(SHIO_AFFECT_APPRAISAL, None)
-        event.set_extra(SHIO_PERSONA_EXPRESSION, None)
-        event.set_extra(SHIO_ACQUISITION_REQUEST, None)
-        event.set_extra(SHIO_EVIDENCE_OUTCOME, None)
-        event.set_extra(SHIO_ACTIVE_CAPABILITY_POLICY, None)
-        event.set_extra(SHIO_EFFECTIVE_TOOL_NAMES, ())
-        event.set_extra(SHIO_REPLY_COMPOSER_REQUEST, None)
-        event.set_extra(SHIO_OUTPUT_VALIDATION_CONTEXT, None)
-        event.set_extra(SHIO_SEMANTIC_GUARD_CONTRACT, None)
-        event.set_extra(SHIO_SEMANTIC_VALIDATION_SEAL, None)
-        event.set_extra(SHIO_REPAIR_ATTEMPTS, 0)
-        event.set_extra(SHIO_PRESENTATION_HANDOFF, None)
-        event.set_extra(SHIO_LEDGER_OUTBOUND_IDS, set())
-        event.set_extra(SHIO_MEDIA_ADAPTATION, None)
-        event.set_extra(SHIO_MEMORY_POLICY_RESULT, None)
-        event.set_extra(SHIO_MEMORY_READER_EVIDENCE, None)
-        event.set_extra(SHIO_CURRENT_QUESTION_ANCHOR, None)
-        event.set_extra(SHIO_INFERENCE_PERMIT, None)
-        event.set_extra(SHIO_PRIMARY_PROVIDER_STARTED_AT, None)
-        event.set_extra(SHIO_PERFORMANCE_SNAPSHOT, None)
-        event.set_extra(SHIO_MEME_MANAGER_TOOL, None)
-        event.set_extra(SHIO_MEME_MANAGER_PROMPT, "")
-        event.set_extra(SHIO_MEME_MANAGER_REFERENCE, "")
-        event.set_extra(SHIO_MEME_MANAGER_PRESENTATION_MODE, "unavailable")
-        event.set_extra(SHIO_MEME_MANAGER_CATEGORY_MARKERS, ())
-
-    def _discard_semantic_validation_seal(self, event: AstrMessageEvent) -> None:
-        self.semantic_guard_controller.discard(
-            event.get_extra(SHIO_SEMANTIC_VALIDATION_SEAL, None)
-        )
-        event.set_extra(SHIO_SEMANTIC_VALIDATION_SEAL, None)
-
-    def _owner_action_denial_reason(self, planned_action: PlannedAction) -> str:
-        if not self.owner_action_enabled:
-            return "owner_action_disabled"
-        operation = planned_action.action.operation_intent
-        enabled_by_operation = {
-            "artifact_read_exact": (
-                self.owner_action_adapter_config.artifact_read_exact_enabled
-            ),
-            "artifact_grep": self.owner_action_adapter_config.artifact_grep_enabled,
-            "memory_write_literal": (
-                self.owner_action_adapter_config.memory_write_literal_enabled
-            ),
-            "sandbox_shell_once": False,
-        }
-        if operation is None or not enabled_by_operation.get(operation.value, False):
-            return "owner_action_adapter_disabled"
-        # The audited production runtime allowlist is intentionally empty.  A UI
-        # flag alone can never create tool authority.
-        return "owner_action_runtime_conformance_unavailable"
-
-    @staticmethod
-    def _deterministic_owner_action_fallback(
-        composer_request: ReplyComposerRequest,
-    ) -> str | None:
-        """Return the only production-local owner-action fallback E5 can send.
-
-        The current production graph can issue a displayable owner-action
-        outcome only for an all-off denial.  If model output violates that
-        outcome, do not ask the model to improvise the security result again:
-        provide one content-free sentence and still pass it through the exact
-        REPAIR validator, presentation handoff and final-send seal.
-        """
-
-        outcome = composer_request.action_outcome
-        if (
-            type(outcome) is ActionOutcomeIntent
-            and outcome.kind is ActionOutcomeKind.DENIED
-            and outcome.has_output is False
-        ):
-            return "这个我不能替你做，所以没动。"
-        return None
-
-    def _prepare_disabled_owner_action_outcome(
-        self,
-        *,
-        event: AstrMessageEvent,
-        planned_action: PlannedAction,
-        content_seed: ContentIntentSeed,
-    ) -> ContentIntentSeed:
-        """Create a canonical denial; E5 never opens an adapter or executor."""
-
-        ticket = event.get_extra(SHIO_OWNER_ACTION_TICKET, None)
-        route = event.get_extra(SHIO_OWNER_ACTION_ROUTE, None)
-        if (
-            ticket is None
-            or not isinstance(route, OwnerActionRouteDecision)
-            or route.status is not OwnerActionRouteStatus.MATCHED
-        ):
-            raise RuntimeError("owner_action_route_unavailable")
-        store, _durable = self._ensure_owner_action_durable_runtime()
-        action_route = self.owner_action_controller.seal_action_route(
-            ticket,
-            planned_action,
-            route,
-        )
-        now = time.time()
-        denial = self.owner_action_controller.deny_action_route(
-            ticket,
-            action_route,
-            denied_at=now,
-            reason_codes=(self._owner_action_denial_reason(planned_action),),
-        )
-        inspection = self.owner_action_controller.inspect_denial_lineage(denial)
-        reservation = store.reserve(
-            inspection.operation,
-            request_digest=denial.denial_digest,
-            now=now,
-        )
-        store.mark_terminal(
-            reservation.handle,
-            status=denial.status,
-            effect_state=denial.effect_state,
-            attempted=False,
-            now=now + 0.001,
-        )
-        outcome = self.action_outcome_authority.issue_from_denial(
-            current_planned_action=planned_action,
-            denial=denial,
-        )
-        attached = attach_action_outcome(
-            content_seed,
-            outcome,
-            self.action_outcome_authority,
-            current_planned_action=planned_action,
-        )
-        event.set_extra(SHIO_OWNER_ACTION_SOURCE, denial)
-        event.set_extra(SHIO_ACTION_OUTCOME, outcome)
-        event.set_extra(
-            SHIO_OWNER_ACTION_LIFECYCLE_HANDLE,
-            reservation.handle,
-        )
-        return attached
-
-    async def _execute_react_presentation(
-        self,
-        *,
-        event: AstrMessageEvent,
-        planned_action: PlannedAction,
-        expression_intent: ExpressionIntent,
-    ) -> MemeExecutionReceipt | None:
-        """Execute the sole zero-text REACT presentation path."""
-
-        # Explicitly disable the legacy semantic-tool selection state for this
-        # turn. The compatibility executor below receives only a closed
-        # expression marker and never exposes model query/candidate material.
-        for key, value in (
-            ("meme_manager_semantic_active", False),
-            ("meme_manager_semantic_mode", ""),
-            ("meme_manager_semantic_selected_ids", []),
-            ("meme_manager_semantic_search_completed", False),
-        ):
-            event.set_extra(key, value)
-        generation = event_generation_snapshot(event)
-        if generation is None:
-            record_pipeline_stage(
-                event,
-                "meme_presentation",
-                meme_runtime_status="generation_missing",
-                meme_execution_status="suppressed",
-            )
-            return None
-        conformance = self.meme_manager_conformance.collect(self.context)
-        receipt: MemeExecutionReceipt
-        if conformance.status is not MemeManagerConformanceStatus.VERIFIED:
-            reason_by_status = {
-                MemeManagerConformanceStatus.MISSING: "runtime_missing",
-                MemeManagerConformanceStatus.DISABLED: "runtime_disabled",
-                MemeManagerConformanceStatus.INTERFACE_CHANGED: (
-                    "runtime_interface_changed"
-                ),
-                MemeManagerConformanceStatus.BUILD_CHANGED: "runtime_build_changed",
-                MemeManagerConformanceStatus.ERROR: "runtime_error",
-            }
-            receipt = self.meme_execution_authority.issue_suppressed(
-                planned_action=planned_action,
-                expression_intent=expression_intent,
-                generation=generation,
-                reason_code=reason_by_status[conformance.status],
-            )
-        else:
-            evidence = conformance.evidence
-            if evidence is None:
-                raise ContractViolation("meme_runtime_evidence_required")
-            lease = self.meme_execution_authority.prepare(
-                planned_action=planned_action,
-                expression_intent=expression_intent,
-                generation=generation,
-                runtime_evidence=evidence,
-            )
-            permit = self.meme_execution_authority.claim(
-                lease,
-                generation=generation,
-            )
-            receipt = await self.scope_concurrency.run_event(
-                generation,
-                self._effective_principal(event),
-                kind=ScopeWorkKind.REACT,
-                work_factory=lambda: execute_meme_permit(
-                    self.meme_execution_authority,
-                    permit,
-                    event=event,
-                    generation=generation,
-                ),
-            )
-        self.meme_execution_authority.inspect_receipt(receipt)
-        event.set_extra(SHIO_MEME_PRESENTATION_RECEIPT, receipt)
-        record_pipeline_stage(
-            event,
-            "meme_presentation",
-            **conformance.trace_metadata(),
-            **receipt.trace_metadata(),
-        )
-        return receipt
-
-    def _block_typed_turn(
-        self,
-        event: AstrMessageEvent,
-        req: ProviderRequest,
-        *,
-        reason_code: str,
+    async def _record_master_alert_terminal(
+        self, event: AstrMessageEvent, snapshot: TurnSnapshot, *, success: bool,
+        terminal_reason: str,
     ) -> None:
-        """Fail closed when a direct v2 turn cannot be bound safely.
-
-        A typed-only deployment must never leak back into AstrBot's raw request.
-        """
-
-        self._finalize_owner_action_noop(event)
-        req.system_prompt = ""
-        req.contexts = []
-        req.prompt = ""
-        req.extra_user_content_parts = []
-        req.image_urls = []
-        req.audio_urls = []
-        req.func_tool = ToolSet([])
-        req.tool_calls_result = None
-        event.set_extra(SHIO_ACTIVE, False)
-        event.set_extra(SHIO_TYPED_PIPELINE_ACTIVE, False)
-        event.set_extra(
-            SHIO_PAYLOAD,
-            {"typed_pipeline_active": False, "blocked_reason": reason_code},
-        )
-        stop = getattr(event, "stop_event", None)
-        if callable(stop):
-            stop()
-        structured_log(
-            logger,
-            "error",
-            "typed_reply.fail_closed",
-            trace_id=get_trace_id(event),
-            reason_code=reason_code,
-        )
-
-    async def _activate_planned_reply_request(
-        self,
-        *,
-        event: AstrMessageEvent,
-        req: ProviderRequest,
-        envelope: TurnEnvelope,
-        principal: PrincipalContext,
-        identity_scope: dict[str, str],
-        current_message: str,
-        sender_id: str,
-        sender_name: str,
-        scope_key: str,
-        planned_action: PlannedAction,
-        content_seed: ContentIntentSeed,
-        capability_policy: Any,
-        persona_package: PersonaPackage,
-        recent_replies: list[str],
-        evidence_outcome: EvidenceOutcome | None = None,
-        generation_snapshot: Any = None,
-    ) -> bool:
-        """Build the sole final Persona request after content and evidence settle."""
-
-        assembled = event.get_extra(SHIO_ASSEMBLED_CONTEXT_V2, None)
-        media_adaptation = event.get_extra(SHIO_MEDIA_ADAPTATION, None)
-        current_question_anchor = event.get_extra(
-            SHIO_CURRENT_QUESTION_ANCHOR,
-            None,
-        )
-        target = planned_action.action.reply_target
+        settings = self._master_alert_settings()
         if (
-            planned_action.kind
-            not in {
-                ActionKind.REPLY,
-                ActionKind.USE_TOOL,
-                ActionKind.EXECUTE_ACTION,
-            }
-            or target is None
-            or not isinstance(assembled, AssembledContext)
-            or not isinstance(media_adaptation, AstrBotMediaAdaptation)
-            or not isinstance(current_question_anchor, CurrentQuestionAnchor)
-            or assembled.reply_target != target
-            or content_seed.binding != planned_action.binding
+            not settings.get("master_alert_enabled", False)
+            or not getattr(self, "_master_alert_ready", False)
+            or getattr(self, "_master_alert_terminated", False)
+            or getattr(self, "_master_alert_terminating", False)
+            or snapshot.origin == "natural"
         ):
+            return
+        try:
+            threshold = max(1, int(settings.get("consecutive_threshold", 3)))
+            window_seconds = max(60, int(settings.get("window_minutes", 10)) * 60)
+        except (TypeError, ValueError):
+            return
+        submit_id = ""
+        async with self._master_alert_mutex():
+            if (
+                getattr(self, "_master_alert_terminated", False)
+                or getattr(self, "_master_alert_terminating", False)
+            ):
+                return
+            record = getattr(self, "_master_alert_record", MasterAlertRecord())
+            if not isinstance(record, MasterAlertRecord):
+                return
+            if success:
+                candidate = master_alert_success(record)
+            else:
+                is_review = terminal_reason == "review_exhausted"
+                enabled = settings.get(
+                    "review_repair_exhausted_enabled" if is_review else "main_reply_exhausted_enabled",
+                    False,
+                )
+                if not master_alert_counts_failure(
+                    enabled=True, type_enabled=enabled is True,
+                    origin=snapshot.origin, terminal_reason=terminal_reason,
+                ):
+                    return
+                candidate = master_alert_failure(
+                    record, error_type=terminal_reason, now=time.time(),
+                    window_seconds=window_seconds, threshold=threshold,
+                )
+            self._publish_master_alert_record_locked(candidate)
+            # Once this error event's count belongs to this live instance,
+            # ResultDecorate must not replay it if the later send await is
+            # cancelled. The marker is event-local, never a durable receipt.
+            if not success:
+                event.set_extra("shio.sys001.error_master_done", True)
+            if candidate.report_status == "pending" and candidate.master_umo:
+                submit_id = candidate.report_id
+        if submit_id:
+            await self._schedule_pending_master_alert(candidate)
+        elif candidate.report_status == "pending" and not candidate.master_umo:
+            self._log_master_alert_unbound_hint()
+
+    def _log_master_alert_unbound_hint(self) -> None:
+        """Emit one generic, bounded hint until a Master private UMO is bound."""
+        now = time.monotonic()
+        last = getattr(self, "_master_alert_unbound_hint_at", 0.0)
+        if not isinstance(last, (int, float)) or now - last >= 60.0:
+            self._master_alert_unbound_hint_at = now
+            logger.warning(
+                "Shio Master alert is pending until a private Master session is bound"
+            )
+
+    def _observe_segmented_reply_compatibility(self, event: AstrMessageEvent) -> None:
+        if event.get_extra("shio.sys001.segmented_reply_checked", False):
+            return
+        event.set_extra("shio.sys001.segmented_reply_checked", True)
+        try:
+            config = self.context.get_config(umo=event.unified_msg_origin)
+            if not isinstance(config, dict):
+                event.set_extra(
+                    "shio.sys001.segmented_reply_status",
+                    SegmentedReplyCompatibility(False, "official_config_non_dict"),
+                )
+                return
+            platform = getattr(event, "platform_meta", None)
+            supported = bool(getattr(platform, "supports_segmented_reply", True))
+            status = segmented_reply_compatibility(
+                config.get("platform_settings", {}).get("segmented_reply"),
+                platform_supported=supported,
+            )
+            event.set_extra("shio.sys001.segmented_reply_status", status)
+            if not status.compatible and status.reason != "disabled":
+                logger.warning("Shio text layout is not AstrBot segmented-reply compatible: %s", status.reason)
+        except Exception:
+            event.set_extra(
+                "shio.sys001.segmented_reply_status",
+                SegmentedReplyCompatibility(False, "official_config_unavailable"),
+            )
+
+    def _capability_visibility_settings(self) -> dict[str, Any]:
+        value = self._settings().get("capability_visibility", {})
+        return value if isinstance(value, dict) else {}
+
+    async def _current_conversation(self, event: AstrMessageEvent):
+        """Use the public conversation manager; never recreate history locally."""
+        manager = self.context.conversation_manager
+        conversation_id = await manager.get_curr_conversation_id(event.unified_msg_origin)
+        if not conversation_id:
+            conversation_id = await manager.new_conversation(
+                event.unified_msg_origin,
+                platform_id=event.get_platform_id(),
+            )
+        return await manager.get_conversation(event.unified_msg_origin, conversation_id)
+
+    async def _auxiliary_providers(
+        self,
+        event: AstrMessageEvent,
+        binding: _AuxiliaryBinding,
+        *,
+        explicit_provider_id: str,
+        fallback_provider_ids: list[Any],
+        deadline: float | None = None,
+    ) -> list[Any] | None | object:
+        """Resolve each public auxiliary route independently and in order.
+
+        ``None`` means the event binding became stale. Lookup failures are one
+        route's failure only: a healthy current Provider or later fallback is
+        still eligible. This helper never creates a Provider client.
+        """
+        if not isinstance(explicit_provider_id, str) or not isinstance(
+            fallback_provider_ids, list
+        ):
+            return []
+        explicit = explicit_provider_id.strip()
+        fallback = [
+            provider_id.strip()
+            for provider_id in fallback_provider_ids
+            if isinstance(provider_id, str) and provider_id.strip()
+        ]
+        providers: list[Any] = []
+
+        def append(provider: Any) -> None:
+            if provider is not None and not any(provider is item for item in providers):
+                providers.append(provider)
+
+        if not explicit:
+            provider = await self._await_auxiliary_operation(
+                event,
+                binding,
+                lambda: self.context.get_using_provider_async(event.unified_msg_origin),
+                deadline=deadline,
+                deadline_sentinel=True,
+            )
+            if provider is _AUXILIARY_DEADLINE_EXHAUSTED:
+                return _AUXILIARY_DEADLINE_EXHAUSTED
+            append(provider)
+            if not self._auxiliary_call_is_current(event, binding):
+                return None
+        for provider_id in ([explicit] if explicit else []) + fallback:
+            if (
+                deadline is None
+                or deadline - asyncio.get_running_loop().time() <= 0
+                or not self._auxiliary_call_is_current(event, binding)
+            ):
+                return _AUXILIARY_DEADLINE_EXHAUSTED
+            try:
+                # AstrBot's public Context contract exposes this lookup as a
+                # synchronous in-process accessor.  Do not create a second
+                # routing worker merely to offload it; it consumes the same
+                # deadline by the post-call fence before any chat may begin.
+                provider = self.context.get_provider_by_id(provider_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                provider = None
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                return _AUXILIARY_DEADLINE_EXHAUSTED
+            append(provider)
+            if not self._auxiliary_call_is_current(event, binding):
+                return None
+        return providers
+
+    def _track_auxiliary_task(self, task: asyncio.Task[Any]) -> None:
+        """Detach a non-cooperative public Provider await without losing errors."""
+        tasks = getattr(self, "_auxiliary_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = set()
+            self._auxiliary_tasks = tasks
+        tasks.add(task)
+
+        def consume(completed: asyncio.Task[Any]) -> None:
+            tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                completed.exception()
+            except Exception:
+                pass
+
+        task.add_done_callback(consume)
+
+    async def _auxiliary_text_chat(
+        self,
+        event: AstrMessageEvent,
+        binding: _AuxiliaryBinding,
+        provider: Any,
+        *,
+        prompt: str,
+        timeout: float | None = None,
+        deadline: float | None = None,
+        deadline_sentinel: bool = False,
+    ) -> Any | None | object:
+        """Hard bound one tool-free Provider call without waiting for its cancel.
+
+        ``wait_for`` waits for cancellation acknowledgement, which a Provider
+        implementation may suppress.  The independently tracked task is
+        cancelled and detached at the deadline; any late result is consumed and
+        callers still re-check the event/lifecycle binding before publishing.
+        """
+        if deadline is None:
+            if not isinstance(timeout, (int, float)) or not isfinite(timeout) or timeout <= 0:
+                return None
+            deadline = asyncio.get_running_loop().time() + float(timeout)
+        return await self._await_auxiliary_operation(
+            event,
+            binding,
+            lambda: provider.text_chat(prompt=prompt, func_tool=None),
+            deadline=deadline,
+            deadline_sentinel=deadline_sentinel,
+        )
+
+    async def _await_auxiliary_operation(
+        self,
+        event: AstrMessageEvent,
+        binding: _AuxiliaryBinding,
+        operation: Any,
+        *,
+        deadline: float | None,
+        deadline_sentinel: bool = False,
+    ) -> Any | None | object:
+        """Await one public auxiliary step within the caller's total budget."""
+        if not self._auxiliary_call_is_current(event, binding):
+            return None
+        if deadline is None:
+            return None
+        loop = asyncio.get_running_loop()
+        remaining = deadline - loop.time()
+        if not isfinite(remaining) or remaining <= 0:
+            return _AUXILIARY_DEADLINE_EXHAUSTED if deadline_sentinel else None
+        try:
+            awaitable = operation()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+        # Python 3.12 can synchronously advance an immediately-ready public
+        # lookup.  That avoids spending a tiny configured E2E budget solely on
+        # debug task scheduling; a blocking lookup still becomes one tracked
+        # task and is detached at the same absolute deadline.
+        try:
+            task = asyncio.Task(awaitable, loop=loop, eager_start=True)
+        except TypeError:  # pragma: no cover - older supported runtimes
+            task = asyncio.create_task(awaitable)
+        self._track_auxiliary_task(task)
+        try:
+            # ``eager_start`` can run a public coroutine's synchronous prefix
+            # while the Task is being constructed.  Recompute from the same
+            # absolute deadline before either accepting an eager result or
+            # giving an unfinished task time to wait; no route may gain a new
+            # per-call budget at that boundary.
+            remaining = deadline - loop.time()
+            if not isfinite(remaining) or remaining <= 0:
+                if not task.done():
+                    task.cancel()
+                    # Deliver cancellation once without awaiting the public
+                    # operation's acknowledgement; a provider may suppress it
+                    # and remains tracked/detached for late-result handling.
+                    await asyncio.sleep(0)
+                return _AUXILIARY_DEADLINE_EXHAUSTED if deadline_sentinel else None
+            if task.done():
+                done = {task}
+            else:
+                done, _pending = await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        if not done:
+            task.cancel()
+            # Give the cancelled coroutine one scheduling turn so cooperative
+            # public Providers see cancellation, but never await their
+            # completion or extend this purpose's absolute deadline.
+            await asyncio.sleep(0)
+            return _AUXILIARY_DEADLINE_EXHAUSTED if deadline_sentinel else None
+        # ``asyncio.wait`` may report a completed task at the precise budget
+        # edge. A superseded binding always wins over the deadline outcome:
+        # old callers retain their established None/stale path rather than
+        # reinterpret a discarded result as current-call exhaustion.
+        if not self._auxiliary_call_is_current(event, binding):
+            return None
+        # Fence adoption separately from waiting: a current result is useful
+        # only while the caller's original absolute deadline is still live.
+        remaining = deadline - loop.time()
+        if not isfinite(remaining) or remaining <= 0:
+            return _AUXILIARY_DEADLINE_EXHAUSTED if deadline_sentinel else None
+        try:
+            return task.result()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+
+    async def _official_group_history_contexts(
+        self, event: AstrMessageEvent, snapshot: TurnSnapshot
+    ) -> list[dict[str, str]]:
+        """Read the one approved, provenance-bearing group-history projection."""
+        if snapshot.is_private:
+            return []
+        try:
+            config = self.context.get_config(umo=event.unified_msg_origin)
+            settings = config.get("provider_ltm_settings", {})
+            if (
+                not isinstance(settings, dict)
+                or not settings.get("group_message_history_enable", False)
+                or settings.get("group_icl_enable", False)
+            ):
+                return []
+            manager = getattr(self.context, "message_history_manager", None)
+            get_history = getattr(manager, "get", None)
+            if not callable(get_history):
+                return []
+            try:
+                limit = int(settings.get("group_message_history_max_cnt", 50))
+            except (TypeError, ValueError):
+                return []
+            if not 1 <= limit <= 700:
+                return []
+            records = await get_history(
+                platform_id=event.get_platform_id(), user_id=snapshot.scope, page_size=limit
+            )
+            if not isinstance(records, list):
+                return []
+            current_row_id = event.get_extra(
+                "_current_platform_message_history_id",
+                getattr(event, "_current_platform_message_history_id", None),
+            )
+            if isinstance(current_row_id, bool) or not isinstance(current_row_id, int):
+                current_row_id = None
+            # R37 batch requests have a real watermark event.  If AstrBot did
+            # not expose its platform-history row id, an upper bound cannot be
+            # proven, so omit official history rather than allow future rows.
+            batch = event.get_extra("shio.sys001.batch", ())
+            if batch and current_row_id is None:
+                return []
+            excluded_history_row_ids: frozenset[int] = frozenset()
+            if isinstance(batch, tuple) and all(isinstance(item, _BatchMessage) for item in batch):
+                row_ids = [item.history_row_id for item in batch]
+                # Each batch participant is already supplied as explicit
+                # provenance. If AstrBot did not expose every matching history
+                # row id, omitting history is safer than duplicating a real
+                # participant through a second owner.
+                if any(row_id is None for row_id in row_ids):
+                    return []
+                excluded_history_row_ids = frozenset(row_ids)
+            ingress = self._ingress_settings()
+            return project_official_group_history(
+                records,
+                blocked_sender_ids=self._ingress_ids(ingress, "blocked_sender_ids"),
+                current_history_row_id=current_row_id,
+                watermark_history_row_id=current_row_id,
+                excluded_history_row_ids=excluded_history_row_ids,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return []
+
+    async def _visible_name_wake(self, event: AstrMessageEvent) -> bool:
+        """Only extend AstrBot's configured wake words into visible text."""
+        address = address_decision(event.get_messages(), str(event.get_self_id()))
+        if address == "DIRECT_OTHER":
+            return False
+        settings = self._group_settings()
+        if settings.get("name_wake_mode", "direct") not in {"direct", "semantic"}:
+            return False
+        try:
+            platform = self.context.get_config(umo=event.unified_msg_origin)
+            prefixes = platform.get("wake_prefix", [])
+        except Exception:
+            return False
+        text = event.get_message_str().strip()
+        matched = visible_wake_match(text, prefixes)
+        if not matched:
+            return False
+        if settings.get("name_wake_mode", "direct") == "direct":
+            return True
+
+        binding = self._bind_auxiliary_call(event)
+
+        snapshot = create_snapshot(event, origin="name")
+        prompt = name_semantic_prompt(
+            str(settings.get("name_semantic_prompt", "")),
+            matched,
+            snapshot,
+            address,
+            history_contexts=await self._official_group_history_contexts(event, snapshot),
+        )
+        explicit_provider_id = str(
+            settings.get("name_semantic_provider_id", "")
+        ).strip()
+        fallback_provider_ids = [
+            str(provider_id).strip()
+            for provider_id in settings.get("name_semantic_fallback_provider_ids", [])
+            if str(provider_id).strip()
+        ]
+        try:
+            timeout_seconds = float(
+                settings.get("name_semantic_timeout_seconds", 8)
+            )
+        except (TypeError, ValueError):
+            timeout_seconds = 8.0
+        if not isfinite(timeout_seconds) or timeout_seconds <= 0:
+            timeout_seconds = 8.0
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        providers = await self._auxiliary_providers(
+            event, binding, explicit_provider_id=explicit_provider_id,
+            fallback_provider_ids=fallback_provider_ids, deadline=deadline,
+        )
+        if providers is _AUXILIARY_DEADLINE_EXHAUSTED:
+            return False
+        if providers is None:
             return False
 
-        try:
-            product_trace = event.get_extra(SHIO_PRODUCT_TRACE, None)
-            if isinstance(product_trace, ProductTrace):
-                product_trace.append(
-                    ProductStage.CONTENT_INTENT,
-                    elapsed_ms=0.0,
-                    payload=ProductTracePayload(
-                        status=ProductTraceStatus.READY,
-                        item_count=len(content_seed.intent.required_atoms),
-                        target_bound=True,
-                        current_subject_only=True,
-                        source_verified=True,
-                    ),
-                )
-            appraisal = appraise_affect(
-                principal=principal,
-                reply_target=target,
-                current_message=current_message,
-                conversation_mode=capability_policy.conversation_mode,
+        seen: set[int] = set()
+        for provider in providers:
+            if provider is None or id(provider) in seen:
+                continue
+            seen.add(id(provider))
+            response = await self._auxiliary_text_chat(
+                event,
+                binding,
+                provider,
+                prompt=prompt,
+                deadline=deadline,
+                deadline_sentinel=True,
             )
-            affect_mutation = event.get_extra(SHIO_AFFECT_STATE_MUTATION, None)
-            continuous_affect = self.affect_states.issue_render_context(
-                affect_mutation,
-                binding=planned_action.binding,
-                now=time.time(),
-            )
-            event.set_extra(SHIO_AFFECT_RENDER_CONTEXT, continuous_affect)
-            relationship_mutation = event.get_extra(
-                SHIO_RELATIONSHIP_STATE_MUTATION,
-                None,
-            )
-            if not isinstance(relationship_mutation, RelationshipMutationResult):
+            if response is _AUXILIARY_DEADLINE_EXHAUSTED:
                 return False
-            if (
-                relationship_mutation.status
-                is not RelationshipMutationStatus.ACCEPTED_HUMAN
+            if response is None:
+                # A detached, non-cooperative route may return control at the
+                # exact budget edge.  Do not start another route after that
+                # purpose-wide deadline has been consumed.
+                if asyncio.get_running_loop().time() >= deadline:
+                    return False
+                continue
+
+            if not self._auxiliary_call_is_current(event, binding):
+                return False
+
+            semantic = parse_name_semantic(
+                str(getattr(response, "completion_text", ""))
+            )
+            if semantic.status != "valid":
+                continue
+            return semantic.decision.value == "DIRECT"
+        return False
+
+    def _natural_scopes(self) -> frozenset[str]:
+        raw = self._group_settings().get("natural_group_scopes", [])
+        return frozenset(str(scope) for scope in raw if isinstance(scope, str) and scope)
+
+    def _legacy_natural_umo_scopes(self) -> frozenset[str]:
+        """Return deployed R22 UMO values without treating a new group number as one."""
+        return frozenset(scope for scope in self._natural_scopes() if ":" in scope)
+
+    async def _ensure_natural_scope_ready(self, scope: str) -> bool:
+        """Restore one admitted real UMO once before its natural gate opens.
+
+        The group-number setting is only an admission key.  This function is
+        deliberately called after that admission and locks the real UMO so two
+        first events cannot duplicate a read or publish an older snapshot over
+        a newer in-memory cadence state.
+        """
+        if not scope:
+            return False
+        async with self._natural_lock(scope):
+            if getattr(self, "_natural_terminated", False) or getattr(
+                self, "_auxiliary_terminated", False
             ):
                 return False
-            relationship_context = self.relationship_states.issue_render_context(
-                relationship_mutation,
-                binding=planned_action.binding,
-            )
-            event.set_extra(
-                SHIO_RELATIONSHIP_RENDER_CONTEXT,
-                relationship_context,
-            )
-            if isinstance(product_trace, ProductTrace):
-                product_trace.append(
-                    ProductStage.AFFECT,
-                    elapsed_ms=0.0,
-                    payload=ProductTracePayload(
-                        status=ProductTraceStatus.READY,
-                        item_count=1,
-                        target_bound=True,
-                        current_subject_only=True,
-                        source_verified=True,
-                    ),
+            if getattr(self, "_natural_ready", {}).get(scope, False):
+                return True
+            epoch = getattr(self, "_auxiliary_epoch", 0)
+            self._natural_ready[scope] = False
+            try:
+                value = await self._await_kv(
+                    self.get_kv_data(self._natural_kv_key(scope), None),
+                    subsystem="natural", scope=scope,
                 )
-            persona_expression = build_persona_expression_plan(
-                persona_package,
-                appraisal,
-                principal=principal,
-                conversation_mode=capability_policy.conversation_mode,
-                recent_visible_replies=tuple(recent_replies),
-            )
-            feedback_scores = (
-                self.runtime.expression_feedback_scores(
-                    scope_key=scope_key,
-                    persona_key=persona_package.package_id,
-                    situation_id=persona_expression.trigger.value,
-                    relationship_scope=principal.relationship_role,
-                )
-                if (
-                    bool(self._config("social_feedback_enabled", True))
-                    and persona_expression.is_actionable
-                )
-                else {}
-            )
-            retrieval = retrieve_expression_candidates(
-                persona_package,
-                persona_expression,
-                feedback_scores=feedback_scores,
-                max_candidates=3,
-            )
-            emotion_tags = tuple(
-                dict.fromkeys(
-                    value
-                    for value in (
-                        appraisal.trigger.value,
-                        appraisal.surface_emotion.value,
-                        (
-                            appraisal.secondary_emotion.value
-                            if appraisal.secondary_emotion is not None
-                            else ""
-                        ),
-                        appraisal.hidden_concern.value,
-                    )
-                    if value
-                )
-            )
-            meme_complement = decide_semantic_meme_handoff(
-                current_message=current_message,
-            )
-            expression_intent = self.expression_intent_authority.issue(
-                planned_action_authority=self.planned_action_authority,
-                planned_action=planned_action,
-                modality=ExpressionModality.TEXT,
-                social_act=persona_expression.topic_return,
-                emotion_tags=emotion_tags,
-                max_bubbles=min(
-                    3,
-                    max(1, int(self._config("chat_max_bubbles", 3))),
-                ),
-                meme_executor="",
-                max_meme_calls=0,
-                reason_codes=("typed_text_renderer",),
-            )
-            event.set_extra(SHIO_MEME_COMPLEMENT_DECISION, meme_complement)
-            structured_log(
-                logger,
-                "info",
-                "meme.complement_decision",
-                trace_id=get_trace_id(event),
-                eligible=meme_complement.eligible,
-                reason_code=meme_complement.reason_code,
-                category="manager_semantic",
-            )
-            if isinstance(product_trace, ProductTrace):
-                product_trace.append(
-                    ProductStage.EXPRESSION,
-                    elapsed_ms=0.0,
-                    payload=ProductTracePayload(
-                        status=ProductTraceStatus.READY,
-                        item_count=len(retrieval.candidates),
-                        target_bound=True,
-                        current_subject_only=True,
-                        source_verified=True,
-                    ),
-                )
-            composer_request_kwargs = {
-                "planned_action": planned_action,
-                "content_seed": content_seed,
-                "expression_intent": expression_intent,
-                "affect_appraisal": appraisal,
-                "continuous_affect": continuous_affect,
-                "relationship_context": relationship_context,
-                "persona_expression": persona_expression,
-                "expression_candidates": retrieval.candidates,
-                "persona_package": persona_package,
-                "capability_policy": capability_policy,
-                "current_message": current_message,
-                "sender_name": sender_name,
-                "current_question_anchor": current_question_anchor,
-                "assembled_context": assembled,
-                "media_context": media_adaptation.context,
-                "media_prompt_evidence": (
-                    media_adaptation.transport.safe_prompt_evidence
-                ),
-                "evidence_outcome": evidence_outcome,
-                "temporal_context": self._build_temporal_context(
-                    now=float(time.time()),
-                ),
-                "scene_rules": (
-                    str(
-                        self._config(
-                            "natural_group_participation_rules",
-                            DEFAULT_NATURAL_GROUP_PARTICIPATION_RULES,
-                        )
-                        or DEFAULT_NATURAL_GROUP_PARTICIPATION_RULES
-                    ).strip()
-                    if capability_policy.conversation_mode == "group_join"
-                    else ""
-                ),
-                "effective_tool_names": tuple(
-                    event.get_extra(SHIO_EFFECTIVE_TOOL_NAMES, ()) or ()
-                ),
-            }
-            # The provisional request is canonical input only.  Its action
-            # outcome is deliberately not claimed until the Provider decision
-            # has sealed the final request's immutable typed gate.
-            preflight_request = build_reply_composer_request(
-                **composer_request_kwargs,
-                semantic_risk_decision=SemanticRiskDecision.NONE,
-                claim_action_outcome=False,
-            )
-            semantic_risk = await self._run_semantic_risk_preflight(
-                event=event,
-                req=req,
-                snapshot=generation_snapshot,
-                principal=principal,
-                planned_action=planned_action,
-                composer_request=preflight_request,
-            )
-            if semantic_risk is SemanticRiskDecision.UNCERTAIN:
-                event.set_extra(SHIO_SEMANTIC_RISK_DECISION, None)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                value = self._KV_UNAVAILABLE
+            if (
+                getattr(self, "_natural_terminated", False)
+                or getattr(self, "_auxiliary_terminated", False)
+                or epoch != getattr(self, "_auxiliary_epoch", 0)
+                or value is self._KV_UNAVAILABLE
+            ):
+                logger.warning("Shio natural cadence scope is unavailable after KV restore failure")
                 return False
-            composer_request = build_reply_composer_request(
-                **composer_request_kwargs,
-                semantic_risk_decision=semantic_risk,
+            if value is None:
+                self._natural_cadence[scope] = NaturalCadence.empty()
+                self._natural_ready[scope] = True
+                return True
+            record = decode_natural_cadence_record(
+                value, expected_scope=scope, now=time.time()
             )
-            event.set_extra(
-                SHIO_SEMANTIC_RISK_DECISION,
-                (semantic_risk, self._semantic_risk_snapshot(composer_request)),
+            if record is None or record.status != "committed":
+                logger.warning("Shio natural cadence scope is unavailable after invalid KV state")
+                return False
+            _cooldown, window_seconds, _maximum, _backoff_base, _backoff_maximum = (
+                self._natural_cadence_settings()
             )
-            semantic_contract = SemanticGuardContract(
-                composer_request=composer_request,
-                planned_action=planned_action,
-                content_intent=content_seed.intent,
-                current_question_anchor=current_question_anchor,
-                media_context=media_adaptation.context,
-                current_message=current_message,
-                evidence_outcome=evidence_outcome,
-                action_outcome=composer_request.action_outcome,
-                action_outcome_authority=(
-                    composer_request.action_outcome_authority
-                ),
+            cadence = prune_natural_cadence(
+                record.cadence, now=time.time(), window_seconds=window_seconds
             )
-            validation_context = build_output_validation_context(
-                composer_request=composer_request,
-                current_message=current_message,
-                expected_target_message_id=target.message_id,
-                expected_target_sender_key=principal.sender_key,
-                is_owner=principal.is_owner,
-                current_question_anchor=current_question_anchor,
-                semantic_contract=semantic_contract,
+            if (
+                getattr(self, "_natural_terminated", False)
+                or getattr(self, "_auxiliary_terminated", False)
+                or epoch != getattr(self, "_auxiliary_epoch", 0)
+            ):
+                return False
+            self._natural_cadence[scope] = cadence
+            self._natural_bindings[scope] = NaturalCadenceRecord(
+                scope, cadence, record.transaction_id, "committed"
             )
-        except Exception as exc:
-            structured_log(
-                logger,
-                "warning",
-                "typed_reply.prepare_failed",
-                trace_id=get_trace_id(event),
-                failure_kind=safe_exception_kind(exc),
+            self._natural_ready[scope] = True
+            return True
+
+    def _natural_prompt(self) -> str:
+        value = self._group_settings().get("natural_participation_prompt", "")
+        return str(value).strip() if isinstance(value, str) else ""
+
+    async def _decide_natural_participation(
+        self, event: AstrMessageEvent, snapshot: TurnSnapshot
+    ) -> str:
+        """Run the bounded, tool-free natural gate before the main Agent.
+
+        This is intentionally not a reply Provider loop: it can return only a
+        decision, cannot receive a ToolSet, and never creates a conversation or
+        sends.  A malformed or late response is fail-closed.
+        """
+        started = time.monotonic()
+        attempts: list[dict[str, int | str]] = []
+        event.set_extra("shio.sys001.natural_decision_attempts", attempts)
+
+        def audit(outcome: str) -> None:
+            # This event-local audit intentionally contains no body, prompt,
+            # history, batch, or raw Provider result.
+            attempts.append({
+                "outcome": outcome,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+            })
+
+        settings = self._group_settings()
+        binding = self._bind_auxiliary_call(event, snapshot)
+        explicit = settings.get("natural_decision_provider_id", "")
+        fallback_ids = settings.get("natural_decision_fallback_provider_ids", [])
+        if not isinstance(explicit, str) or not isinstance(fallback_ids, list):
+            audit("unavailable")
+            return ""
+        try:
+            timeout = float(settings.get("natural_decision_timeout_seconds", 8))
+        except (TypeError, ValueError):
+            audit("unavailable")
+            return ""
+        if not isfinite(timeout) or timeout <= 0:
+            audit("unavailable")
+            return ""
+        # Construct local, structured context before the Provider route budget
+        # starts.  The configured deadline is reserved end-to-end for public
+        # Provider lookup and its tool-free response, not local projection.
+        try:
+            address = address_decision(event.get_messages(), snapshot.self_id)
+            history = await self._official_group_history_contexts(event, snapshot)
+            batch = event.get_extra("shio.sys001.batch", ())
+            batch_contexts = (
+                self._batch_contexts(batch[:-1])
+                if isinstance(batch, tuple) and all(isinstance(item, _BatchMessage) for item in batch)
+                else []
             )
+            prompt = (
+                "Classify whether Shio should participate in this real group-message batch. "
+                "Return only JSON {\"decision\":\"REPLY\"}, {\"decision\":\"WAIT\"}, "
+                "or {\"decision\":\"NO_ACTION\"}. Do not use tools, hidden markers, "
+                "or a reply text.\n\n"
+                f"RULES:\n{self._natural_prompt()}\n\n"
+                f"STRUCTURED_ADDRESS={address}\n{snapshot.model_context()}\n"
+                f"OFFICIAL_HISTORY={json.dumps(history, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"REAL_BATCH={json.dumps(batch_contexts, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"MESSAGE:\n{snapshot.message_text}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            audit("unavailable")
+            return ""
+        deadline = asyncio.get_running_loop().time() + timeout
+        try:
+            providers = await self._auxiliary_providers(
+                event, binding, explicit_provider_id=explicit,
+                fallback_provider_ids=fallback_ids, deadline=deadline,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            audit("unavailable")
+            return ""
+        if providers is _AUXILIARY_DEADLINE_EXHAUSTED:
+            audit("unavailable")
+            return ""
+        if providers is None:
+            audit("unavailable")
+            return ""
+        if not isinstance(providers, list) or not providers:
+            audit("unavailable")
+            return ""
+
+        for provider in providers:
+            response = await self._auxiliary_text_chat(
+                event,
+                binding,
+                provider,
+                prompt=prompt,
+                deadline=deadline,
+                deadline_sentinel=True,
+            )
+            if response is _AUXILIARY_DEADLINE_EXHAUSTED:
+                audit("unavailable")
+                return ""
+            if response is None:
+                audit("unavailable")
+                continue
+            if not self._auxiliary_call_is_current(event, binding):
+                audit("unavailable")
+                return ""
+            decision = parse_natural_participation_decision(
+                getattr(response, "completion_text", "")
+            )
+            if decision is None:
+                audit("invalid")
+                continue
+            audit(decision.decision)
+            return decision.decision
+        audit("unavailable")
+        return ""
+
+    async def _natural_gate_allows(self, scope: str) -> bool:
+        """Read only restored, scope-local cadence state before a natural turn."""
+        async with self._natural_lock(scope):
+            if (
+                getattr(self, "_natural_terminated", False)
+                or not getattr(self, "_natural_ready", {}).get(scope, False)
+            ):
+                return False
+            state = getattr(self, "_natural_cadence", {}).get(
+                scope, NaturalCadence.empty()
+            )
+            cooldown, window_seconds, maximum, _backoff_base, _backoff_maximum = (
+                self._natural_cadence_settings()
+            )
+            return natural_cadence_allows(
+                state,
+                now=time.time(),
+                cooldown=cooldown,
+                window_seconds=window_seconds,
+                maximum=maximum,
+            )
+
+    async def _persist_natural_state(
+        self,
+        *,
+        scope: str,
+        state: NaturalCadence,
+        generation: int,
+        message_id: str,
+    ) -> bool:
+        """Commit under the caller's scope lock, then publish in-memory state."""
+        if (
+            getattr(self, "_natural_terminated", False)
+            or generation != self._natural_generations.get(scope, 0)
+        ):
             return False
+        transaction = secrets.token_hex(16)
+        pending = NaturalCadenceRecord(scope, state, transaction, "pending")
 
-        learning_context = make_learning_context(
-            persona_key=persona_package.package_id,
-            situation_id=appraisal.trigger.value,
-            relationship_scope=principal.relationship_role,
-            behavior_ids=tuple(
-                candidate.material_id for candidate in retrieval.candidates
-            ),
-        )
-        media_adaptation.restore_request_media(req)
-        manager_tool = event.get_extra(SHIO_MEME_MANAGER_TOOL, None)
-        manager_prompt = str(
-            event.get_extra(SHIO_MEME_MANAGER_PROMPT, "") or ""
-        ).strip()
-        manager_presentation_mode = str(
-            event.get_extra(SHIO_MEME_MANAGER_PRESENTATION_MODE, "") or ""
-        ).strip()
-        manager_presentation_active = bool(
-            manager_prompt
-            and (
-                manager_presentation_mode == "legacy_category"
-                or (
-                    manager_presentation_mode == "semantic_tool"
-                    and manager_tool is not None
-                )
+        async def put(record: NaturalCadenceRecord) -> bool:
+            persisted = await self._await_kv(
+                self.put_kv_data(
+                    self._natural_kv_key(scope), encode_natural_cadence_record(record)
+                ),
+                subsystem="natural", scope=scope,
             )
-        )
-        req.system_prompt = composer_request.system_prompt + (
-            f"\n\n{manager_prompt}" if manager_presentation_active else ""
-        )
-        req.contexts = [
-            message.provider_dict() for message in composer_request.model_messages
-        ]
-        req.prompt = composer_request.user_prompt
-        req.extra_user_content_parts = []
-        req.func_tool = ToolSet(
-            [manager_tool] if manager_tool is not None else []
-        )
-        req.tool_calls_result = None
-
-        event.set_extra(SHIO_TYPED_PIPELINE_ACTIVE, True)
-        event.set_extra(SHIO_PLANNED_ACTION, planned_action)
-        event.set_extra(SHIO_CONTENT_INTENT, content_seed.intent)
-        event.set_extra(SHIO_EXPRESSION_INTENT, expression_intent)
-        event.set_extra(SHIO_AFFECT_APPRAISAL, appraisal)
-        event.set_extra(SHIO_PERSONA_EXPRESSION, persona_expression)
-        event.set_extra(SHIO_EVIDENCE_OUTCOME, evidence_outcome)
-        event.set_extra(SHIO_ACTIVE_CAPABILITY_POLICY, capability_policy)
-        event.set_extra(SHIO_REPLY_COMPOSER_REQUEST, composer_request)
-        event.set_extra(SHIO_OUTPUT_VALIDATION_CONTEXT, validation_context)
-        event.set_extra(SHIO_SEMANTIC_GUARD_CONTRACT, semantic_contract)
-        event.set_extra(SHIO_SEMANTIC_VALIDATION_SEAL, None)
-        event.set_extra(SHIO_REPAIR_ATTEMPTS, 0)
-        event.set_extra(SHIO_ACTIVE, True)
-        event.set_extra(
-            SHIO_PAYLOAD,
-            {
-                "typed_pipeline_active": True,
-                "system_prompt": composer_request.system_prompt,
-                "contexts": [
-                    message.provider_dict()
-                    for message in composer_request.model_messages
-                ],
-                "recent_assistant_replies": list(recent_replies),
-                "prompt": composer_request.user_prompt,
-                "current_message": current_message,
-                "sender_id": sender_id,
-                "sender_name": sender_name,
-                "platform_id": str(identity_scope.get("platform_id", "")),
-                "bot_id": str(identity_scope.get("bot_id", "")),
-                "chat_type": str(identity_scope.get("chat_type", "private")),
-                "group_id": str(identity_scope.get("group_id", "")),
-                "identity_key": principal.sender_key,
-                "is_owner": principal.is_owner,
-                "conversation_mode": capability_policy.conversation_mode,
-                "scope_key": scope_key,
-                "target_sequence": 0,
-                "history_source": "typed_assembled",
-                "expression_ids": [
-                    candidate.material_id for candidate in retrieval.candidates
-                ],
-                "learning_context": learning_context,
-                "reply_shape": composer_request.reply_shape,
-                "chat_max_bubbles": composer_request.max_bubbles,
-                "action_kind": planned_action.kind.value,
-            },
-        )
-        record_pipeline_stage(
-            event,
-            "action",
-            **planned_action.trace_metadata(),
-        )
-        record_pipeline_stage(
-            event,
-            "content_intent",
-            **content_seed.trace_metadata(),
-        )
-        record_pipeline_stage(
-            event,
-            "expression_intent",
-            **expression_intent.trace_metadata(),
-        )
-        record_pipeline_stage(
-            event,
-            "plan",
-            target_model="typed_action_content_renderer",
-            has_target_message_id=True,
-            target_actionable=True,
-            has_reference_context=assembled.reference is not None,
-            reference_sender_verified=bool(
-                assembled.reference is not None and assembled.reference.sender_key
-            ),
-            fact_model="typed_grounding",
-            fact_count=len(validation_context.grounding_facts),
-            expression_count=len(retrieval.candidates),
-            reply_shape=composer_request.reply_shape,
-            use_allowed_tools=False,
-            planner_provider_candidate_count=0,
-            allowed_tool_count=0,
-            planner_call_count=0,
-            planner_failure_count=0,
-            v2_plan_status="typed_action_planner",
-            v2_plan_fact_model="typed_grounding",
-            v2_plan_fact_count=len(validation_context.grounding_facts),
-            v2_plan_replan_required=False,
-            v2_plan_rejection_code="",
-            final_generation_budget=composer_request.call_budget.total_model_calls,
-        )
-        structured_log(
-            logger,
-            "info",
-            "typed_reply.prepared",
-            trace_id=get_trace_id(event),
-            source_kind=envelope.source_kind,
-            subject_digest=diagnostic_digest(principal.sender_key),
-            target_digest=diagnostic_digest(target.message_id),
-            action_kind=planned_action.kind.value,
-            context_record_count=composer_request.context_record_count,
-            provider_context_count=len(composer_request.model_messages),
-            grounding_fact_count=composer_request.grounding_fact_count,
-            expression_count=composer_request.candidate_count,
-            planner_call_count=0,
-            final_generation_budget=1,
-            manager_presentation_active=manager_presentation_active,
-            manager_presentation_tool=bool(
-                manager_presentation_mode == "semantic_tool"
-                and manager_tool is not None
-            ),
-            manager_presentation_mode=manager_presentation_mode or "unavailable",
-            manager_prompt_captured=bool(manager_prompt),
-            primary_provider_owner="astrbot_default_request",
-            primary_provider_digest=diagnostic_digest(
-                str(
-                    getattr(req, "provider_id", "")
-                    or getattr(req, "model", "")
-                    or "astrbot_default_request"
-                )
-            ),
-        )
+            return persisted is not self._KV_UNAVAILABLE
+        try:
+            if not await put(pending):
+                self._natural_ready[scope] = False
+                logger.warning("Shio natural cadence scope is unavailable after pending KV write failure")
+                return False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._natural_ready[scope] = False
+            logger.warning("Shio natural cadence scope is unavailable after KV write failure")
+            return False
+        if (
+            getattr(self, "_natural_terminated", False)
+            or generation != self._natural_generations.get(scope, 0)
+        ):
+            return False
+        committed = NaturalCadenceRecord(scope, state, transaction, "committed")
+        try:
+            if not await put(committed):
+                self._natural_ready[scope] = False
+                logger.warning("Shio natural cadence scope is unavailable after committed KV write failure")
+                return False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._natural_ready[scope] = False
+            logger.warning("Shio natural cadence scope is unavailable after KV write failure")
+            return False
+        if (
+            getattr(self, "_natural_terminated", False)
+            or generation != self._natural_generations.get(scope, 0)
+        ):
+            # A terminating instance must not publish a local success after a
+            # late KV completion.  Graceful terminate waits these scope locks
+            # before a reload may restore state.
+            return False
+        self._natural_cadence[scope] = state
+        self._natural_bindings[scope] = committed
+        self._natural_ready[scope] = True
         return True
 
-    @filter.on_llm_request(priority=-sys.maxsize)
-    async def enforce_agent_permission(
-        self,
-        event: AstrMessageEvent,
-        req: ProviderRequest,
-    ) -> None:
-        """内置权限守卫：主人保留全部工具，普通用户只保留精确白名单。"""
-        event.set_extra(SHIO_EFFECTIVE_TOOL_NAMES, ())
-        if not bool(self._config("permission_guard_enabled", True)):
-            return
-
-        ensure_turn_envelope(event)
-        sender_id, _ = self._effective_sender(event)
-        principal = self._effective_principal(event)
-        is_owner = principal.is_owner
-        identity_scope = self._identity_scope(event, sender_id)
-        event.set_extra(SHIO_IDENTITY_SCOPE, identity_scope)
-        configured_allowed = set(self._guest_allowed_tool_names())
-        available_tools = self._available_tools(req.func_tool)
-        manager_tool = (
-            next(
-                (
-                    tool
-                    for tool in available_tools
-                    if str(getattr(tool, "name", "") or "") == "search_memes"
-                ),
-                None,
-            )
+    async def _record_natural_no_action(
+        self, event: AstrMessageEvent, snapshot: TurnSnapshot
+    ) -> bool:
+        """Persist D-056 NO_ACTION backoff before releasing this text batch."""
+        candidate = event.get_extra("shio.sys001.natural_candidate")
+        base_generation = event.get_extra("shio.sys001.natural_candidate_base_generation")
+        if (
+            not isinstance(candidate, int)
+            or isinstance(candidate, bool)
+            or not isinstance(base_generation, int)
+            or isinstance(base_generation, bool)
+        ):
+            return False
+        async with self._natural_lock(snapshot.scope):
+            generation = self._natural_generations.get(snapshot.scope, 0)
             if (
-                bool(event.get_extra("meme_manager_semantic_active", False))
-                and str(event.get_extra("meme_manager_semantic_mode", "")) == "tool"
-            )
-            else None
-        )
-        capability_tools = [
-            tool for tool in available_tools if tool is not manager_tool
-        ]
-        active_policy = (
-            build_owner_capability_policy(
-                principal,
-                conversation_mode="direct_reply",
-            )
-            if is_owner
-            else build_guest_capability_policy(
-                principal,
-                configured_tool_names=configured_allowed,
-                conversation_mode="direct_reply",
-            )
-        )
-        allowed_tools = [
-            tool
-            for tool in capability_tools
-            if decide_tool(active_policy, classify_tool(tool)).allowed
-        ]
-        allowed_tool_names = [str(getattr(tool, "name", "")) for tool in allowed_tools]
-        if not sender_id:
-            allowed_tools = []
-            allowed_tool_names = []
-            manager_tool = None
-        event.set_extra(
-            SHIO_EFFECTIVE_TOOL_NAMES,
-            tuple(
-                dict.fromkeys(
-                    name for name in allowed_tool_names if str(name or "").strip()
-                )
-            ),
-        )
-        event.set_extra(
-            SHIO_CAPABILITY_POLICY,
-            self._capability_policy_metadata(
-                policy=active_policy,
-                available_tools=capability_tools,
-            ),
-        )
-
-        allowed_name_set = set(allowed_tool_names)
-        removed_tool_names = [
-            name
-            for name in self._get_tool_names(req.func_tool)
-            if name not in allowed_name_set
-            and not (manager_tool is not None and name == "search_memes")
-        ]
-        req.func_tool = ToolSet(
-            allowed_tools + ([manager_tool] if manager_tool is not None else [])
-        )
-
-        if bool(self._config("inject_verified_context", True)):
-            access_mode = (
-                "owner_entitled_typed_actions"
-                if is_owner
-                else ("limited_read_only" if allowed_tool_names else "chat_only")
-            )
-            verified_values = {
-                "source": "shio",
-                "platform_id": identity_scope["platform_id"],
-                "bot_id": identity_scope["bot_id"] or "unknown",
-                "chat_type": identity_scope["chat_type"],
-                "group_id": identity_scope["group_id"] or "private",
-                "sender_id": sender_id or "unknown",
-                "identity_key": identity_scope["identity_key"],
-                "owner": "true" if is_owner else "false",
-                "mode": access_mode,
-            }
-            if isinstance(event.get_extra(SHIO_NATURAL_WAKE, None), dict):
-                verified_values["wake_reason"] = "natural_name"
-            if allowed_tool_names and not is_owner:
-                verified_values["allowed_tools"] = ",".join(allowed_tool_names)
-                verified_values["external_writes"] = "disabled"
-            elif not is_owner:
-                verified_values["tools"] = "disabled"
-                verified_values["external_actions"] = "disabled"
-            context_text = (
-                "<verified_access_control "
-                + self._xml_attrs(verified_values)
-                + " />"
-            )
-            parts = req.extra_user_content_parts
-            if not isinstance(parts, list):
-                parts = []
-                req.extra_user_content_parts = parts
-            parts.append(TextPart(text=context_text).mark_as_temp())
-
-        if (
-            not is_owner
-            and removed_tool_names
-            and bool(self._config("permission_audit_log", True))
-        ):
-            structured_log(
-                logger,
-                "info",
-                "capability.blocked",
-                group_digest=diagnostic_digest(identity_scope["group_id"]),
-                subject_digest=diagnostic_digest(sender_id),
-                blocked_tool_count=len(removed_tool_names),
-            )
-
-    # 内置权限守卫先裁决，角色回复链随后清理后台注入并构造纯聊天请求。
-    # 内置权限守卫先裁决，角色回复链随后构造唯一的 typed Composer 请求。
-    @filter.on_llm_request(priority=-sys.maxsize - 100)
-    async def build_persona_reply(
-        self,
-        event: AstrMessageEvent,
-        req: ProviderRequest,
-    ) -> None:
-        """接管启用状态下的所有角色聊天；失败时闭锁，绝不回退旧链。"""
-        if not bool(self._config("enabled", True)):
-            return
-
-        admission = self.admit_ingress_event(event)
-        if (
-            not isinstance(admission, AdmissionResult)
-            or not admission.decision.allows_state_mutation
-        ):
-            self._set_inactive(event)
-            self._block_typed_turn(
-                event,
-                req,
-                reason_code="ingress_not_admitted",
-            )
-            return
-
-        await self._resolve_participation_semantic(event)
-
-        # AstrBot's internal tool loop does not re-enter this hook.  A value
-        # arriving here is therefore legacy/unbound input, never evidence for
-        # the current action.  Drop it and build the current turn from the
-        # admitted event; the sealed acquisition path below owns all results.
-        manager_tool, manager_prompt, manager_presentation_mode = (
-            self._capture_meme_manager_tool_prompt(
-            event,
-            req,
-            )
-        )
-        req.tool_calls_result = None
-        self._set_inactive(event)
-        event.set_extra(SHIO_MEME_MANAGER_TOOL, manager_tool)
-        event.set_extra(SHIO_MEME_MANAGER_PROMPT, manager_prompt)
-        event.set_extra(
-            SHIO_MEME_MANAGER_PRESENTATION_MODE,
-            manager_presentation_mode,
-        )
-        sender_id, sender_name = self._effective_sender(event)
-        turn_envelope = ensure_turn_envelope(event)
-        generation_snapshot = event_generation_snapshot(event)
-        if (
-            generation_snapshot is None
-            or generation_snapshot.epoch
-            != admission.decision.binding.generation_epoch
-            or generation_snapshot.scope_key != turn_envelope.scope_key
-        ):
-            self._block_typed_turn(
-                event,
-                req,
-                reason_code="generation_epoch_unbound",
-            )
-            return
-
-        wake_metadata = event.get_extra(SHIO_NATURAL_WAKE, None)
-        wake_reason = (
-            str(wake_metadata.get("reason", "") or "").strip()
-            if isinstance(wake_metadata, dict)
-            else ""
-        )
-        conversation_mode = (
-            "group_join"
-            if turn_envelope.chat_type == "group"
-            and wake_reason
-            in {"participation_may_join", "participation_react_only"}
-            else "direct_reply"
-        )
-        principal = self._effective_principal(event)
-        identity_scope = event.get_extra(SHIO_IDENTITY_SCOPE, None)
-        if not isinstance(identity_scope, dict):
-            identity_scope = self._identity_scope(event, sender_id)
-        admitted_current_message = self._canonical_event_message(event)
-        current_message = admitted_current_message
-
-        reply_target = ensure_direct_reply_target(event, turn_envelope, current_message)
-        reference_context = ensure_reference_context(event, turn_envelope)
-        admitted_event = event.get_extra(SHIO_CONVERSATION_EVENT, None)
-        if not isinstance(admitted_event, ConversationEvent):
-            self._block_typed_turn(
-                event,
-                req,
-                reason_code="conversation_event_unavailable",
-            )
-            return
-        start_pipeline_trace(
-            event,
-            current_message=current_message,
-            sender_id=sender_id,
-            group_id=str(identity_scope.get("group_id", "")),
-            chat_type=str(identity_scope.get("chat_type", "private")),
-            is_owner=principal.is_owner,
-            envelope_metadata=turn_envelope.trace_metadata(),
-            trace_id=admitted_event.binding.trace_id,
-        )
-        affect_state_mutation = event.get_extra(
-            SHIO_AFFECT_STATE_MUTATION,
-            None,
-        )
-        if (
-            not isinstance(affect_state_mutation, AffectMutationResult)
-            or affect_state_mutation.status
-            is not AffectMutationStatus.ACCEPTED_HUMAN
-            or affect_state_mutation.state is None
-            or affect_state_mutation.state.conversation_revision
-            != admitted_event.binding.conversation_revision
-        ):
-            self._block_typed_turn(
-                event,
-                req,
-                reason_code="affect_state_unbound",
-            )
-            return
-        record_pipeline_stage(
-            event,
-            "affect_state_ingress",
-            **affect_state_mutation.trace_metadata(),
-        )
-        record_pipeline_stage(
-            event,
-            "target",
-            has_target=reply_target is not None,
-            target_actionable=bool(reply_target is not None and reply_target.is_actionable),
-            has_target_message_id=bool(reply_target is not None and reply_target.message_id),
-            has_target_sender_key=bool(reply_target is not None and reply_target.sender_key),
-            target_degradation_count=(
-                len(reply_target.degradation_reasons)
-                if reply_target is not None
-                else 1
-            ),
-            target_message_digest=diagnostic_digest(
-                reply_target.message_id if reply_target is not None else ""
-            ),
-            target_subject_digest=diagnostic_digest(
-                reply_target.sender_key if reply_target is not None else ""
-            ),
-        )
-        if turn_envelope.chat_type == "group":
-            scene_mutation = event.get_extra(SHIO_GROUP_SCENE_MUTATION, None)
-            if (
-                not isinstance(scene_mutation, SceneMutationResult)
-                or scene_mutation.status
-                is not SceneMutationStatus.ACCEPTED_HUMAN
-                or scene_mutation.snapshot.scope_key
-                != admitted_event.binding.scope_key
-                or scene_mutation.snapshot.conversation_revision
-                != admitted_event.binding.conversation_revision
+                getattr(self, "_natural_terminated", False)
+                or not self._natural_ready.get(snapshot.scope, False)
+                or candidate not in self._natural_candidate_map(snapshot.scope)
+                or base_generation != generation
             ):
-                self._block_typed_turn(
-                    event,
-                    req,
-                    reason_code="group_scene_unbound",
-                )
-                return
+                return False
+            _cooldown, window_seconds, _maximum, backoff_base, backoff_maximum = (
+                self._natural_cadence_settings()
+            )
+            current = prune_natural_cadence(
+                self._natural_cadence.get(snapshot.scope, NaturalCadence.empty()),
+                now=time.time(),
+                window_seconds=window_seconds,
+            )
+            return await self._persist_natural_state(
+                scope=snapshot.scope,
+                state=natural_no_action(
+                    current,
+                    now=time.time(),
+                    base=backoff_base,
+                    maximum=backoff_maximum,
+                ),
+                generation=generation,
+                message_id=snapshot.message_id,
+            )
+
+    def _snapshot(self, event: AstrMessageEvent, origin: str) -> TurnSnapshot:
+        snapshot = create_snapshot(event, origin=origin)
+        generation: int | None = None
+        if origin == "natural":
+            candidates = self._natural_candidate_map(snapshot.scope)
+            sequences = getattr(self, "_natural_candidate_sequences", None)
+            if not isinstance(sequences, dict):
+                sequences = {}
+                self._natural_candidate_sequences = sequences
+            sequence = sequences.get(snapshot.scope, 0) + 1
+            sequences[snapshot.scope] = sequence
+            active_generation = self._natural_generations.get(snapshot.scope, 0)
+            candidates[sequence] = active_generation
+            event.set_extra("shio.sys001.natural_candidate", sequence)
             event.set_extra(
-                SHIO_GROUP_SCENE_SNAPSHOT,
-                scene_mutation.snapshot,
-            )
-            record_pipeline_stage(
-                event,
-                "scene_ingress",
-                **scene_mutation.trace_metadata(),
-            )
-        address_decision = event.get_extra(SHIO_ADDRESS_DECISION, None)
-        if (
-            not isinstance(address_decision, AddressDecision)
-            or address_decision.binding != admitted_event.binding
-        ):
-            self._block_typed_turn(
-                event,
-                req,
-                reason_code="address_unbound",
-            )
-            return
-        record_pipeline_stage(
-            event,
-            "address",
-            **address_decision.trace_metadata(),
-        )
-        get_messages = getattr(event, "get_messages", None)
-        try:
-            message_chain = list(get_messages() or ()) if callable(get_messages) else ()
-            media_adaptation = adapt_astrbot_media(
-                binding=admitted_event.binding,
-                provider_request=req,
-                message_chain=message_chain,
-                sender_key_resolver=(
-                    lambda value: build_sender_key(
-                        admitted_event.binding.scope_key,
-                        value,
-                    )
-                ),
-            )
-        except Exception as exc:
-            structured_log(
-                logger,
-                "warning",
-                "media.adaptation_failed",
-                trace_id=get_trace_id(event),
-                failure_kind=safe_exception_kind(exc),
-            )
-            self._block_typed_turn(
-                event,
-                req,
-                reason_code="media_context_invalid",
-            )
-            return
-        event.set_extra(SHIO_MEDIA_ADAPTATION, media_adaptation)
-        record_pipeline_stage(
-            event,
-            "media",
-            **media_adaptation.trace_metadata(),
-        )
-        try:
-            current_question_anchor = build_current_question_anchor(
-                admitted_event.binding,
-                admitted_current_message,
-                media_item_ids=tuple(
-                    item.item_id for item in media_adaptation.context.items
-                ),
-            )
-        except Exception as exc:
-            structured_log(
-                logger,
-                "error",
-                "current_anchor.build_failed",
-                trace_id=get_trace_id(event),
-                failure_kind=safe_exception_kind(exc),
-            )
-            self._block_typed_turn(
-                event,
-                req,
-                reason_code="current_question_anchor_invalid",
-            )
-            return
-        event.set_extra(
-            SHIO_CURRENT_QUESTION_ANCHOR,
-            current_question_anchor,
-        )
-        record_pipeline_stage(
-            event,
-            "current_anchor",
-            **current_question_anchor.trace_metadata(),
-        )
-
-        try:
-            memory_result = await self._ensure_memory_policy_result(
-                event=event,
-                request=req,
-                admission=admission,
-                conversation_event=admitted_event,
-            )
-        except Exception as exc:
-            structured_log(
-                logger,
-                "error",
-                "memory.policy_failed",
-                trace_id=get_trace_id(event),
-                failure_kind=safe_exception_kind(exc),
-            )
-            self._block_typed_turn(
-                event,
-                req,
-                reason_code="memory_policy_invalid",
-            )
-            return
-        reader_evidence = event.get_extra(SHIO_MEMORY_READER_EVIDENCE, {})
-        if not isinstance(reader_evidence, dict):
-            reader_evidence = {}
-        record_pipeline_stage(
-            event,
-            "memory_policy",
-            **memory_result.trace_metadata(),
-            **reader_evidence,
-        )
-
-        max_messages = max(2, int(self._config("max_context_messages", 16)))
-        max_context_chars = max(1000, int(self._config("max_context_chars", 9000)))
-        clean_history, history_source = await self._identity_aware_history(
-            event,
-            req.contexts,
-            current_message,
-            sender_id,
-            str(identity_scope.get("group_id", "")),
-            max_messages,
-            max_context_chars,
-        )
-        scope_key = str(
-            identity_scope.get("scope_key", "")
-            or self.runtime.group_scope(
-                str(identity_scope.get("platform_id", "")),
-                str(identity_scope.get("bot_id", "")),
-                str(identity_scope.get("group_id", "")),
-            )
-        )
-        context_metadata = self._build_typed_context(
-            event=event,
-            envelope=turn_envelope,
-            principal=principal,
-            reply_target=reply_target,
-            reference_context=reference_context,
-            current_message=current_message,
-            scope_key=scope_key,
-            identity_scope=identity_scope,
-        )
-        assembled_context = event.get_extra(SHIO_ASSEMBLED_CONTEXT_V2, None)
-        prior_group_join_records = (
-            tuple(
-                record
-                for record in (
-                    *assembled_context.replyer_thread,
-                    *assembled_context.public_background,
-                )
-                if not (
-                    record.role is LedgerRole.USER
-                    and record.message_id
-                    and record.message_id == reply_target.message_id
-                )
-            )
-            if isinstance(assembled_context, AssembledContext)
-            else ()
-        )
-        if conversation_mode == "group_join" and (
-            not isinstance(assembled_context, AssembledContext)
-            or not has_verified_public_group_context(prior_group_join_records)
-        ):
-            structured_log(
-                logger,
-                "info",
-                "participation.context_unavailable",
-                trace_id=get_trace_id(event),
-                conversation_mode=conversation_mode,
-                verified_public_context_count=0,
-            )
-            self._block_typed_turn(
-                event,
-                req,
-                reason_code="participation_verified_context_unavailable",
-            )
-            return
-        replyer_history = (
-            assembled_context.replyer_thread
-            if isinstance(assembled_context, AssembledContext)
-            else ()
-        )
-        recent_replies = [
-            record.content
-            for record in replyer_history
-            if record.role is LedgerRole.ASSISTANT and record.content
-        ][-6:]
-
-        turn_gate = self._typed_turn_gate(
-            envelope=turn_envelope,
-            principal=principal,
-        )
-        persona_package = self._configured_persona_package()
-        if not turn_gate.activation_ready:
-            self._block_typed_turn(
-                event,
-                req,
-                reason_code=turn_gate.reason_codes[0]
-                if turn_gate.reason_codes
-                else "typed_identity_denied",
-            )
-            return
-        if persona_package is None:
-            self._block_typed_turn(
-                event,
-                req,
-                reason_code="persona_package_unavailable",
-            )
-            return
-
-        active_capability_policy = (
-            build_owner_capability_policy(
-                principal,
-                conversation_mode=conversation_mode,
-            )
-            if principal.is_owner
-            else build_guest_capability_policy(
-                principal,
-                configured_tool_names=self._guest_allowed_tool_names(),
-                conversation_mode=conversation_mode,
-            )
-        )
-        opportunity_attention = event.get_extra(
-            SHIO_OPPORTUNITY_ATTENTION,
-            None,
-        )
-        participation_assessment = event.get_extra(
-            SHIO_PARTICIPATION_ASSESSMENT,
-            None,
-        )
-        participation_cadence = event.get_extra(
-            SHIO_PARTICIPATION_CADENCE,
-            None,
-        )
-        participation_reaction = event.get_extra(
-            SHIO_PARTICIPATION_REACTION,
-            None,
-        )
-        try:
-            if not isinstance(opportunity_attention, OpportunityAttentionDecision):
-                raise RuntimeError("opportunity_attention_unavailable")
-            if type(participation_assessment) is not ParticipationAssessment:
-                raise RuntimeError("participation_assessment_unavailable")
-            self.participation_authority.inspect(participation_assessment)
-            if type(participation_cadence) is not ParticipationCadenceDecision:
-                raise RuntimeError("participation_cadence_unavailable")
-            self.participation_cadence_authority.inspect(participation_cadence)
-            if type(participation_reaction) is not ParticipationReactionDecision:
-                raise RuntimeError("participation_reaction_unavailable")
-            self.participation_reaction_authority.inspect(participation_reaction)
-            if (
-                participation_assessment.opportunity is not opportunity_attention
-                or participation_assessment.binding is not admission.decision.binding
-                or participation_cadence.base is not participation_assessment
-                or participation_cadence.binding is not admission.decision.binding
-                or participation_reaction.base is not participation_cadence
-                or participation_reaction.binding is not admission.decision.binding
-                or participation_assessment.persona_package_id
-                != persona_package.package_id
-            ):
-                raise RuntimeError("participation_assessment_binding_mismatch")
-        except Exception as exc:
-            structured_log(
-                logger,
-                "error",
-                "attention.inspect_failed",
-                trace_id=get_trace_id(event),
-                failure_kind=safe_exception_kind(exc),
-            )
-            self._block_typed_turn(
-                event,
-                req,
-                reason_code="opportunity_attention_unbound",
-            )
-            return
-        attention = participation_assessment.attention
-        participation = participation_reaction.decision
-        try:
-            content_seed = build_content_intent_seed(
-                anchor=current_question_anchor,
-                reply_target=reply_target,
-                memory_result=memory_result,
-                media_context=media_adaptation.context,
-            )
-            knowledge_gap = (
-                KnowledgeGapDecision(
-                    binding=content_seed.binding,
-                    need=KnowledgeNeed.NONE,
-                    requires_evidence=False,
-                    requested_capability=None,
-                    max_tool_calls=0,
-                    reason_codes=("participation_react_only_zero_tool",),
-                )
-                if participation.level is ParticipationLevel.REACT_ONLY
-                else decide_knowledge_gap(
-                    content_seed=content_seed,
-                    current_message=current_message,
-                )
-            )
-            owner_action_ticket = event.get_extra(
-                SHIO_OWNER_ACTION_TICKET,
-                None,
-            )
-            owner_action_route = event.get_extra(
-                SHIO_OWNER_ACTION_ROUTE,
-                None,
-            )
-            owner_action_matched = bool(
-                isinstance(owner_action_route, OwnerActionRouteDecision)
-                and owner_action_route.status is OwnerActionRouteStatus.MATCHED
-            )
-            planned_action = plan_action(
-                ingress=admission.decision,
-                address=address_decision,
-                attention=attention,
-                participation=participation,
-                reply_target=reply_target,
-                knowledge_gap=knowledge_gap,
-                capability_policy=active_capability_policy,
-                owner_action_router=(
-                    self.owner_action_router if owner_action_matched else None
-                ),
-                owner_action_ticket=(
-                    owner_action_ticket if owner_action_matched else None
-                ),
-                owner_action_route=(
-                    owner_action_route if owner_action_matched else None
-                ),
-                planned_action_authority=self.planned_action_authority,
-                now=time.monotonic(),
-            )
-        except Exception as exc:
-            structured_log(
-                logger,
-                "error",
-                "typed_action.prepare_failed",
-                trace_id=get_trace_id(event),
-                failure_kind=safe_exception_kind(exc),
-            )
-            self._block_typed_turn(
-                event,
-                req,
-                reason_code="typed_action_invalid",
-            )
-            return
-
-        runtime_decision = self._typed_runtime_decision(
-            event,
-            envelope=turn_envelope,
-            principal=principal,
-            turn_ready=True,
-            planned_action=planned_action,
-            refresh=True,
-            turn_status=planned_action.kind.value,
-            turn_reason_count=len(planned_action.planner_reason_codes),
-        )
-        capability_metadata = event.get_extra(SHIO_CAPABILITY_POLICY, {})
-        if not isinstance(capability_metadata, dict):
-            capability_metadata = {}
-        record_pipeline_stage(
-            event,
-            "context",
-            planner_message_count=len(clean_history),
-            replyer_message_count=len(replyer_history),
-            history_source=history_source,
-            memory_subject_model="typed_provenance",
-            **context_metadata,
-            **capability_metadata,
-        )
-        record_pipeline_stage(
-            event,
-            "attention",
-            **opportunity_attention.trace_metadata(),
-            **attention.trace_metadata(),
-        )
-        record_pipeline_stage(
-            event,
-            "participation",
-            **participation_assessment.trace_metadata(),
-            **{
-                key: value
-                for key, value in participation_cadence.trace_metadata().items()
-                if key != "schema_version"
-            },
-            **{
-                key: value
-                for key, value in participation_reaction.trace_metadata().items()
-                if key != "schema_version"
-            },
-        )
-        record_pipeline_stage(
-            event,
-            "knowledge_gap",
-            **knowledge_gap.trace_metadata(),
-        )
-        event.set_extra(SHIO_PLANNED_ACTION, planned_action)
-        event.set_extra(SHIO_CONTENT_INTENT, content_seed.intent)
-
-        if planned_action.kind is ActionKind.EXECUTE_ACTION:
-            try:
-                content_seed = self._prepare_disabled_owner_action_outcome(
-                    event=event,
-                    planned_action=planned_action,
-                    content_seed=content_seed,
-                )
-                event.set_extra(SHIO_CONTENT_INTENT, content_seed.intent)
-            except Exception as exc:
-                structured_log(
-                    logger,
-                    "error",
-                    "owner_action.denial_prepare_failed",
-                    trace_id=get_trace_id(event),
-                    failure_kind=safe_exception_kind(exc),
-                )
-                self._block_typed_turn(
-                    event,
-                    req,
-                    reason_code="owner_action_denial_unavailable",
-                )
-                return
-
-        if planned_action.kind is ActionKind.REACT:
-            reaction_target = planned_action.action.reply_target
-            if reaction_target is None:
-                self._block_typed_turn(
-                    event,
-                    req,
-                    reason_code="reaction_target_unavailable",
-                )
-                return
-            expression_intent = self.expression_intent_authority.issue(
-                planned_action_authority=self.planned_action_authority,
-                planned_action=planned_action,
-                modality=ExpressionModality.REACTION,
-                social_act=planned_action.action.expression_intent,
-                emotion_tags=(),
-                current_message=current_message,
-                relationship_distance=trusted_relationship_distance(
-                    principal,
-                    conversation_mode,
-                ),
-                max_bubbles=0,
-                reason_codes=("participation_react_only",),
-            )
-            event.set_extra(SHIO_EXPRESSION_INTENT, expression_intent)
-            await self._execute_react_presentation(
-                event=event,
-                planned_action=planned_action,
-                expression_intent=expression_intent,
-            )
-
-        if planned_action.kind in {
-            ActionKind.NO_ACTION,
-            ActionKind.WAIT,
-            ActionKind.REACT,
-        }:
-            req.system_prompt = ""
-            req.contexts = []
-            req.prompt = ""
-            req.extra_user_content_parts = []
-            req.image_urls = []
-            req.audio_urls = []
-            req.func_tool = ToolSet([])
-            req.tool_calls_result = None
-            event.set_extra(SHIO_TYPED_PIPELINE_ACTIVE, True)
-            event.set_extra(
-                SHIO_PAYLOAD,
-                {
-                    "typed_pipeline_active": True,
-                    "action_kind": planned_action.kind.value,
-                    "scope_key": scope_key,
-                    "identity_key": principal.sender_key,
-                },
-            )
-            event.set_extra(SHIO_ACTIVE, False)
-            record_pipeline_stage(
-                event,
-                "action",
-                **planned_action.trace_metadata(),
-                terminal_without_text=True,
-            )
-            stop = getattr(event, "stop_event", None)
-            if callable(stop):
-                stop()
-            return
-
-        evidence_outcome: EvidenceOutcome | None = None
-        if planned_action.kind is ActionKind.USE_TOOL:
-            acquisition_clock = time.monotonic()
-            runtime_tools = self._available_tools(req.func_tool)
-            configured_names = (
-                tuple(self._guest_allowed_tool_names())
-                if conversation_mode == "group_join"
-                else tuple(
-                    str(getattr(tool, "name", "") or "").strip()
-                    for tool in runtime_tools
-                    if str(getattr(tool, "name", "") or "").strip()
-                )
-                if principal.is_owner
-                else tuple(self._guest_allowed_tool_names())
-            )
-            url_match = re.search(
-                r"https?://[^\s<>'\"，。；;]+",
-                current_message,
-                re.IGNORECASE,
-            )
-            try:
-                request_shape = (
-                    build_knowledge_base_request_shape(
-                        admitted_event.binding,
-                        query=current_message,
-                    )
-                    if knowledge_gap.requested_capability
-                    is CapabilityClass.CHAT_RETRIEVAL
-                    else build_extract_request_shape(
-                        admitted_event.binding,
-                        url=url_match.group(0),
-                    )
-                    if url_match is not None
-                    else build_search_request_shape(
-                        admitted_event.binding,
-                        query=current_message,
-                    )
-                )
-                acquisition_request = broker_tool_request(
-                    planned_action=planned_action,
-                    knowledge_gap=knowledge_gap,
-                    capability_policy=active_capability_policy,
-                    runtime_tools=tuple(classify_tool(tool) for tool in runtime_tools),
-                    configured_tool_names=configured_names,
-                    request_shape=request_shape,
-                    now=acquisition_clock,
-                )
-                event.set_extra(
-                    SHIO_ACQUISITION_REQUEST,
-                    acquisition_request,
-                )
-                sealed_execution = await self.scope_concurrency.run_event(
-                    generation_snapshot,
-                    principal,
-                    kind=ScopeWorkKind.DIRECT,
-                    work_factory=lambda: execute_sealed_acquisition(
-                        request=acquisition_request,
-                        runtime_tools=tuple(runtime_tools),
-                        plugin_context=self.context,
-                        event=event,
-                        clock=time.monotonic,
-                        epoch_current=(
-                            lambda binding: (
-                                binding == admitted_event.binding
-                                and event_epoch_validation(
-                                    event,
-                                    self.generation_epochs,
-                                ).is_current
-                            )
-                        ),
-                    ),
-                )
-                record_pipeline_stage(
-                    event,
-                    "sealed_acquisition",
-                    **sealed_execution.trace_metadata(),
-                )
-                observed_at = time.monotonic()
-                typed_results = (
-                    adapt_tool_call_results(
-                        sealed_execution.batch,
-                        tools=tuple(runtime_tools),
-                        scope_key=admitted_event.binding.scope_key,
-                        target_sender_key=(
-                            admitted_event.binding.current_sender_key
-                        ),
-                        acquisition_request=acquisition_request,
-                        observed_at=observed_at,
-                    )
-                    if (
-                        sealed_execution.succeeded
-                        and sealed_execution.batch is not None
-                        and observed_at <= acquisition_request.selection.deadline
-                        and event_epoch_validation(
-                            event,
-                            self.generation_epochs,
-                        ).is_current
-                    )
-                    else ()
-                )
-                record_pipeline_stage(
-                    event,
-                    "tool_result",
-                    **tool_result_trace_metadata(typed_results),
-                )
-                evidence_outcome = adapt_grounding_evidence(
-                    request=acquisition_request,
-                    results=typed_results,
-                    current_binding=admitted_event.binding,
-                    now=observed_at,
-                )
-            except Exception as exc:
-                structured_log(
-                    logger,
-                    "warning",
-                    "acquisition.prepare_failed",
-                    trace_id=get_trace_id(event),
-                    failure_kind=safe_exception_kind(exc),
-                )
-                evidence_outcome = EvidenceOutcome(
-                    binding=admitted_event.binding,
-                    action_id=planned_action.action_id,
-                    kind=EvidenceOutcomeKind.INVALID_RESULT,
-                    facts=(),
-                    result_count=0,
-                    reason_codes=("acquisition_unavailable",),
-                )
-            event.set_extra(SHIO_EVIDENCE_OUTCOME, evidence_outcome)
-            if (
-                conversation_mode == "group_join"
-                and evidence_outcome.kind is not EvidenceOutcomeKind.ACCEPTED
-            ):
-                self._block_typed_turn(
-                    event,
-                    req,
-                    reason_code="group_join_grounding_unavailable",
-                )
-                return
-            if evidence_outcome.kind is EvidenceOutcomeKind.ACCEPTED:
-                content_seed = attach_grounding_facts(
-                    content_seed,
-                    evidence_outcome.facts,
-                )
-                event.set_extra(SHIO_CONTENT_INTENT, content_seed.intent)
-            record_pipeline_stage(
-                event,
-                "evidence",
-                **evidence_outcome.trace_metadata(),
-            )
-
-        if (
-            runtime_decision.activate_typed_pipeline
-            and await self._activate_planned_reply_request(
-                event=event,
-                req=req,
-                envelope=turn_envelope,
-                principal=principal,
-                identity_scope=identity_scope,
-                current_message=current_message,
-                sender_id=sender_id,
-                sender_name=sender_name,
-                scope_key=scope_key,
-                planned_action=planned_action,
-                content_seed=content_seed,
-                capability_policy=active_capability_policy,
-                persona_package=persona_package,
-                recent_replies=recent_replies,
-                evidence_outcome=evidence_outcome,
-                generation_snapshot=generation_snapshot,
-            )
-        ):
-            try:
-                composer_request = event.get_extra(SHIO_REPLY_COMPOSER_REQUEST, None)
-                if not isinstance(composer_request, ReplyComposerRequest):
-                    raise RuntimeError("semantic risk request unavailable")
-                risk_binding = event.get_extra(SHIO_SEMANTIC_RISK_DECISION, None)
-                if (
-                    type(risk_binding) is not tuple
-                    or len(risk_binding) != 2
-                    or risk_binding[0] is not composer_request.semantic_risk_decision
-                    or risk_binding[1]
-                    != self._semantic_risk_snapshot(composer_request)
-                ):
-                    self._set_inactive(event)
-                    self._block_typed_turn(
-                        event,
-                        req,
-                        reason_code="semantic_risk_binding_missing",
-                    )
-                    return
-                permit = await self.inference_budget.acquire_event(
-                    generation_snapshot,
-                    principal,
-                    planned_action,
-                    purpose=InferencePurpose.PRIMARY,
-                )
-            except InferenceBudgetError as exc:
-                self._set_inactive(event)
-                self._block_typed_turn(
-                    event,
-                    req,
-                    reason_code="inference_budget_unavailable",
-                )
-                structured_log(
-                    logger,
-                    "warning",
-                    "typed_reply.inference_budget_rejected",
-                    trace_id=get_trace_id(event),
-                    failure_kind=safe_exception_kind(exc),
-                )
-                return
-            event.set_extra(SHIO_INFERENCE_PERMIT, permit)
-            trace_context = get_trace_context(event)
-            if trace_context is not None:
-                self.performance_window.observe_latency(
-                    LatencyKind.LOCAL_ORCHESTRATION,
-                    float((time.perf_counter() - trace_context.started_at) * 1000.0),
-                )
-            self._observe_inference_permit(permit)
-            self.performance_window.record_model_call(ModelCallKind.PRIMARY)
-            event.set_extra(
-                SHIO_PRIMARY_PROVIDER_STARTED_AT,
-                float(time.perf_counter()),
-            )
-            record_pipeline_stage(
-                event,
-                "inference_budget",
-                **permit.trace_metadata(),
-            )
-            return
-
-        self._block_typed_turn(
-            event,
-            req,
-            reason_code="typed_prepare_failed",
-        )
-        return
-
-    async def _guard_typed_reply(
-        self,
-        event: AstrMessageEvent,
-        response: LLMResponse,
-        payload: dict[str, Any],
-    ) -> None:
-        """Validate one typed Composer result and allow at most one repair call."""
-
-        self.semantic_guard_controller.discard(
-            event.get_extra(SHIO_SEMANTIC_VALIDATION_SEAL, None)
-        )
-        event.set_extra(SHIO_SEMANTIC_VALIDATION_SEAL, None)
-        event.set_extra(SHIO_PRESENTATION_HANDOFF, None)
-        composer_request = event.get_extra(SHIO_REPLY_COMPOSER_REQUEST, None)
-        validation_context = event.get_extra(SHIO_OUTPUT_VALIDATION_CONTEXT, None)
-        semantic_contract = event.get_extra(SHIO_SEMANTIC_GUARD_CONTRACT, None)
-        planned_action = event.get_extra(SHIO_PLANNED_ACTION, None)
-        content_intent = event.get_extra(SHIO_CONTENT_INTENT, None)
-        expression_intent = event.get_extra(SHIO_EXPRESSION_INTENT, None)
-        affect_appraisal = event.get_extra(SHIO_AFFECT_APPRAISAL, None)
-        persona_expression = event.get_extra(SHIO_PERSONA_EXPRESSION, None)
-        capability_policy = event.get_extra(SHIO_ACTIVE_CAPABILITY_POLICY, None)
-        media_adaptation = event.get_extra(SHIO_MEDIA_ADAPTATION, None)
-        risk_binding = event.get_extra(SHIO_SEMANTIC_RISK_DECISION, None)
-        if (
-            not isinstance(composer_request, ReplyComposerRequest)
-            or not isinstance(validation_context, OutputValidationContext)
-            or not isinstance(semantic_contract, SemanticGuardContract)
-            or not isinstance(planned_action, PlannedAction)
-            or not isinstance(content_intent, ContentIntent)
-            or not isinstance(expression_intent, ExpressionIntent)
-            or not isinstance(affect_appraisal, AffectAppraisal)
-            or not isinstance(persona_expression, PersonaExpressionPlan)
-            or not isinstance(media_adaptation, AstrBotMediaAdaptation)
-            or capability_policy is None
-            or content_intent.binding != planned_action.binding
-            or expression_intent.binding != planned_action.binding
-            or composer_request.action_id != planned_action.action_id
-            or validation_context.semantic_contract is not semantic_contract
-            or semantic_contract.planned_action is not planned_action
-            or semantic_contract.content_intent is not content_intent
-            or semantic_contract.current_question_anchor
-            is not composer_request.current_question_anchor
-            or semantic_contract.media_context is not media_adaptation.context
-            or semantic_contract.evidence_outcome
-            is not event.get_extra(SHIO_EVIDENCE_OUTCOME, None)
-            or type(risk_binding) is not tuple
-            or len(risk_binding) != 2
-            or type(risk_binding[0]) is not SemanticRiskDecision
-            or risk_binding[0] is SemanticRiskDecision.UNCERTAIN
-            or risk_binding[0] is not composer_request.semantic_risk_decision
-            or (
-                risk_binding[0] is SemanticRiskDecision.ATTRIBUTION_REQUIRED
-                and composer_request.attribution_risk is AttributionRisk.NONE
-            )
-            or (
-                risk_binding[0] is SemanticRiskDecision.NONE
-                and composer_request.attribution_risk is not AttributionRisk.NONE
-            )
-            or risk_binding[1] != self._semantic_risk_snapshot(composer_request)
-        ):
-            response.role = "assistant"
-            response.completion_text = ""
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            structured_log(
-                logger,
-                "error",
-                "typed_reply.state_missing",
-                trace_id=get_trace_id(event),
-            )
-            return
-
-        initial_raw_output = str(response.completion_text or "")
-        raw_output = self._clean_meme_manager_model_output(
-            event,
-            initial_raw_output,
-        )
-        record_pipeline_stage(
-            event,
-            "raw_reply",
-            content_fingerprint=content_fingerprint(raw_output),
-            content_chars=len(raw_output),
-        )
-        result = parse_reply_composer_output(composer_request, raw_output)
-        report = validate_reply_composer_output(
-            request=composer_request,
-            result=result,
-            raw_output=raw_output,
-            context=validation_context,
-            semantic_phase=SemanticGuardPhase.INITIAL,
-        )
-        attempts = max(0, int(event.get_extra(SHIO_REPAIR_ATTEMPTS, 0) or 0))
-        decision = decide_output_repair(
-            report,
-            repair_attempts_used=attempts,
-        )
-        record_pipeline_stage(
-            event,
-            "guard",
-            guard_hit=not report.is_valid,
-            guard_hit_count=len(report.issues),
-            severe_guard_hit=not report.is_valid,
-            repair_attempted=decision.action is RepairAction.GENERATE_ONCE,
-            called_tool_count=(
-                1 if event.get_extra(SHIO_ACQUISITION_REQUEST, None) is not None else 0
-            ),
-            typed_tool_result_count=len(content_intent.grounding_facts),
-            validator="output_validator_v2",
-            **report.trace_metadata(),
-        )
-
-        if decision.action is RepairAction.BLOCK:
-            event.set_extra(SHIO_MEME_MANAGER_REFERENCE, "")
-            event.set_extra(SHIO_MEME_MANAGER_CATEGORY_MARKERS, ())
-            response.role = "assistant"
-            response.completion_text = ""
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            structured_log(
-                logger,
-                "warning",
-                "typed_reply.blocked",
-                trace_id=get_trace_id(event),
-                issue_count=len(report.issues),
-                repair_attempt_count=attempts,
-            )
-            return
-
-        if decision.action is RepairAction.GENERATE_ONCE:
-            # A marker selected for the rejected draft cannot authorize an
-            # image for the repaired visible reply.
-            event.set_extra(SHIO_MEME_MANAGER_REFERENCE, "")
-            event.set_extra(SHIO_MEME_MANAGER_CATEGORY_MARKERS, ())
-            repair_call_count = 0
-            initial_issue_count = len(report.issues)
-            initial_primary_issue_code = (
-                report.issue_codes[0] if report.issue_codes else "none"
-            )
-            repair_failure_kind = ""
-            repair_result_code = "not_started"
-            repair_provider_digest = ""
-            repair_response_metadata = _llm_response_diagnostics(None)
-            try:
-                repair_request = build_single_repair_request(
-                    original_request=composer_request,
-                    rejected_visible_text=result.visible_text,
-                    report=report,
-                    repair_attempts_used=attempts,
-                    semantic_contract=semantic_contract,
-                    trusted_presentation_prompt=(
-                        str(
-                            event.get_extra(SHIO_MEME_MANAGER_PROMPT, "") or ""
-                        ).strip()
-                        if str(
-                            event.get_extra(
-                                SHIO_MEME_MANAGER_PRESENTATION_MODE,
-                                "",
-                            )
-                            or ""
-                        ).strip()
-                        == "legacy_category"
-                        else ""
-                    ),
-                )
-                event.set_extra(SHIO_REPAIR_ATTEMPTS, attempts + 1)
-                owner_action_fallback = (
-                    self._deterministic_owner_action_fallback(composer_request)
-                )
-                direct_reply_fallback = build_safe_direct_reply_fallback(
-                    composer_request
-                )
-                grounded_evidence_fallback = build_grounded_evidence_fallback(
-                    composer_request
-                )
-                used_fallback = owner_action_fallback is not None
-                if owner_action_fallback is not None:
-                    raw_output = owner_action_fallback
-                    repair_result_code = "owner_action_fallback"
-                else:
-                    try:
-                        configured_repair_provider_id = str(
-                            self._config("replyer_provider_id", "")
-                        ).strip()
-                        provider = self._provider(
-                            configured_repair_provider_id,
-                            event.unified_msg_origin,
-                        )
-                        repair_provider_digest = diagnostic_digest(
-                            configured_repair_provider_id
-                            or type(provider).__name__
-                            if provider is not None
-                            else "missing"
-                        )
-                        snapshot = event_generation_snapshot(event)
-                        if provider is None or snapshot is None:
-                            raise RuntimeError(
-                                "typed repair provider or generation snapshot unavailable"
-                            )
-                        repair_media = media_adaptation.for_repair()
-                        expected_media_ids = tuple(
-                            item.item_id
-                            for item in semantic_contract.media_context.items
-                        )
-                        if (
-                            repair_request.semantic_contract is not semantic_contract
-                            or repair_request.media_item_ids != expected_media_ids
-                            or repair_media is not media_adaptation
-                            or repair_media.context
-                            is not semantic_contract.media_context
-                        ):
-                            raise RuntimeError(
-                                "typed repair semantic/media contract mismatch"
-                            )
-                        repair_call_count = 1
-                        repaired = await self.scope_concurrency.run_event(
-                            snapshot,
-                            self._effective_principal(event),
-                            kind=(
-                                ScopeWorkKind.ACTION
-                                if planned_action.kind is ActionKind.EXECUTE_ACTION
-                                else ScopeWorkKind.DIRECT
-                            ),
-                            work_factory=lambda: self.inference_budget.run_event_call(
-                                snapshot,
-                                self._effective_principal(event),
-                                planned_action,
-                                purpose=InferencePurpose.REPAIR,
-                                work_factory=lambda: self._run_observed_provider_call(
-                                    call_kind=ModelCallKind.REPAIR,
-                                    latency_kind=LatencyKind.REPAIR_PROVIDER,
-                                    work_factory=lambda: self.generation_tasks.run(
-                                        snapshot,
-                                        provider.text_chat(
-                                            prompt=repair_request.user_prompt,
-                                            contexts=[
-                                                message.provider_dict()
-                                                for message in composer_request.model_messages
-                                            ],
-                                            system_prompt=repair_request.system_prompt,
-                                            image_urls=list(
-                                                repair_media.transport.image_urls
-                                            ),
-                                            audio_urls=list(
-                                                repair_media.transport.audio_urls
-                                            ),
-                                            func_tool=None,
-                                            request_max_retries=1,
-                                        ),
-                                        cancel_safe=provider_supports_cancellation(
-                                            provider
-                                        ),
-                                    ),
-                                ),
-                                permit_observer=self._observe_inference_permit,
-                            ),
-                        )
-                        repair_response_metadata = _llm_response_diagnostics(repaired)
-                        raw_output = str(repaired.completion_text or "")
-                        if raw_output.strip():
-                            repair_result_code = "visible_completion"
-                        elif repair_response_metadata["repair_reasoning_chars"]:
-                            repair_result_code = "reasoning_only"
-                        else:
-                            repair_result_code = "empty_completion"
-                        structured_log(
-                            logger,
-                            "info",
-                            "typed_reply.repair_provider_returned",
-                            trace_id=get_trace_id(event),
-                            initial_issue_count=initial_issue_count,
-                            initial_primary_issue_code=initial_primary_issue_code,
-                            repair_provider_digest=repair_provider_digest,
-                            repair_result_code=repair_result_code,
-                            **repair_response_metadata,
-                        )
-                    except SupersededGeneration:
-                        raise
-                    except Exception as exc:
-                        repair_failure_kind = safe_exception_kind(exc)
-                        repair_result_code = "provider_exception"
-                        raw_output = ""
-                        structured_log(
-                            logger,
-                            "warning",
-                            "typed_reply.repair_provider_failed",
-                            trace_id=get_trace_id(event),
-                            initial_issue_count=initial_issue_count,
-                            initial_primary_issue_code=initial_primary_issue_code,
-                            repair_provider_digest=repair_provider_digest,
-                            failure_kind=repair_failure_kind,
-                            repair_result_code=repair_result_code,
-                            **repair_response_metadata,
-                        )
-
-                    raw_output = self._clean_meme_manager_model_output(
-                        event,
-                        raw_output,
-                    )
-                    candidate_result = parse_reply_composer_output(
-                        composer_request,
-                        raw_output,
-                    )
-                    candidate_is_valid = _preflight_reply_composer_repair_candidate(
-                        request=composer_request,
-                        result=candidate_result,
-                        raw_output=raw_output,
-                        context=validation_context,
-                    )
-                    if not candidate_is_valid:
-                        if repair_result_code == "visible_completion":
-                            repair_result_code = "validation_rejected"
-                        if grounded_evidence_fallback is not None:
-                            raw_output = grounded_evidence_fallback
-                            used_fallback = True
-                            event.set_extra(
-                                SHIO_MEME_MANAGER_CATEGORY_MARKERS,
-                                (),
-                            )
-                        elif direct_reply_fallback is not None:
-                            raw_output = direct_reply_fallback
-                            used_fallback = True
-                            event.set_extra(
-                                SHIO_MEME_MANAGER_CATEGORY_MARKERS,
-                                (),
-                            )
-                result = parse_reply_composer_output(composer_request, raw_output)
-                report = validate_reply_composer_output(
-                    request=composer_request,
-                    result=result,
-                    raw_output=raw_output,
-                    context=validation_context,
-                    semantic_phase=SemanticGuardPhase.REPAIR,
-                    repair_request=repair_request,
-                )
-                record_pipeline_stage(
-                    event,
-                    "repair",
-                    repair_call_count=repair_call_count,
-                    repair_failure_count=0 if report.is_valid else 1,
-                    initial_issue_count=initial_issue_count,
-                    initial_primary_issue_code=initial_primary_issue_code,
-                    repair_result_code=repair_result_code,
-                    repair_provider_digest=repair_provider_digest,
-                    outcome=(
-                        "fallback_succeeded"
-                        if used_fallback and report.is_valid
-                        else "fallback_rejected"
-                        if used_fallback
-                        else "succeeded"
-                        if report.is_valid
-                        else "rejected"
-                    ),
-                    **(
-                        {"failure_kind": repair_failure_kind}
-                        if repair_failure_kind
-                        else {}
-                    ),
-                    **report.trace_metadata(),
-                    **repair_response_metadata,
-                )
-            except SupersededGeneration:
-                response.role = "assistant"
-                response.completion_text = ""
-                event.set_extra("meme_manager_semantic_selected_ids", [])
-                record_pipeline_stage(
-                    event,
-                    "stale_generation_drop",
-                    reason_code="typed_repair_superseded",
-                )
-                return
-            except Exception as exc:
-                record_pipeline_stage(
-                    event,
-                    "repair",
-                    repair_call_count=repair_call_count,
-                    repair_failure_count=1,
-                    outcome="failed",
-                    failure_kind=safe_exception_kind(exc),
-                    initial_issue_count=initial_issue_count,
-                    initial_primary_issue_code=initial_primary_issue_code,
-                    repair_result_code="orchestration_exception",
-                    repair_provider_digest=repair_provider_digest,
-                    **repair_response_metadata,
-                )
-
-            post_decision = decide_output_repair(
-                report,
-                repair_attempts_used=max(
-                    1,
-                    int(event.get_extra(SHIO_REPAIR_ATTEMPTS, 0) or 0),
-                ),
-            )
-            if post_decision.action is not RepairAction.SEND:
-                response.role = "assistant"
-                response.completion_text = ""
-                event.set_extra("meme_manager_semantic_selected_ids", [])
-                structured_log(
-                    logger,
-                    "warning",
-                    "typed_reply.repair_rejected",
-                    trace_id=get_trace_id(event),
-                    issue_count=len(report.issues),
-                    initial_issue_count=initial_issue_count,
-                    initial_primary_issue_code=initial_primary_issue_code,
-                    primary_issue_code=(
-                        report.issue_codes[0]
-                        if report.issue_codes
-                        else "repair_output_invalid"
-                    ),
-                    repair_attempt_count=1,
-                    repair_result_code=repair_result_code,
-                    repair_provider_digest=repair_provider_digest,
-                    **(
-                        {"failure_kind": repair_failure_kind}
-                        if repair_failure_kind
-                        else {}
-                    ),
-                    **repair_response_metadata,
-                )
-                return
-
-        final_text = result.visible_text
-        presentation = build_presentation_handoff(
-            composer_request=composer_request,
-            semantic_contract=semantic_contract,
-            action_outcome=semantic_contract.action_outcome,
-            action_outcome_authority=(
-                semantic_contract.action_outcome_authority
-            ),
-            planned_action=planned_action,
-            expression_intent=expression_intent,
-            affect_appraisal=affect_appraisal,
-            result=result,
-            validation=report,
-            capability_policy=capability_policy,
-        )
-        semantic_report = report.semantic_guard_report
-        if (
-            not isinstance(presentation, PresentationHandoff)
-            or not presentation.eligible
-            or semantic_report is None
-            or not semantic_report.is_valid
-        ):
-            response.role = "assistant"
-            response.completion_text = ""
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            return
-        try:
-            semantic_seal = self.semantic_guard_controller.issue(
-                contract=semantic_contract,
-                phase=semantic_report.phase,
-                visible_text=presentation.final_visible_text,
-                presentation=presentation,
-                presentation_digest=presentation.final_text_digest,
-            )
-        except ValueError:
-            response.role = "assistant"
-            response.completion_text = ""
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            return
-        event.set_extra(SHIO_PRESENTATION_HANDOFF, presentation)
-        event.set_extra(SHIO_SEMANTIC_VALIDATION_SEAL, semantic_seal)
-        response.role = "assistant"
-        manager_reference = str(
-            event.get_extra(SHIO_MEME_MANAGER_REFERENCE, "") or ""
-        ).strip()
-        manager_categories = tuple(
-            str(value or "").strip()
-            for value in (
-                event.get_extra(SHIO_MEME_MANAGER_CATEGORY_MARKERS, ()) or ()
-            )
-            if _MEME_MANAGER_SAFE_CATEGORY_RE.fullmatch(
-                str(value or "").strip()
-            )
-        )
-        manager_suffixes = (
-            ([f"&&{manager_reference}&&"] if manager_reference else [])
-            + [f"&&{category}&&" for category in manager_categories]
-        )
-        response.completion_text = final_text + (
-            "\n" + "\n".join(manager_suffixes) if manager_suffixes else ""
-        )
-        record_pipeline_stage(
-            event,
-            "presentation_handoff",
-            **presentation.trace_metadata(),
-        )
-        record_pipeline_stage(
-            event,
-            "final_reply",
-            content_fingerprint=content_fingerprint(final_text),
-            content_chars=len(final_text),
-            bubble_count=len(result.bubbles),
-            changed_from_raw=final_text != initial_raw_output,
-            final_generation_count=1
-            + int(event.get_extra(SHIO_REPAIR_ATTEMPTS, 0) or 0),
-            **report.trace_metadata(),
-        )
-
-    # Validate/repair before Meme Manager's priority=99999 response hook so
-    # semantic selection always sees the final user-visible reply.
-    @filter.on_llm_response(priority=sys.maxsize)
-    async def guard_persona_reply(
-        self,
-        event: AstrMessageEvent,
-        response: LLMResponse,
-    ) -> None:
-        """只接受绑定到当前 typed 请求的 Composer 输出。"""
-        primary_started = event.get_extra(
-            SHIO_PRIMARY_PROVIDER_STARTED_AT,
-            None,
-        )
-        event.set_extra(SHIO_PRIMARY_PROVIDER_STARTED_AT, None)
-        if type(primary_started) is float:
-            self.performance_window.observe_latency(
-                LatencyKind.PRIMARY_PROVIDER,
-                float((time.perf_counter() - primary_started) * 1000.0),
-            )
-            if response.role == "err":
-                self.performance_window.record_model_failure()
-        permit = event.get_extra(SHIO_INFERENCE_PERMIT, None)
-        if type(permit) is InferencePermit:
-            event.set_extra(SHIO_INFERENCE_PERMIT, None)
-            try:
-                released = await self.inference_budget.release(permit)
-                if not released:
-                    raise InferenceBudgetError("inference_active_timeout")
-            except InferenceBudgetError as exc:
-                response.role = "assistant"
-                response.completion_text = ""
-                event.set_extra("meme_manager_semantic_selected_ids", [])
-                structured_log(
-                    logger,
-                    "error",
-                    "typed_reply.inference_permit_rejected",
-                    trace_id=get_trace_id(event),
-                    failure_kind=safe_exception_kind(exc),
-                )
-                return
-        elif event.get_extra(SHIO_ACTIVE, False):
-            response.role = "assistant"
-            response.completion_text = ""
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            structured_log(
-                logger,
-                "error",
-                "typed_reply.inference_permit_missing",
-                trace_id=get_trace_id(event),
-            )
-            return
-        if not event.get_extra(SHIO_ACTIVE, False):
-            return
-
-        payload = event.get_extra(SHIO_PAYLOAD, None)
-        epoch_validation = event_epoch_validation(event, self.generation_epochs)
-        if not epoch_validation.is_current:
-            self._discard_semantic_validation_seal(event)
-            response.role = "assistant"
-            response.completion_text = ""
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            record_pipeline_stage(
-                event,
-                "stale_generation_drop",
-                reason_code=epoch_validation.reason_code,
-                current_epoch=epoch_validation.current_epoch,
-            )
-            self._emit_pipeline_metrics(event)
-            return
-
-        if response.role == "err":
-            self._discard_semantic_validation_seal(event)
-            response.role = "assistant"
-            response.completion_text = ""
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            record_pipeline_stage(
-                event,
-                "replyer_failed",
-                failure_kind="ProviderError",
-                replyer_failure_count=1,
-            )
-            structured_log(
-                logger,
-                "warning",
-                "typed_reply.provider_failed",
-                trace_id=get_trace_id(event),
-            )
-            self._emit_pipeline_metrics(event)
-            return
-
-        if (
-            not isinstance(payload, dict)
-            or not bool(payload.get("typed_pipeline_active", False))
-            or not bool(event.get_extra(SHIO_TYPED_PIPELINE_ACTIVE, False))
-        ):
-            self._discard_semantic_validation_seal(event)
-            response.role = "assistant"
-            response.completion_text = ""
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            record_pipeline_stage(
-                event,
-                "guard",
-                guard_hit=True,
-                guard_hit_count=1,
-                severe_guard_hit=True,
-                repair_attempted=False,
-                validator="typed_state_binding",
-            )
-            structured_log(
-                logger,
-                "error",
-                "typed_reply.non_typed_blocked",
-                trace_id=get_trace_id(event),
-            )
-            self._emit_pipeline_metrics(event)
-            return
-
-        await self._guard_typed_reply(event, response, payload)
-
-    @filter.on_decorating_result(priority=-100)
-    async def dispatch_chat_bubbles(self, event: AstrMessageEvent) -> None:
-        """闲聊按自然句逐条发送；内容型回答保持完整排版。"""
-        if not event.get_extra(SHIO_ACTIVE, False):
-            return
-        result = event.get_result()
-        if result is None or not getattr(result, "chain", None):
-            self._discard_semantic_validation_seal(event)
-            return
-        epoch_validation = event_epoch_validation(event, self.generation_epochs)
-        if not epoch_validation.is_current:
-            self._discard_semantic_validation_seal(event)
-            result.chain.clear()
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            record_pipeline_stage(
-                event,
-                "stale_generation_drop",
-                reason_code=epoch_validation.reason_code,
-                current_epoch=epoch_validation.current_epoch,
-            )
-            self._emit_pipeline_metrics(event)
-            logger.info(
-                "[星汐/并发守卫] reason=%s 发送前发现 generation 过时，已清空结果。",
-                epoch_validation.reason_code,
-            )
-            return
-        try:
-            if not result.is_llm_result():
-                self._discard_semantic_validation_seal(event)
-                return
-        except Exception:
-            self._discard_semantic_validation_seal(event)
-            return
-
-        text_components = self._collect_text_components(result.chain)
-        if not text_components:
-            self._discard_semantic_validation_seal(event)
-            return
-        payload = event.get_extra(SHIO_PAYLOAD, {})
-        active_tool_names = self._response_guard_tool_names(event)
-        final_meme_references: list[str] = []
-        removed_visible_tool_artifact = False
-        aggregate_source = "\n".join(component.text for component in text_components)
-        aggregate_had_protocol = contains_tool_protocol(
-            aggregate_source,
-            active_tool_names,
-        )
-        aggregate_cleaned, aggregate_references = (
-            extract_and_clean_internal_meme_references(
-                aggregate_source,
-                active_tool_names,
-            )
-        )
-        if (
-            aggregate_had_protocol
-            and aggregate_cleaned != aggregate_source.strip()
-            and not contains_tool_protocol(aggregate_cleaned, active_tool_names)
-        ):
-            text_components[0].text = aggregate_cleaned
-            for component in text_components[1:]:
-                component.text = ""
-            removed_visible_tool_artifact = True
-            final_meme_references.extend(aggregate_references)
-        else:
-            for component in text_components:
-                original_component_text = component.text
-                cleaned_text, references = extract_and_clean_internal_meme_references(
-                    original_component_text,
-                    active_tool_names,
-                )
-                component.text = cleaned_text
-                if (
-                    cleaned_text != original_component_text.strip()
-                    and contains_tool_protocol(
-                        original_component_text,
-                        active_tool_names,
-                    )
-                    and not contains_tool_protocol(cleaned_text, active_tool_names)
-                ):
-                    removed_visible_tool_artifact = True
-                for reference in references:
-                    if reference not in final_meme_references:
-                        final_meme_references.append(reference)
-        removed_unconsumed_manager_marker = False
-        for component in text_components:
-            original_component_text = str(component.text or "")
-            cleaned_component_text, _ = (
-                self._extract_meme_manager_category_markers(
-                    original_component_text,
-                    trusted_legacy_mode=False,
-                )
-            )
-            component.text = cleaned_component_text
-            if cleaned_component_text != original_component_text.strip():
-                removed_unconsumed_manager_marker = True
-        if removed_visible_tool_artifact:
-            logger.warning(
-                "[星汐/表达守卫] 发送前已从消息节点移除伪造的工具文本调用。"
-            )
-        if removed_unconsumed_manager_marker:
-            structured_log(
-                logger,
-                "warning",
-                "presentation.manager_marker_unconsumed",
-                trace_id=get_trace_id(event),
-            )
-        if final_meme_references:
-            structured_log(
-                logger,
-                "warning",
-                "presentation.reference_blocked_before_send",
-                trace_id=get_trace_id(event),
-                reference_count=len(final_meme_references),
-            )
-        visible_text = "\n".join(
-            comp.text for comp in text_components if str(comp.text or "").strip()
-        ).strip()
-        if removed_visible_tool_artifact and not visible_text:
-            self._discard_semantic_validation_seal(event)
-            result.chain.clear()
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            record_pipeline_stage(event, "final_send_blocked", reason_code="protocol_only_output")
-            self._emit_pipeline_metrics(event)
-            return
-        if contains_tool_protocol(visible_text, active_tool_names):
-            self._discard_semantic_validation_seal(event)
-            result.chain.clear()
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            logger.warning(
-                "[星汐/协议守卫] 发送前再次发现内部工具协议，已阻断。"
-            )
-            record_pipeline_stage(event, "final_send_blocked", reason_code="tool_protocol")
-            self._emit_pipeline_metrics(event)
-            return
-        if contains_internal_reasoning(visible_text):
-            self._discard_semantic_validation_seal(event)
-            result.chain.clear()
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            logger.warning(
-                "[星汐/规划守卫] 发送前再次发现内部规划或推理，已阻断。"
-            )
-            record_pipeline_stage(event, "final_send_blocked", reason_code="internal_reasoning")
-            self._emit_pipeline_metrics(event)
-            return
-        if (
-            isinstance(payload, dict)
-            and not bool(payload.get("is_owner", False))
-            and contains_nonowner_identity_confusion(visible_text)
-        ):
-            self._discard_semantic_validation_seal(event)
-            result.chain.clear()
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            logger.warning(
-                "[星汐/身份守卫] 发送前再次发现普通群友被归因为主人，已阻断。"
-            )
-            record_pipeline_stage(event, "final_send_blocked", reason_code="identity_confusion")
-            self._emit_pipeline_metrics(event)
-            return
-
-        semantic_contract = event.get_extra(SHIO_SEMANTIC_GUARD_CONTRACT, None)
-        semantic_seal = event.get_extra(SHIO_SEMANTIC_VALIDATION_SEAL, None)
-        validation_context = event.get_extra(SHIO_OUTPUT_VALIDATION_CONTEXT, None)
-        composer_request = event.get_extra(SHIO_REPLY_COMPOSER_REQUEST, None)
-        planned_action = event.get_extra(SHIO_PLANNED_ACTION, None)
-        content_intent = event.get_extra(SHIO_CONTENT_INTENT, None)
-        media_adaptation = event.get_extra(SHIO_MEDIA_ADAPTATION, None)
-        evidence_outcome = event.get_extra(SHIO_EVIDENCE_OUTCOME, None)
-        presentation = event.get_extra(SHIO_PRESENTATION_HANDOFF, None)
-        risk_binding = event.get_extra(SHIO_SEMANTIC_RISK_DECISION, None)
-        stage_state_valid = bool(
-            isinstance(semantic_contract, SemanticGuardContract)
-            and isinstance(semantic_seal, SemanticValidationSeal)
-            and isinstance(validation_context, OutputValidationContext)
-            and isinstance(composer_request, ReplyComposerRequest)
-            and isinstance(planned_action, PlannedAction)
-            and isinstance(content_intent, ContentIntent)
-            and isinstance(media_adaptation, AstrBotMediaAdaptation)
-            and isinstance(presentation, PresentationHandoff)
-            and type(risk_binding) is tuple
-            and len(risk_binding) == 2
-            and type(risk_binding[0]) is SemanticRiskDecision
-            and risk_binding[0] is not SemanticRiskDecision.UNCERTAIN
-            and isinstance(composer_request, ReplyComposerRequest)
-            and risk_binding[1] == self._semantic_risk_snapshot(composer_request)
-            and presentation.eligible
-            and validation_context.composer_request is composer_request
-            and validation_context.semantic_contract is semantic_contract
-            and validation_context.current_question_anchor
-            is semantic_contract.current_question_anchor
-            and composer_request.current_question_anchor
-            is semantic_contract.current_question_anchor
-            and composer_request.planned_action is planned_action
-            and semantic_contract.composer_request is composer_request
-            and semantic_contract.planned_action is planned_action
-            and semantic_contract.content_intent is content_intent
-            and semantic_contract.media_context is media_adaptation.context
-            and semantic_contract.evidence_outcome is evidence_outcome
-            and semantic_contract.action_outcome
-            is composer_request.action_outcome
-            and semantic_contract.action_outcome_authority
-            is composer_request.action_outcome_authority
-            and presentation.composer_request is composer_request
-            and presentation.semantic_contract is semantic_contract
-            and presentation.action_outcome
-            is semantic_contract.action_outcome
-            and presentation.action_outcome_authority
-            is semantic_contract.action_outcome_authority
-            and presentation.target_message_id
-            == semantic_contract.content_intent.binding.current_message_id
-            and bool(presentation.final_text_digest)
-        )
-        if not stage_state_valid:
-            self._discard_semantic_validation_seal(event)
-            result.chain.clear()
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            record_pipeline_stage(
-                event,
-                "final_send_blocked",
-                reason_code="semantic_stage_seal_missing_or_mismatched",
-            )
-            self._emit_pipeline_metrics(event)
-            return
-        if contains_history_speaker_attribution_confusion(
-            current_message=validation_context.current_message,
-            visible_text=visible_text,
-            model_messages=composer_request.model_messages,
-            current_sender_key=composer_request.target_sender_key,
-        ):
-            self._discard_semantic_validation_seal(event)
-            result.chain.clear()
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            structured_log(
-                logger,
-                "warning",
-                "typed_reply.final_history_speaker_attribution_blocked",
-                trace_id=get_trace_id(event),
-            )
-            record_pipeline_stage(
-                event,
-                "final_send_blocked",
-                reason_code="history_speaker_attribution",
-            )
-            self._emit_pipeline_metrics(event)
-            return
-        # PresentationHandoff is the sole canonical segment boundary authority.
-        # Re-splitting guarded bytes here would create a second presentation
-        # path and could move a negation or causal correction to a later bubble.
-        final_segments = presentation.final_segments
-        final_semantic_report = validate_semantic_media_guard(
-            contract=semantic_contract,
-            visible_text=visible_text,
-            visible_segments=final_segments,
-            phase=SemanticGuardPhase.FINAL_SEND,
-        )
-        validated_digest = presentation.final_text_digest
-        seal_consumed = self.semantic_guard_controller.consume_final(
-            seal=semantic_seal,
-            contract=semantic_contract,
-            visible_text=visible_text,
-            visible_segments=final_segments,
-            presentation=presentation,
-            presentation_digest=validated_digest,
-        )
-        event.set_extra(SHIO_SEMANTIC_VALIDATION_SEAL, None)
-        record_pipeline_stage(
-            event,
-            "final_semantic_guard",
-            final_text_changed=bool(
-                validated_digest
-                and validated_digest != final_semantic_report.visible_digest
-            ),
-            semantic_stage_seal_consumed=seal_consumed,
-            **final_semantic_report.trace_metadata(),
-        )
-        if not final_semantic_report.is_valid or not seal_consumed:
-            result.chain.clear()
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            structured_log(
-                logger,
-                "warning",
-                "typed_reply.final_semantic_blocked",
-                trace_id=get_trace_id(event),
-                issue_count=len(final_semantic_report.issues),
-            )
-            record_pipeline_stage(
-                event,
-                "final_send_blocked",
-                reason_code=(
-                    "semantic_guard_final_send"
-                    if not final_semantic_report.is_valid
-                    else "semantic_stage_seal_invalid"
-                ),
-            )
-            self._emit_pipeline_metrics(event)
-            return
-
-        if not bool(self._config("enable_chat_bubbles", True)):
-            if not self._prepare_automatic_send_observation(
-                event,
-                payload,
-                visible_text,
-            ):
-                result.chain.clear()
-            return
-        expression_intent = event.get_extra(SHIO_EXPRESSION_INTENT, None)
-        if (
-            not isinstance(composer_request, ReplyComposerRequest)
-            or not isinstance(expression_intent, ExpressionIntent)
-            or composer_request.reply_shape != "chat_bubbles"
-        ):
-            if not self._prepare_automatic_send_observation(
-                event,
-                payload,
-                visible_text,
-            ):
-                result.chain.clear()
-            return
-        bubbles = list(final_segments)
-        if len(bubbles) <= 1:
-            if not self._prepare_automatic_send_observation(
-                event,
-                payload,
-                visible_text,
-            ):
-                result.chain.clear()
-            return
-
-        min_delay = max(0, int(self._config("bubble_interval_min_ms", 450))) / 1000
-        max_delay = max(0, int(self._config("bubble_interval_max_ms", 1200))) / 1000
-        if max_delay < min_delay:
-            min_delay, max_delay = max_delay, min_delay
-
-        sent_count = 0
-        for bubble in bubbles[:-1]:
-            if not event_epoch_validation(event, self.generation_epochs).is_current:
-                result.chain.clear()
-                event.set_extra("meme_manager_semantic_selected_ids", [])
-                return
-            planned = self._plan_send_segment(event, payload, bubble)
-            if planned is None:
-                result.chain.clear()
-                record_pipeline_stage(
-                    event,
-                    "final_send_blocked",
-                    reason_code="presentation_segment_untracked",
-                )
-                self._emit_pipeline_metrics(event)
-                return
-            self.send_receipts.mark_attempted(planned)
-            try:
-                record_pipeline_stage(
-                    event,
-                    "send_attempt",
-                    automatic=False,
-                    visible_chars=len(bubble),
-                )
-                send_snapshot = event_generation_snapshot(event)
-                if send_snapshot is None:
-                    raise RuntimeError("send_generation_snapshot_missing")
-                await self.scope_concurrency.run_event(
-                    send_snapshot,
-                    self._effective_principal(event),
-                    kind=(
-                        ScopeWorkKind.ACTION
-                        if planned_action.kind is ActionKind.EXECUTE_ACTION
-                        else ScopeWorkKind.DIRECT
-                    ),
-                    work_factory=lambda bubble=bubble: event.send(
-                        event.plain_result(bubble)
-                    ),
-                )
-            except Exception as exc:
-                if planned is not None:
-                    record = self.send_receipts.get_reply(
-                        planned.rsplit(":", 1)[0]
-                    )
-                    if (
-                        record is not None
-                        and any(
-                            segment.segment_id == planned
-                            and segment.status == SegmentSendStatus.ATTEMPTED
-                            for segment in record.segments
-                        )
-                    ):
-                        self.send_receipts.mark_failed(
-                            planned,
-                            failure_kind=type(exc).__name__,
-                        )
-                record_pipeline_stage(
-                    event,
-                    "send_failed",
-                    automatic=False,
-                    failure_kind=type(exc).__name__,
-                )
-                structured_log(
-                    logger,
-                    "warning",
-                    "send.manual_failed",
-                    trace_id=get_trace_id(event),
-                    failure_kind=safe_exception_kind(exc),
-                )
-                # A failed exact segment is terminal. Falling through to
-                # AstrBot's aggregate automatic send would retry the same bytes
-                # outside the canonical presentation transaction.
-                result.chain.clear()
-                self._emit_pipeline_metrics(event)
-                return
-            sent_count += 1
-            if planned is not None:
-                self.send_receipts.mark_succeeded(planned)
-                self._observe_successful_send_segment(event, bubble)
-            record_pipeline_stage(
-                event,
-                "send_success",
-                automatic=False,
-                visible_chars=len(bubble),
-            )
-            if max_delay > 0:
-                await asyncio.sleep(random.uniform(min_delay, max_delay))
-
-        if sent_count == 0:
-            if not self._prepare_automatic_send_observation(
-                event,
-                payload,
-                visible_text,
-            ):
-                result.chain.clear()
-            return
-        remaining = bubbles[sent_count:]
-        if not event_epoch_validation(event, self.generation_epochs).is_current:
-            result.chain.clear()
-            event.set_extra("meme_manager_semantic_selected_ids", [])
-            return
-        text_components[0].text = "\n".join(remaining)
-        for comp in text_components[1:]:
-            comp.text = ""
-        if not self._prepare_automatic_send_observation(
-            event,
-            payload,
-            text_components[0].text,
-        ):
-            result.chain.clear()
-
-    def _send_observation_tracker(
-        self,
-        event: AstrMessageEvent,
-    ) -> ReplyObservationTracker | None:
-        tracker = event.get_extra(SHIO_SEND_OBSERVATION, None)
-        return tracker if isinstance(tracker, ReplyObservationTracker) else None
-
-    def _emit_pipeline_metrics(
-        self,
-        event: AstrMessageEvent,
-    ) -> PipelineMetricsSnapshot:
-        snapshot = store_pipeline_metrics(event)
-        performance = self.performance_window.snapshot()
-        event.set_extra(SHIO_PERFORMANCE_SNAPSHOT, performance)
-        if bool(self._config("debug_log", False)):
-            structured_log(
-                logger,
-                "info",
-                "pipeline.metrics",
-                trace_id=snapshot.trace_id,
-                **snapshot.trace_metadata(),
-                **performance.trace_metadata(),
-                **self.runtime_continuity.trace_metadata(),
-            )
+                "shio.sys001.natural_candidate_base_generation", active_generation
+            )
+        event.set_extra(SYS001_TURN_EXTRA, snapshot)
+        event.set_extra(SYS001_LIFECYCLE_EXTRA, TurnLifecycle())
+        event.set_extra("shio.sys001.generation", generation)
         return snapshot
 
-    def _plan_send_segment(
-        self,
-        event: AstrMessageEvent,
-        payload: Any,
-        visible_text: str,
-    ) -> str | None:
-        if (
-            not isinstance(payload, dict)
-            or payload.get("chat_type") not in {"group", "private"}
-        ):
-            return None
-        text = str(visible_text or "").strip()
-        if not text:
-            return None
-        tracker = self._send_observation_tracker(event)
-        if tracker is None:
-            envelope = ensure_turn_envelope(event)
-            target = ensure_direct_reply_target(
-                event,
-                envelope,
-                str(payload.get("current_message", "")),
-            )
-            try:
-                presentation = event.get_extra(SHIO_PRESENTATION_HANDOFF, None)
-                expression_ids = (
-                    payload.get("expression_ids", [])
-                    if bool(self._config("social_feedback_enabled", True))
-                    else []
-                )
-                if not isinstance(presentation, PresentationHandoff):
-                    raise ValueError("presentation_required")
-                record = self.send_receipts.begin_presentation_reply(
-                    presentation,
-                    expression_ids=expression_ids,
-                    trace_id=get_trace_id(event),
-                )
-                if record.segments[0].visible_text != text:
-                    raise ValueError("presentation_segment_order_mismatch")
-            except Exception as exc:
-                if bool(self._config("debug_log", False)):
-                    structured_log(
-                        logger,
-                        "warning",
-                        "send.observation_skipped",
-                        trace_id=get_trace_id(event),
-                        failure_kind=safe_exception_kind(exc),
-                    )
-                return None
-            tracker = ReplyObservationTracker(
-                internal_reply_id=record.internal_reply_id,
-                target_sender_id=str(payload.get("sender_id", "")),
-                expression_ids=tuple(
-                    str(value)
-                    for value in (
-                        payload.get("expression_ids", [])
-                        if bool(self._config("social_feedback_enabled", True))
-                        else []
-                    )
-                    if str(value)
-                )[:3],
-                target_sequence=int(payload.get("target_sequence", 0) or 0),
-                feedback_window_seconds=max(
-                    60,
-                    int(self._config("social_feedback_window_minutes", 10)) * 60,
-                ),
-                trace_id=get_trace_id(event),
-                learning_context=(
-                    payload.get("learning_context")
-                    if isinstance(payload.get("learning_context"), LearningContext)
-                    else None
-                ),
-            )
-            event.set_extra(SHIO_SEND_OBSERVATION, tracker)
-            record_pipeline_stage(
-                event,
-                "bubble_planned",
-                segment_index=0,
-                visible_chars=len(text),
-            )
-            return record.segments[0].segment_id
-        presentation = event.get_extra(SHIO_PRESENTATION_HANDOFF, None)
-        if isinstance(presentation, PresentationHandoff):
-            record = self.send_receipts.get_reply(tracker.internal_reply_id)
-            if record is None:
-                return None
-            matches = tuple(
-                segment
-                for segment in record.segments
-                if segment.status is SegmentSendStatus.PLANNED
-                and segment.visible_text == text
-            )
-            if len(matches) != 1:
-                return None
-            segment = matches[0]
-            record_pipeline_stage(
-                event,
-                "bubble_planned",
-                segment_index=segment.segment_index,
-                visible_chars=len(text),
-            )
-            return segment.segment_id
-        segment = self.send_receipts.append_segment(
-            tracker.internal_reply_id,
-            visible_text=text,
-        )
-        record_pipeline_stage(
-            event,
-            "bubble_planned",
-            segment_index=segment.segment_index,
-            visible_chars=len(text),
-        )
-        return segment.segment_id
+    def _natural_candidate_map(self, scope: str) -> dict[int, int]:
+        """Return this process's pending pre-Agent candidates for one scope."""
+        candidates = getattr(self, "_natural_candidates", None)
+        if not isinstance(candidates, dict):
+            candidates = {}
+            self._natural_candidates = candidates
+        scoped = candidates.get(scope)
+        if not isinstance(scoped, dict):
+            scoped = {}
+            candidates[scope] = scoped
+        return scoped
 
-    def _prepare_automatic_send_observation(
-        self,
-        event: AstrMessageEvent,
-        payload: Any,
-        visible_text: str,
-    ) -> bool:
-        tracker = self._send_observation_tracker(event)
-        if tracker is not None and tracker.pending_automatic_segment_id:
-            return True
-        segment_id = self._plan_send_segment(event, payload, visible_text)
-        if segment_id is None:
-            return False
-        self.send_receipts.mark_attempted(segment_id)
-        record_pipeline_stage(
-            event,
-            "send_handoff",
-            automatic=True,
-            visible_chars=len(str(visible_text or "").strip()),
-        )
-        tracker = self._send_observation_tracker(event)
-        if tracker is not None:
-            tracker.pending_automatic_segment_id = segment_id
-            tracker.pending_automatic_text = str(visible_text or "").strip()
-        return tracker is not None
+    def _natural_active_candidate_watermark(self, scope: str) -> int:
+        """Return the greatest candidate sequence promoted in this live scope."""
+        watermarks = getattr(self, "_natural_active_candidate_watermarks", None)
+        if not isinstance(watermarks, dict):
+            watermarks = {}
+            self._natural_active_candidate_watermarks = watermarks
+        return watermarks.get(scope, 0)
 
-    def _observe_successful_send_segment(
-        self,
-        event: AstrMessageEvent,
-        visible_text: str,
+    def _set_natural_active_candidate_watermark(
+        self, scope: str, candidate: int
     ) -> None:
-        tracker = self._send_observation_tracker(event)
-        payload = event.get_extra(SHIO_PAYLOAD, {})
-        if tracker is None or not isinstance(payload, dict):
-            return
-        text = str(visible_text or "").strip()
-        if not text:
-            return
-        tracker.successful_segments.append(text)
-        if len(tracker.successful_segments) == 1:
-            trace_context = get_trace_context(event)
-            if trace_context is not None:
-                self.performance_window.observe_latency(
-                    LatencyKind.FIRST_BUBBLE,
-                    float((time.perf_counter() - trace_context.started_at) * 1000.0),
-                )
-        sent_record = self.send_receipts.sent_reply_record(tracker.internal_reply_id)
-        self.runtime.record_bot_reply(
-            scope_key=str(payload.get("scope_key", "")),
-            target_sender_id=tracker.target_sender_id,
-            reply_text=tracker.successful_visible_text,
-            expression_ids=list(tracker.expression_ids),
-            target_sequence=tracker.target_sequence,
-            feedback_window_seconds=tracker.feedback_window_seconds,
-            internal_reply_id=tracker.internal_reply_id,
-            sent_platform_message_ids=(
-                tuple(
-                    segment.platform_message_id
-                    for segment in sent_record.successful_segments
-                    if segment.platform_message_id
-                )
-                if sent_record is not None
-                else ()
-            ),
-            learning_context=tracker.learning_context,
-            trace_id=tracker.trace_id,
-        )
-        envelope = ensure_turn_envelope(event)
-        ledger_ids = event.get_extra(SHIO_LEDGER_OUTBOUND_IDS, set())
-        if not isinstance(ledger_ids, set):
-            ledger_ids = set()
-        segment_index = len(tracker.successful_segments) - 1
-        internal_message_id = f"{tracker.internal_reply_id}:{segment_index}"
-        if internal_message_id not in ledger_ids:
-            try:
-                self.ledger.record_outbound(
-                    scope_key=str(payload.get("scope_key", "")),
-                    session_id=envelope.session_id,
-                    message_id=internal_message_id,
-                    bot_sender_key=build_sender_key(
-                        str(payload.get("scope_key", "")),
-                        str(payload.get("bot_id", "")),
-                    ),
-                    target_sender_key=str(
-                        payload.get("identity_key", "")
-                        or build_sender_key(
-                            str(payload.get("scope_key", "")),
-                            str(payload.get("sender_id", "")),
-                        )
-                    ),
-                    reply_to_message_id=envelope.message_id,
-                    timestamp=time.time(),
-                    content=text,
-                    platform_id=envelope.platform_id,
-                    bot_id=envelope.bot_id,
-                )
-                ledger_ids.add(internal_message_id)
-                event.set_extra(SHIO_LEDGER_OUTBOUND_IDS, ledger_ids)
-            except ValueError as exc:
-                if bool(self._config("debug_log", False)):
-                    structured_log(
-                        logger,
-                        "warning",
-                        "ledger.outbound_skipped",
-                        trace_id=tracker.trace_id,
-                        failure_kind=safe_exception_kind(exc),
-                    )
-        if bool(self._config("debug_log", False)):
-            envelope = ensure_turn_envelope(event)
-            trace = get_pipeline_trace(event)
-            latest = trace.get("stages", [])[-1] if trace.get("stages") else {}
-            structured_log(
-                logger,
-                "info",
-                "send.succeeded",
-                trace_id=tracker.trace_id,
-                source_kind=envelope.source_kind,
-                subject_digest=diagnostic_digest(envelope.sender_key),
-                target_digest=diagnostic_digest(envelope.message_id),
-                segment_count=len(tracker.successful_segments),
-                visible_chars=len(text),
-                latency_ms=float(latest.get("elapsed_ms", 0.0) or 0.0),
-            )
+        watermarks = getattr(self, "_natural_active_candidate_watermarks", None)
+        if not isinstance(watermarks, dict):
+            watermarks = {}
+            self._natural_active_candidate_watermarks = watermarks
+        watermarks[scope] = candidate
 
-    def _finalize_owner_action_delivery(self, event: AstrMessageEvent) -> None:
-        outcome = event.get_extra(SHIO_ACTION_OUTCOME, None)
-        if not isinstance(outcome, ActionOutcomeIntent):
-            return
-        source = event.get_extra(SHIO_OWNER_ACTION_SOURCE, None)
-        lifecycle_handle = event.get_extra(
-            SHIO_OWNER_ACTION_LIFECYCLE_HANDLE,
-            None,
-        )
-        planned_action = event.get_extra(SHIO_PLANNED_ACTION, None)
-        composer_request = event.get_extra(SHIO_REPLY_COMPOSER_REQUEST, None)
-        presentation = event.get_extra(SHIO_PRESENTATION_HANDOFF, None)
-        tracker = self._send_observation_tracker(event)
-        store = self.owner_action_lifecycle_store
-        durable_authority = self.owner_action_durable_authority
+    def _retire_unstarted_natural_candidate(
+        self, event: AstrMessageEvent, snapshot: TurnSnapshot
+    ) -> None:
+        """Retire only this non-REPLY candidate; never roll back active turns."""
+        candidate = event.get_extra("shio.sys001.natural_candidate")
         if (
-            source is None
-            or not isinstance(lifecycle_handle, LifecycleHandle)
-            or not isinstance(planned_action, PlannedAction)
-            or not isinstance(composer_request, ReplyComposerRequest)
-            or not isinstance(presentation, PresentationHandoff)
-            or tracker is None
-            or store is None
-            or durable_authority is None
+            isinstance(candidate, int)
+            and not isinstance(candidate, bool)
         ):
-            raise RuntimeError("owner_action_delivery_lineage_missing")
-        evidence = self.send_receipts.issue_owner_action_send_terminal_evidence(
-            presentation,
-            internal_reply_id=tracker.internal_reply_id,
+            self._natural_candidate_map(snapshot.scope).pop(candidate, None)
+
+    # Kept as a narrow internal alias while older hook-focused tests and
+    # callers transition; its semantics are candidate retirement, not a scope
+    # generation rollback.
+    def _discard_unstarted_natural_generation(
+        self, event: AstrMessageEvent, snapshot: TurnSnapshot
+    ) -> None:
+        self._retire_unstarted_natural_candidate(event, snapshot)
+
+    async def _activate_natural_candidate(
+        self, event: AstrMessageEvent, snapshot: TurnSnapshot
+    ) -> bool:
+        """Promote a newer REPLY candidate under the scope commit lock."""
+        candidate = event.get_extra("shio.sys001.natural_candidate")
+        if not isinstance(candidate, int) or isinstance(candidate, bool):
+            return False
+        async with self._natural_lock(snapshot.scope):
+            candidates = self._natural_candidate_map(snapshot.scope)
+            if (
+                getattr(self, "_natural_terminated", False)
+                or candidate not in candidates
+                or candidate <= self._natural_active_candidate_watermark(
+                    snapshot.scope
+                )
+            ):
+                candidates.pop(candidate, None)
+                return False
+            candidates.pop(candidate, None)
+            self._set_natural_active_candidate_watermark(snapshot.scope, candidate)
+            generation = self._natural_generations.get(snapshot.scope, 0) + 1
+            self._natural_generations[snapshot.scope] = generation
+            event.set_extra("shio.sys001.generation", generation)
+            event.set_extra("shio.sys001.natural_active", True)
+            return True
+
+    def _bind_auxiliary_call(
+        self,
+        event: AstrMessageEvent,
+        snapshot: TurnSnapshot | None = None,
+        *,
+        fence_natural_generation: bool = True,
+    ) -> _AuxiliaryBinding:
+        """Fence an auxiliary Provider result to this event and plugin epoch."""
+        natural_scope = ""
+        natural_generation: int | None = None
+        natural_candidate: int | None = None
+        if isinstance(snapshot, TurnSnapshot) and snapshot.origin == "natural":
+            natural_scope = snapshot.scope
+            generation = event.get_extra("shio.sys001.generation")
+            if isinstance(generation, int) and not isinstance(generation, bool):
+                natural_generation = generation
+            candidate = event.get_extra("shio.sys001.natural_candidate")
+            if isinstance(candidate, int) and not isinstance(candidate, bool):
+                natural_candidate = candidate
+        binding = _AuxiliaryBinding(
+            epoch=getattr(self, "_auxiliary_epoch", 0),
+            event_id=id(event),
+            token=object(),
+            natural_scope=natural_scope,
+            natural_generation=natural_generation,
+            natural_candidate=natural_candidate,
+            fence_natural_generation=fence_natural_generation,
         )
-        self.action_outcome_authority.acknowledge_delivery_terminal(
-            outcome,
-            planned_action,
-            consumer=composer_request,
+        setter = getattr(event, "set_extra", None)
+        if callable(setter):
+            setter("shio.sys001.auxiliary_binding", binding)
+        return binding
+
+    def _auxiliary_call_is_current(
+        self, event: AstrMessageEvent, binding: _AuxiliaryBinding
+    ) -> bool:
+        """Reject a late auxiliary result without changing visible state."""
+        if (
+            getattr(self, "_auxiliary_terminated", False)
+            or binding.epoch != getattr(self, "_auxiliary_epoch", 0)
+            or binding.event_id != id(event)
+            or (
+                callable(getattr(event, "get_extra", None))
+                and event.get_extra("shio.sys001.auxiliary_binding") is not binding
+            )
+        ):
+            return False
+        if not binding.fence_natural_generation:
+            return True
+        if binding.natural_generation is not None:
+            return (
+                binding.natural_generation
+                == self._natural_generations.get(binding.natural_scope)
+                and binding.natural_generation
+                == event.get_extra("shio.sys001.generation")
+            )
+        if binding.natural_candidate is not None:
+            return binding.natural_candidate in self._natural_candidate_map(
+                binding.natural_scope
+            )
+        return True
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
+    async def request_event_bound_reply(
+        self, event: AstrMessageEvent
+    ) -> AsyncGenerator[ProviderRequest, None]:
+        """Accept one real inbound event and hand it back to AstrBot's agent."""
+        if event.get_extra("handlers_parsed_params", {}):
+            return
+        provisional = create_snapshot(event, origin="pending")
+        ingress = self._ingress_settings()
+        entry = admit_ingress(
+            provisional,
+            private_allowed_sender_ids=self._ingress_ids(
+                ingress, "private_allowed_sender_ids"
+            ),
+            blocked_sender_ids=self._ingress_ids(ingress, "blocked_sender_ids"),
+            group_allowed_scopes=self._ingress_ids(ingress, "group_allowed_scopes"),
+            group_blocked_scopes=self._ingress_ids(ingress, "group_blocked_scopes"),
         )
-        dispatch = durable_authority.acknowledge_delivered(
-            lifecycle_handle=lifecycle_handle,
-            source=source,
-            outcome=outcome,
-            current_planned_action=planned_action,
-            composer_request=composer_request,
-            send_evidence=evidence,
-            send_ledger=self.send_receipts,
-            presentation=presentation,
-            now=time.time(),
+        if not entry.allowed:
+            return
+        # Fixed AstrBot owns command handlers and default media/Reply request
+        # construction.  Commands intentionally stay outside this scheduler.
+        # A media/Reply component only reserves this scope when AstrBot's
+        # WakingCheck has established an actual reply obligation.  Ordinary
+        # media and Reply events can legitimately end without an Agent,
+        # OnLLMResponse, or AfterMessageSent event, so they must not own a
+        # boundary that could block a later directed request forever.
+        if self._has_official_boundary_component(event):
+            if not bool(event.is_at_or_wake_command):
+                return
+            boundary_snapshot = self._snapshot(event, "direct")
+            await self._batch_hold_official_boundary(event, boundary_snapshot)
+            return
+        group = self._group_settings()
+        # Private, native @, and Reply-to-self are mandatory entries.  Do not
+        # await a name classifier before deciding them: its timeout/cancel is
+        # unrelated to AstrBot's direct-reply contract.
+        forced = decide_entry(
+            provisional,
+            native_wake=bool(event.is_at_or_wake_command),
+            visible_name_wake=False,
+            natural_enabled=False,
+            allowed_group_scopes=frozenset(),
         )
-        controller_ticket = durable_authority.ticket_for(
-            dispatch,
-            DurableFinalizeConsumer.CONTROLLER_RELEASE,
+        visible_name_wake = False
+        if forced.disposition == "request":
+            decision = forced
+        else:
+            visible_name_wake = await self._visible_name_wake(event)
+            decision = decide_entry(
+                provisional,
+                native_wake=False,
+                visible_name_wake=visible_name_wake,
+                natural_enabled=bool(group.get("natural_participation_enabled", False)),
+                allowed_group_scopes=self._natural_scopes(),
+            )
+            # AstrBot's Master role remains the sole authority source.  It
+            # bypasses Shio admission lists, but an undirected group utterance
+            # is still a natural-participation candidate rather than an
+            # invented mandatory-reply privilege.
+            if (
+                decision.disposition != "request"
+                and provisional.is_master
+                and not provisional.is_private
+                and bool(group.get("natural_participation_enabled", False))
+                and provisional.message_text.strip()
+            ):
+                decision = EntryDecision("request", "natural", "master_natural_event")
+        batch_entry = await self._batch_join_and_wait(
+            event,
+            create_snapshot(event, origin=decision.origin if decision.disposition == "request" else "natural"),
+            mandatory=decision.disposition == "request" and decision.origin in {"direct", "private"},
         )
-        outcome_ticket = durable_authority.ticket_for(
-            dispatch,
-            DurableFinalizeConsumer.OUTCOME_RETIRE,
+        if batch_entry is None:
+            return
+        batch, mandatory, batch_generation, watermark_token = batch_entry
+        origin = "private" if provisional.is_private else (
+            "direct" if mandatory else "natural"
         )
-        self.owner_action_controller.release_terminal_lineage(
-            source,
-            outcome=outcome,
-            outcome_authority=self.action_outcome_authority,
-            ticket=controller_ticket,
-            durable_authority=durable_authority,
-            reclaimed_at=time.time(),
+        snapshot = create_snapshot(event, origin=origin)
+        event.set_extra("shio.sys001.batch", batch)
+        event.set_extra("shio.sys001.batch_generation", batch_generation)
+        event.set_extra("shio.sys001.batch_watermark_token", watermark_token)
+        event.set_extra("shio.sys001.batch_mandatory", mandatory)
+        if not mandatory and decision.disposition != "request":
+            await self._batch_mark_terminal(
+                snapshot.scope, snapshot.message_id, batch_generation, watermark_token,
+            )
+            return
+        if snapshot.origin == "natural" and not await self._ensure_natural_scope_ready(
+            provisional.scope
+        ):
+            await self._batch_mark_terminal(snapshot.scope, snapshot.message_id, batch_generation, watermark_token)
+            return
+        if snapshot.origin == "natural" and not await self._natural_gate_allows(
+            provisional.scope
+        ):
+            await self._batch_mark_terminal(snapshot.scope, snapshot.message_id, batch_generation, watermark_token)
+            return
+        snapshot = self._snapshot(event, origin)
+        await self.capture_master_alert_binding(event, snapshot)
+        if (
+            getattr(self, "_master_alert_terminated", False)
+            or getattr(self, "_master_alert_terminating", False)
+        ):
+            return
+        lifecycle = event.get_extra(SYS001_LIFECYCLE_EXTRA)
+        if isinstance(lifecycle, TurnLifecycle):
+            lifecycle.begin_request()
+        if snapshot.origin == "natural":
+            try:
+                natural_decision = await self._decide_natural_participation(event, snapshot)
+            except asyncio.CancelledError:
+                self._retire_unstarted_natural_candidate(event, snapshot)
+                raise
+            if natural_decision == "WAIT":
+                self._retire_unstarted_natural_candidate(event, snapshot)
+                if isinstance(lifecycle, TurnLifecycle):
+                    lifecycle.terminal("wait")
+                await self._batch_mark_terminal(
+                    snapshot.scope, snapshot.message_id, batch_generation, watermark_token
+                )
+                return
+            if natural_decision == "NO_ACTION":
+                if isinstance(lifecycle, TurnLifecycle):
+                    lifecycle.terminal("no_action")
+                await self._record_natural_no_action(event, snapshot)
+                self._retire_unstarted_natural_candidate(event, snapshot)
+                await self._batch_mark_terminal(
+                    snapshot.scope, snapshot.message_id, batch_generation, watermark_token
+                )
+                return
+            if natural_decision != "REPLY":
+                self._retire_unstarted_natural_candidate(event, snapshot)
+                if isinstance(lifecycle, TurnLifecycle):
+                    lifecycle.terminal("natural_decision_unavailable")
+                await self._batch_mark_terminal(
+                    snapshot.scope, snapshot.message_id, batch_generation, watermark_token
+                )
+                return
+            if not await self._activate_natural_candidate(event, snapshot):
+                if isinstance(lifecycle, TurnLifecycle):
+                    lifecycle.terminal("natural_decision_stale")
+                await self._batch_mark_terminal(
+                    snapshot.scope, snapshot.message_id, batch_generation, watermark_token
+                )
+                return
+        if (
+            getattr(self, "_master_alert_terminated", False)
+            or getattr(self, "_master_alert_terminating", False)
+        ):
+            return
+        try:
+            conversation = await self._current_conversation(event)
+        except Exception:
+            logger.exception("Shio could not obtain the official conversation")
+            if isinstance(lifecycle, TurnLifecycle):
+                lifecycle.terminal("conversation_unavailable")
+            if not snapshot.is_private:
+                await self._batch_mark_terminal(
+                    snapshot.scope, snapshot.message_id, batch_generation, watermark_token
+                )
+            return
+        # Natural participation was decided before this point by a distinct,
+        # tool-free auxiliary call. The main Agent receives only the real user
+        # message: it must never be asked to emit WAIT/NO_ACTION after tools or
+        # conversation state may already have run.
+        prompt = snapshot.message_text
+        # ProcessStage would otherwise run the default AgentRequestSubStage
+        # after consuming this yielded request. This public flag blocks only
+        # that duplicate default call, never this plugin request.
+        # Admission and the official request construction share the Master
+        # lifecycle mutex with termination.  The pre-fence may win either
+        # before or during any earlier await, but never after this request has
+        # been constructed as a live, event-bound unit of work.
+        async with self._master_alert_mutex():
+            if (
+                getattr(self, "_master_alert_terminated", False)
+                or getattr(self, "_master_alert_terminating", False)
+            ):
+                return
+            event.should_call_llm(True)
+            request = event.request_llm(prompt=prompt, conversation=conversation)
+            event.set_extra(_SHIO_AGENT_REQUEST_EXTRA, request)
+        if (
+            getattr(self, "_master_alert_terminated", False)
+            or getattr(self, "_master_alert_terminating", False)
+        ):
+            return
+        yield request
+
+    @filter.on_llm_request(priority=-1000000)
+    async def attach_turn_and_project_capabilities(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        """Add immutable facts and only remove group-visible tool names."""
+        fence = getattr(self, "_active_event_fence", None)
+        if (
+            isinstance(fence, ActiveEventFence)
+            and fence.is_managed(event)
+            and not fence.owns(event)
+        ):
+            return
+        snapshot = event.get_extra(SYS001_TURN_EXTRA)
+        lifecycle = event.get_extra(SYS001_LIFECYCLE_EXTRA)
+        if not isinstance(snapshot, TurnSnapshot):
+            return
+        if (
+            isinstance(lifecycle, TurnLifecycle)
+            and isinstance(fence, ActiveEventFence)
+            and not fence.register(event)
+        ):
+            return
+        try:
+            await self._apply_official_group_history(event, snapshot, req)
+            self._observe_segmented_reply_compatibility(event)
+            req.system_prompt = f"{req.system_prompt or ''}\n\n{snapshot.model_context()}"
+            identity = self._identity_settings()
+            relationship_prompt = str(identity.get("master_relationship_prompt", "")).strip()
+            if (
+                snapshot.is_master
+                and bool(identity.get("master_relationship_enabled", False))
+                and relationship_prompt
+            ):
+                req.system_prompt = (
+                    f"{req.system_prompt}\n\n[Shio Master 表达附加规则]\n"
+                    f"{relationship_prompt}"
+                )
+            self._project_group_visible_tools(snapshot, req)
+        except BaseException:
+            if isinstance(fence, ActiveEventFence):
+                fence.discard(event)
+            raise
+
+    async def _apply_official_group_history(
+        self,
+        event: AstrMessageEvent,
+        snapshot: TurnSnapshot,
+        req: ProviderRequest,
+    ) -> None:
+        """Replace only group conversation contexts with sanitizable official rows."""
+        if snapshot.is_private:
+            return
+        # A current conversation may already have expanded to role/content JSON
+        # before this hook.  It has no sender provenance and is never a safe
+        # fallback for group filtering.
+        req.contexts = []
+        history = await self._official_group_history_contexts(event, snapshot)
+        batch = event.get_extra("shio.sys001.batch", ())
+        if isinstance(batch, tuple) and all(isinstance(item, _BatchMessage) for item in batch):
+            # The watermark is the request prompt and must not appear again as
+            # a batch context. Earlier real events remain explicit once only.
+            req.contexts = [*history, *self._batch_contexts(batch[:-1])]
+        else:
+            req.contexts = history
+
+    def _project_group_visible_tools(
+        self,
+        snapshot: TurnSnapshot,
+        req: ProviderRequest,
+    ) -> None:
+        """Only remove ordinary group tools from the current public ToolSet."""
+        if snapshot.is_private or snapshot.is_master or req.func_tool is None:
+            return
+
+        settings = self._capability_visibility_settings()
+        friendly_sender_ids = frozenset(
+            str(sender_id)
+            for sender_id in settings.get("friendly_sender_ids", [])
+            if isinstance(sender_id, str) and sender_id
         )
-        self.action_outcome_authority.finalize_reclaimed_outcome(
-            outcome,
-            planned_action,
-            ticket=outcome_ticket,
-            durable_authority=durable_authority,
+        if is_friendly_sender(snapshot.sender_id, friendly_sender_ids):
+            return
+
+        allowed_names = frozenset(
+            str(name)
+            for name in settings.get("ordinary_capability_names", [])
+            if isinstance(name, str) and name
         )
-        durable_authority.complete(controller_ticket)
-        event.set_extra(SHIO_OWNER_ACTION_SEND_EVIDENCE, evidence)
-        event.set_extra(SHIO_OWNER_ACTION_SOURCE, None)
-        event.set_extra(SHIO_ACTION_OUTCOME, None)
-        event.set_extra(SHIO_OWNER_ACTION_LIFECYCLE_HANDLE, None)
+        visible_tools = project_visible_tools(
+            getattr(req.func_tool, "tools", ()),
+            is_master=False,
+            is_friendly=False,
+            allowed_names=allowed_names,
+            always_visible_names=ALL_GROUP_USERS_CAPABILITY_NAMES,
+        )
+        req.func_tool = ToolSet(tools=visible_tools)
+
+    async def _review_final_text(
+        self, event: AstrMessageEvent, snapshot: TurnSnapshot, text: str
+    ) -> _FinalReviewOutcome:
+        """Review, repair, then re-review one existing final response.
+
+        Every unusable auxiliary route is fail-closed.  This helper never
+        creates a second main reply or sends a message; its caller chooses
+        whether an explicitly approved last reply may continue downstream.
+        """
+        settings = self._final_review_settings()
+        mode = settings.get("mode", "off")
+        if mode not in {"core", "additional", "combined"} or not text:
+            return _FinalReviewOutcome(text)
+        try:
+            timeout = float(settings.get("timeout_seconds", 8))
+            maximum = int(settings.get("max_repair_attempts", 1))
+        except (TypeError, ValueError):
+            return _FinalReviewOutcome(text, exhausted=True)
+        if not isfinite(timeout) or timeout <= 0 or not 0 <= maximum <= 3:
+            return _FinalReviewOutcome(text, exhausted=True)
+        deadline = asyncio.get_running_loop().time() + timeout
+        # A started real Agent turn remains entitled to its bounded review even
+        # if a later natural candidate is merely classified WAIT/NO_ACTION.
+        # Cadence keeps the generation fence at RespondStage commit time.
+        binding = self._bind_auxiliary_call(
+            event, snapshot, fence_natural_generation=False
+        )
+        explicit_id = settings.get("provider_id", "")
+        fallback_ids = settings.get("fallback_provider_ids", [])
+        if not isinstance(explicit_id, str) or not isinstance(fallback_ids, list):
+            return _FinalReviewOutcome(text, exhausted=True)
+        providers = await self._auxiliary_providers(
+            event, binding, explicit_provider_id=explicit_id,
+            fallback_provider_ids=fallback_ids, deadline=deadline,
+        )
+        if providers is _AUXILIARY_DEADLINE_EXHAUSTED:
+            return _FinalReviewOutcome(text, exhausted=True)
+        if providers is None:
+            return _FinalReviewOutcome(text, stale=True)
+        attempts: list[dict[str, str]] = []
+        event.set_extra("shio.sys001.final_review_attempts", attempts)
+        if not providers:
+            attempts.append({"outcome": "unavailable"})
+            return _FinalReviewOutcome(text, exhausted=True)
+        additional = settings.get("additional_prompt", "")
+        additional_rule = additional.strip() if isinstance(additional, str) else ""
+        rules = "core safety and consistency rules"
+        if mode == "additional":
+            rules = additional_rule
+        elif mode == "combined" and additional_rule:
+            rules = f"{rules}; {additional_rule}"
+        candidate = text
+        repairs = 0
+        while True:
+            usable_decision = None
+            # ``maximum`` bounds accepted repair/re-review cycles only. Every
+            # invocation still tries the full configured public route list.
+            for provider in providers:
+                if provider is None:
+                    continue
+                response = await self._auxiliary_text_chat(
+                    event,
+                    binding,
+                    provider,
+                    prompt=(
+                        "Review this final assistant text against these rules: "
+                        f"{rules}. Return only JSON {{\"action\":\"keep\"}} or "
+                        "{\"action\":\"replace\",\"text\":\"complete replacement\"}. "
+                        "Do not use hidden markers.\n\n"
+                        f"TEXT:\n{candidate}"
+                    ),
+                    deadline=deadline,
+                    deadline_sentinel=True,
+                )
+                if response is _AUXILIARY_DEADLINE_EXHAUSTED:
+                    attempts.append({"outcome": "deadline_exhausted"})
+                    return _FinalReviewOutcome(candidate, exhausted=True)
+                if response is None:
+                    if not self._auxiliary_call_is_current(event, binding):
+                        return _FinalReviewOutcome(text, stale=True)
+                    attempts.append({"outcome": "unavailable"})
+                    continue
+                if not self._auxiliary_call_is_current(event, binding):
+                    return _FinalReviewOutcome(text, stale=True)
+                decision = parse_final_review_decision(
+                    getattr(response, "completion_text", ""), candidate
+                )
+                if decision is None:
+                    attempts.append({"outcome": "invalid"})
+                    continue
+                attempts.append({"outcome": decision.action})
+                usable_decision = decision
+                break
+            if usable_decision is None:
+                return _FinalReviewOutcome(candidate, exhausted=True)
+            if usable_decision.action == "keep":
+                return _FinalReviewOutcome(candidate)
+            if (
+                settings.get("repair_enabled", False) is not True
+                or settings.get("use_repaired_text", False) is not True
+                or repairs >= maximum
+            ):
+                return _FinalReviewOutcome(candidate, exhausted=True)
+            candidate = usable_decision.replacement_text
+            repairs += 1
+
+    @filter.on_llm_response(priority=100000)
+    async def observe_final_agent_response(
+        self, event: AstrMessageEvent, response: LLMResponse
+    ) -> None:
+        """Observe AstrBot's one final Agent response without inferring attempts."""
+        fence = getattr(self, "_active_event_fence", None)
+        if (
+            isinstance(fence, ActiveEventFence)
+            and fence.is_managed(event)
+            and not fence.owns(event)
+        ):
+            return
+        snapshot = event.get_extra(SYS001_TURN_EXTRA)
+        lifecycle = event.get_extra(SYS001_LIFECYCLE_EXTRA)
+        if not isinstance(snapshot, TurnSnapshot) or not isinstance(
+            lifecycle, TurnLifecycle
+        ):
+            return
+        if isinstance(
+            event.get_extra(SYS001_FINAL_AGENT_OBSERVATION_EXTRA, None),
+            FinalAgentObservation,
+        ):
+            return
+        review = _FinalReviewOutcome(str(getattr(response, "completion_text", "")))
+        if isinstance(response.completion_text, str) and response.completion_text:
+            review = await self._review_final_text(
+                event, snapshot, response.completion_text
+            )
+            if review.stale:
+                # A reloaded instance or superseded natural turn must not
+                # reinterpret this old response, alert, or alter its result.
+                if isinstance(fence, ActiveEventFence):
+                    fence.discard(event)
+                return
+            response.completion_text = review.text
+        if review.exhausted and not review.accepted_last_reply:
+            if self._final_review_settings().get(
+                "send_last_reply_on_review_exhausted", False
+            ) is not True:
+                response.completion_text = ""
+                observation = FinalAgentObservation("review_exhausted", response)
+                event.set_extra(SYS001_FINAL_AGENT_OBSERVATION_EXTRA, observation)
+                lifecycle.terminal("review_exhausted")
+                await self._record_master_alert_terminal(
+                    event, snapshot, success=False, terminal_reason="review_exhausted"
+                )
+                await self._batch_mark_terminal(
+                    snapshot.scope,
+                    snapshot.message_id,
+                    event.get_extra("shio.sys001.batch_generation"),
+                    event.get_extra("shio.sys001.batch_watermark_token"),
+                )
+                if not snapshot.is_private:
+                    await self._continuous_mark_terminal(
+                        snapshot.scope, snapshot.message_id
+                    )
+                return
+        observation = classify_final_agent_response(response)
+        event.set_extra(SYS001_FINAL_AGENT_OBSERVATION_EXTRA, observation)
+        if observation.outcome == "final_text":
+            # WAIT/NO_ACTION are owned exclusively by the pre-Agent natural
+            # classifier. A main-Agent final string is ordinary visible text,
+            # even if it happens to spell a marker after using tools.
+            if snapshot.origin == "natural" and isinstance(
+                response.completion_text, str
+            ) and response.completion_text:
+                event.set_extra(
+                    "shio.sys001.natural_reply_pending",
+                    {
+                        "scope": snapshot.scope,
+                        "generation": event.get_extra("shio.sys001.generation"),
+                        "message_id": snapshot.message_id,
+                        "final_text": response.completion_text,
+                    },
+                )
+            # A Reply/media event has no ordinary text cadence to carry it to
+            # RespondStage.  Its public final-response hook is therefore the
+            # first terminal signal for that official boundary.  Text batches
+            # keep their existing RespondStage/cadence ordering: releasing
+            # them here would let a same-scope request overtake visible send.
+            if self._has_official_boundary_component(event):
+                await self._batch_mark_terminal(
+                    snapshot.scope,
+                    snapshot.message_id,
+                    event.get_extra("shio.sys001.batch_generation"),
+                    event.get_extra("shio.sys001.batch_watermark_token"),
+                )
+            await self._record_master_alert_terminal(
+                event, snapshot, success=True, terminal_reason=""
+            )
+            return
+        lifecycle.terminal(observation.outcome)
+        await self._record_master_alert_terminal(
+            event, snapshot, success=False, terminal_reason=observation.outcome
+        )
+        event.set_extra("shio.sys001.error_master_done", True)
+        await self._batch_mark_terminal(
+            snapshot.scope,
+            snapshot.message_id,
+            event.get_extra("shio.sys001.batch_generation"),
+            event.get_extra("shio.sys001.batch_watermark_token"),
+        )
+        event.set_extra("shio.sys001.error_batch_done", True)
+        if not snapshot.is_private:
+            await self._continuous_mark_terminal(snapshot.scope, snapshot.message_id)
+            event.set_extra("shio.sys001.error_continuous_done", True)
+
+    @filter.on_agent_begin(priority=100000)
+    async def observe_main_agent_begin(
+        self, event: AstrMessageEvent, run_context: Any
+    ) -> None:
+        """Bind the live Agent only to Shio's exact official ProviderRequest."""
+        fence = getattr(self, "_active_event_fence", None)
+        if (
+            isinstance(fence, ActiveEventFence)
+            and fence.is_managed(event)
+            and not fence.owns(event)
+        ):
+            return
+        shio_request = event.get_extra(_SHIO_AGENT_REQUEST_EXTRA)
+        if (
+            isinstance(event.get_extra(SYS001_TURN_EXTRA), TurnSnapshot)
+            and isinstance(event.get_extra(SYS001_LIFECYCLE_EXTRA), TurnLifecycle)
+            and shio_request is not None
+            and event.get_extra("provider_request") is shio_request
+        ):
+            event.set_extra(_SHIO_AGENT_RUN_TOKEN_EXTRA, object())
+            event.set_extra(_SHIO_AGENT_RUN_CONTEXT_EXTRA, run_context)
+
+    @filter.on_agent_done(priority=100000)
+    async def observe_main_agent_done(
+        self, event: AstrMessageEvent, run_context: Any, _response: LLMResponse
+    ) -> None:
+        """Retire a completed public Agent run before another handler can own it."""
+        fence = getattr(self, "_active_event_fence", None)
+        if (
+            isinstance(fence, ActiveEventFence)
+            and fence.is_managed(event)
+            and not fence.owns(event)
+        ):
+            return
+        token = event.get_extra(_SHIO_AGENT_RUN_TOKEN_EXTRA)
+        if (
+            token is None
+            or event.get_extra(_SHIO_AGENT_RUN_CONTEXT_EXTRA) is not run_context
+        ):
+            return
+        event.set_extra(_SHIO_AGENT_RUN_TOKEN_EXTRA, None)
+        event.set_extra(_SHIO_AGENT_RUN_CONTEXT_EXTRA, None)
+        observation = event.get_extra(SYS001_FINAL_AGENT_OBSERVATION_EXTRA)
+        if (
+            isinstance(observation, FinalAgentObservation)
+            and observation.outcome == "final_error"
+        ):
+            event.set_extra(_SHIO_AGENT_ERROR_TOKEN_EXTRA, token)
+            return
+        snapshot = event.get_extra(SYS001_TURN_EXTRA)
+        if (
+            isinstance(snapshot, TurnSnapshot)
+            and snapshot.origin == "natural"
+            and isinstance(observation, FinalAgentObservation)
+            and observation.outcome == "final_text"
+        ):
+            # RespondStage owns the natural cadence boundary.  Keep this
+            # observation and exact request binding through after-send, where
+            # record_standard_send commits the visible reply before retiring
+            # the event-local ownership markers.
+            event.set_extra(_SHIO_AGENT_ERROR_TOKEN_EXTRA, None)
+            return
+        event.set_extra(SYS001_FINAL_AGENT_OBSERVATION_EXTRA, None)
+        event.set_extra(_SHIO_AGENT_ERROR_TOKEN_EXTRA, None)
+        event.set_extra(_SHIO_AGENT_REQUEST_EXTRA, None)
+
+    @filter.on_decorating_result(priority=100000)
+    async def layout_text_components(self, event: AstrMessageEvent) -> None:
+        """Lay out text components while leaving standard delivery to AstrBot."""
+        fence = getattr(self, "_active_event_fence", None)
+        if (
+            isinstance(fence, ActiveEventFence)
+            and fence.is_managed(event)
+            and not fence.owns(event)
+        ):
+            event.clear_result()
+            event.stop_event()
+            return
+        snapshot = event.get_extra(SYS001_TURN_EXTRA)
+        lifecycle = event.get_extra(SYS001_LIFECYCLE_EXTRA)
+        if not isinstance(snapshot, TurnSnapshot):
+            return
+        result = event.get_result()
+        observation = event.get_extra(SYS001_FINAL_AGENT_OBSERVATION_EXTRA)
+        shio_request = event.get_extra(_SHIO_AGENT_REQUEST_EXTRA)
+        active_token = event.get_extra(_SHIO_AGENT_RUN_TOKEN_EXTRA)
+        error_token = event.get_extra(_SHIO_AGENT_ERROR_TOKEN_EXTRA)
+        is_fallback_error = (
+            isinstance(lifecycle, TurnLifecycle)
+            and active_token is not None
+            and not isinstance(observation, FinalAgentObservation)
+            and lifecycle.state == "requesting"
+            and not lifecycle.terminal_reason
+        )
+        is_observed_agent_error = (
+            isinstance(lifecycle, TurnLifecycle)
+            and error_token is not None
+            and isinstance(observation, FinalAgentObservation)
+            and observation.outcome == "final_error"
+            and lifecycle.terminal_reason == "final_error"
+        )
+        if (
+            getattr(result, "result_content_type", None)
+            is ResultContentType.GENERAL_RESULT
+            and isinstance(lifecycle, TurnLifecycle)
+            and shio_request is not None
+            and event.get_extra("provider_request") is shio_request
+            and (is_fallback_error or is_observed_agent_error)
+        ):
+            event.clear_result()
+            event.stop_event()
+            lifecycle.terminal("final_error")
+            try:
+                # The on-LLM-response hook can be cancelled at any one of
+                # these awaited stores.  Decorate is still the same official
+                # error terminal, so it retries the complete idempotent
+                # accounting sequence after suppressing delivery above.
+                if not event.get_extra("shio.sys001.error_master_done", False):
+                    await self._record_master_alert_terminal(event, snapshot, success=False, terminal_reason="final_error")
+                    event.set_extra("shio.sys001.error_master_done", True)
+                if not event.get_extra("shio.sys001.error_batch_done", False):
+                    await self._batch_mark_terminal(snapshot.scope, snapshot.message_id, event.get_extra("shio.sys001.batch_generation"), event.get_extra("shio.sys001.batch_watermark_token"))
+                    event.set_extra("shio.sys001.error_batch_done", True)
+                if not snapshot.is_private and not event.get_extra("shio.sys001.error_continuous_done", False):
+                    await self._continuous_mark_terminal(
+                        snapshot.scope, snapshot.message_id
+                    )
+                    event.set_extra("shio.sys001.error_continuous_done", True)
+            finally:
+                fence = getattr(self, "_active_event_fence", None)
+                if isinstance(fence, ActiveEventFence):
+                    fence.discard(event)
+                event.set_extra(_SHIO_AGENT_RUN_TOKEN_EXTRA, None)
+                event.set_extra(_SHIO_AGENT_RUN_CONTEXT_EXTRA, None)
+                event.set_extra(_SHIO_AGENT_ERROR_TOKEN_EXTRA, None)
+                event.set_extra(_SHIO_AGENT_REQUEST_EXTRA, None)
+            return
+        if result is None or not getattr(result, "chain", None):
+            if isinstance(fence, ActiveEventFence):
+                fence.discard(event)
+            return
+        presentation = self._presentation_settings()
+        mode = presentation.get("text_component_mode", "single")
+        if mode in {"model", "plugin"}:
+            try:
+                minimum = max(1, int(presentation.get("text_component_min_segments", 1)))
+                maximum = max(minimum, int(presentation.get("text_component_max_segments", 3)))
+            except (TypeError, ValueError):
+                return
+            compatibility = event.get_extra("shio.sys001.segmented_reply_status")
+            runs: list[tuple[list[Any], str]] = []
+            index = 0
+            malformed = False
+            while index < len(result.chain):
+                part = result.chain[index]
+                if not isinstance(part, Plain):
+                    index += 1
+                    continue
+                run: list[Any] = []
+                values: list[str] = []
+                while index < len(result.chain) and isinstance(result.chain[index], Plain):
+                    candidate = result.chain[index]
+                    value = getattr(candidate, "text", None)
+                    if not isinstance(value, str):
+                        malformed = True
+                    else:
+                        values.append(value)
+                    run.append(candidate)
+                    index += 1
+                if malformed:
+                    break
+                runs.append((run, "".join(values)))
+            if malformed:
+                return
+
+            nonempty_runs = [(run, text) for run, text in runs if text]
+            # Preserve safe existing component boundaries wherever the global
+            # range already permits them.  Only an unsafe run is coalesced
+            # before any refinement, and no text crosses a non-text part.
+            pieces_by_run: list[list[str]] = []
+            for run, text in nonempty_runs:
+                original_pieces = [getattr(part, "text", None) for part in run]
+                if (
+                    all(isinstance(piece, str) and piece for piece in original_pieces)
+                    and text_components_survive_standard_strip(original_pieces)
+                    and text_component_boundaries_are_safe(text, original_pieces)
+                ):
+                    pieces_by_run.append(original_pieces)
+                else:
+                    pieces_by_run.append([text])
+            degraded = bool(getattr(compatibility, "reason", "") == "cleanup_not_empty")
+            if len(nonempty_runs) > maximum:
+                degraded = True
+
+            model_binding: _AuxiliaryBinding | None = None
+            model_deadline: float | None = None
+            model_providers: list[Any] | None = None
+            if len(nonempty_runs) == 1 and not degraded:
+                run, text = nonempty_runs[0]
+                original_pieces = [getattr(part, "text", None) for part in run]
+                # A safe existing standard chain already meeting the global
+                # range remains intact.  This preserves AstrBot's component
+                # topology (and therefore its standard segmented delivery)
+                # while unsafe original Plain boundaries are still repaired.
+                if (
+                    len(run) > 1
+                    and all(isinstance(piece, str) and piece for piece in original_pieces)
+                    and minimum <= len(original_pieces) <= maximum
+                    and text_components_survive_standard_strip(original_pieces)
+                    and text_component_boundaries_are_safe(text, original_pieces)
+                ):
+                    pieces = original_pieces
+                else:
+                    pieces = (
+                        await self._model_text_components(
+                            event, text, presentation, snapshot=snapshot
+                        )
+                        if mode == "model"
+                        else split_text_components(text, minimum=minimum, maximum=maximum)
+                    )
+                if (
+                    all(isinstance(piece, str) and piece for piece in pieces)
+                    and "".join(pieces) == text
+                    and text_components_survive_standard_strip(pieces)
+                    and text_component_boundaries_are_safe(text, pieces)
+                ):
+                    pieces_by_run = [pieces]
+                else:
+                    degraded = True
+            elif mode == "model" and not degraded and len(nonempty_runs) < minimum:
+                try:
+                    timeout = float(presentation.get("model_segment_timeout_seconds", 8))
+                    explicit = presentation.get("model_segment_provider_id", "")
+                    fallback = presentation.get("model_segment_fallback_provider_ids", [])
+                except (TypeError, ValueError):
+                    timeout, explicit, fallback = 0.0, None, None
+                if (
+                    not isfinite(timeout)
+                    or timeout <= 0
+                    or not isinstance(explicit, str)
+                    or not isinstance(fallback, list)
+                ):
+                    degraded = True
+                else:
+                    model_binding = self._bind_auxiliary_call(event, snapshot)
+                    model_deadline = asyncio.get_running_loop().time() + timeout
+                    model_providers = await self._auxiliary_providers(
+                        event,
+                        model_binding,
+                        explicit_provider_id=explicit,
+                        fallback_provider_ids=fallback,
+                        deadline=model_deadline,
+                    )
+                    if model_providers is None or not model_providers:
+                        degraded = True
+
+            while (
+                len(nonempty_runs) != 1
+                and not degraded
+                and sum(len(pieces) for pieces in pieces_by_run) < minimum
+            ):
+                candidates: list[tuple[int, int, list[str]]] = []
+                for run_index, (_run, text) in enumerate(nonempty_runs):
+                    desired = len(pieces_by_run[run_index]) + 1
+                    if mode == "model":
+                        assert model_binding is not None and model_deadline is not None
+                        candidate = await self._model_text_components(
+                            event,
+                            text,
+                            presentation,
+                            snapshot=snapshot,
+                            binding=model_binding,
+                            deadline=model_deadline,
+                            providers=model_providers,
+                            minimum=desired,
+                            maximum=desired,
+                        )
+                    else:
+                        candidate = split_text_components(
+                            text, minimum=desired, maximum=desired
+                        )
+                    if (
+                        len(candidate) == desired
+                        and all(isinstance(piece, str) and piece for piece in candidate)
+                        and "".join(candidate) == text
+                        and text_components_survive_standard_strip(candidate)
+                        and text_component_boundaries_are_safe(text, candidate)
+                    ):
+                        candidates.append((len(text), run_index, candidate))
+                if not candidates:
+                    degraded = True
+                    break
+                _length, chosen, pieces = max(candidates, key=lambda item: (item[0], -item[1]))
+                pieces_by_run[chosen] = pieces
+
+            # Safe existing runs can begin above the global maximum while a
+            # valid target remains: merge only adjacent pieces inside one run,
+            # never across a non-text component.  Removing an already-safe
+            # boundary is deterministic and preserves the exact run text.
+            while not degraded and sum(len(pieces) for pieces in pieces_by_run) > maximum:
+                choices = [
+                    (len(pieces), -run_index, run_index)
+                    for run_index, pieces in enumerate(pieces_by_run)
+                    if len(pieces) > 1
+                ]
+                if not choices:
+                    degraded = True
+                    break
+                _count, _tie, chosen = max(choices)
+                pieces = pieces_by_run[chosen]
+                candidate = [pieces[0] + pieces[1], *pieces[2:]]
+                _run, text = nonempty_runs[chosen]
+                if (
+                    not all(piece for piece in candidate)
+                    or "".join(candidate) != text
+                    or not text_components_survive_standard_strip(candidate)
+                    or not text_component_boundaries_are_safe(text, candidate)
+                ):
+                    degraded = True
+                    break
+                pieces_by_run[chosen] = candidate
+            if degraded or sum(len(pieces) for pieces in pieces_by_run) < minimum:
+                pieces_by_run = [[text] for _run, text in nonempty_runs]
+                setter = getattr(event, "set_extra", None)
+                if callable(setter):
+                    setter("shio.sys001.text_component_layout_status", "degraded_single")
+
+            replacement_by_part: dict[int, list[Any]] = {}
+            for (run, text), pieces in zip(nonempty_runs, pieces_by_run):
+                if (
+                    len(run) == len(pieces)
+                    and all(getattr(part, "text", None) == piece for part, piece in zip(run, pieces))
+                    and text_component_boundaries_are_safe(text, pieces)
+                ):
+                    replacement_by_part[id(run[0])] = run
+                    continue
+                try:
+                    replacements = [type(run[0])(piece) for piece in pieces]
+                except Exception:
+                    try:
+                        replacements = [Plain(piece) for piece in pieces]
+                    except Exception:
+                        return
+                replacement_by_part[id(run[0])] = replacements
+
+            rebuilt: list[Any] = []
+            index = 0
+            while index < len(result.chain):
+                part = result.chain[index]
+                if not isinstance(part, Plain):
+                    rebuilt.append(part)
+                    index += 1
+                    continue
+                run: list[Any] = []
+                while index < len(result.chain) and isinstance(result.chain[index], Plain):
+                    run.append(result.chain[index])
+                    index += 1
+                text = "".join(
+                    value for value in (getattr(item, "text", None) for item in run)
+                    if isinstance(value, str)
+                )
+                if not text:
+                    continue
+                rebuilt.extend(replacement_by_part.get(id(run[0]), run))
+            result.chain[:] = rebuilt
+            return
+        if mode != "single":
+            return
+        rebuilt: list[Any] = []
+        index = 0
+        while index < len(result.chain):
+            part = result.chain[index]
+            if not isinstance(part, Plain):
+                rebuilt.append(part)
+                index += 1
+                continue
+            run = [part]
+            index += 1
+            while index < len(result.chain) and isinstance(result.chain[index], Plain):
+                run.append(result.chain[index])
+                index += 1
+            if len(run) == 1:
+                rebuilt.append(run[0])
+            else:
+                merged_text = "".join(item.text for item in run)
+                try:
+                    rebuilt.append(type(run[0])(merged_text))
+                except Exception:
+                    # The base public text component remains a safe fallback:
+                    # retaining the old run could preserve an unsafe EGC split.
+                    rebuilt.append(Plain(merged_text))
+        result.chain[:] = rebuilt
+
+    @filter.on_decorating_result(priority=-100000)
+    async def stage_remaining_bubbles(self, event: AstrMessageEvent) -> None:
+        """Leave the first unit for RespondStage and atomically retain the rest.
+
+        This deliberately runs after ordinary decorating hooks.  In particular,
+        Meme Manager has already read the full reviewed text and may retain its
+        own pending image.  The only transport operation below is the later
+        public ``event.send`` call; Shio never reaches a platform adapter.
+        """
+        fence = getattr(self, "_active_event_fence", None)
+        if (
+            isinstance(fence, ActiveEventFence)
+            and fence.is_managed(event)
+            and not fence.owns(event)
+        ):
+            event.clear_result()
+            event.stop_event()
+            return
+        snapshot = event.get_extra(SYS001_TURN_EXTRA)
+        lifecycle = event.get_extra(SYS001_LIFECYCLE_EXTRA)
+        result = event.get_result()
+        if (
+            not isinstance(snapshot, TurnSnapshot)
+            or not isinstance(lifecycle, TurnLifecycle)
+            or result is None
+            or not isinstance(getattr(result, "chain", None), list)
+            or getattr(self, "_bubble_terminated", False)
+        ):
+            return
+        status = event.get_extra("shio.sys001.segmented_reply_status")
+        reason = getattr(status, "reason", "")
+        if getattr(status, "compatible", False):
+            # AstrBot owns this compatible enabled path and will send every
+            # component itself; staging here would duplicate the visible text.
+            event.set_extra("shio.sys001.bubble_delivery_status", "official_compatible")
+            return
+        if reason != "disabled":
+            if reason:
+                status_prefix = "fail_closed" if reason.startswith("official_config_") else "conflict"
+                event.set_extra("shio.sys001.bubble_delivery_status", f"{status_prefix}:{reason}")
+                logger.warning("Shio multi-bubble is disabled by AstrBot segmented-reply conflict: %s", reason)
+            return
+        post_decorator_conflict = self._bubble_post_decorator_conflict(event, result)
+        if post_decorator_conflict:
+            # Fixed AstrBot 4.27.4 runs ResultDecorate's TTS, T2I and QQ
+            # forward conversion only *after* decorating hooks.  Removing
+            # units here would therefore make a later public event.send()
+            # bypass that standard owner.  There is no public API for asking
+            # ResultDecorate to decorate an individual remainder, so retain
+            # the full chain for the normal single RespondStage send.
+            event.set_extra(
+                "shio.sys001.bubble_delivery_status",
+                f"fail_closed:{post_decorator_conflict}",
+            )
+            logger.warning(
+                "Shio multi-bubble retained the standard RespondStage chain: %s",
+                post_decorator_conflict,
+            )
+            return
+        presentation = self._presentation_settings()
+        if presentation.get("text_component_mode", "single") not in {"model", "plugin"}:
+            return
+        bounds = bubble_send_wait_bounds(
+            presentation.get("bubble_send_min_wait_seconds", 0),
+            presentation.get("bubble_send_max_wait_seconds", 0),
+        )
+        if bounds is None:
+            event.set_extra("shio.sys001.bubble_delivery_status", "invalid_wait_bounds")
+            return
+        chain = result.chain
+        text_indexes = [
+            index for index, component in enumerate(chain)
+            if isinstance(component, Plain)
+            and isinstance(getattr(component, "text", None), str)
+            and bool(component.text.strip())
+        ]
+        try:
+            minimum = max(1, int(presentation.get("text_component_min_segments", 1)))
+            maximum = max(minimum, int(presentation.get("text_component_max_segments", 3)))
+        except (TypeError, ValueError):
+            return
+        if not (2 <= len(text_indexes) <= maximum) or len(text_indexes) < minimum:
+            return
+        first_text = text_indexes[0]
+        # Reply and At have standard first-message semantics.  A plugin must
+        # not move a later one backward or copy it into a later bubble.
+        if any(
+            getattr(component, "type", "") in {"reply", "at"}
+            for component in chain[first_text + 1 :]
+        ):
+            event.set_extra("shio.sys001.bubble_delivery_status", "unsafe_reply_or_at_order")
+            return
+        first = tuple(chain[: first_text + 1])
+        if not first:
+            return
+        units: list[tuple[Any, ...]] = []
+        for component in chain[first_text + 1 :]:
+            # Each unit preserves original component order.  Text components
+            # are isolated so every remaining text is exactly one bubble.
+            units.append((component,))
+        if not units:
+            return
+        generation = event.get_extra("shio.sys001.generation")
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            generation = None
+        instance_token = getattr(self, "_bubble_instance_token", None)
+        if instance_token is None:
+            # Small direct-hook test harnesses may construct a plugin with
+            # __new__; production instances receive this in __init__.
+            instance_token = object()
+            self._bubble_instance_token = instance_token
+        pending = _PendingBubbleDelivery(
+            tuple(units), id(event), id(snapshot), id(lifecycle), snapshot.message_id,
+            generation, getattr(self, "_bubble_epoch", 0), instance_token,
+        )
+        result.chain[:] = list(first)
+        event.set_extra("shio.sys001.pending_bubble_delivery", pending)
+        event.set_extra("shio.sys001.bubble_delivery_status", "pending")
+
+    def _bubble_post_decorator_conflict(
+        self, event: AstrMessageEvent, result: Any
+    ) -> str | None:
+        """Fail closed when fixed ResultDecorate can still rewrite the full chain."""
+        try:
+            config = self.context.get_config(umo=event.unified_msg_origin)
+        except Exception:
+            return "official_post_decorator_config_unavailable"
+        if not isinstance(config, dict):
+            return "official_post_decorator_config_unavailable"
+        is_llm_result = getattr(result, "is_llm_result", None)
+        if not callable(is_llm_result):
+            return "official_result_shape_unknown"
+        try:
+            llm_result = bool(is_llm_result())
+        except Exception:
+            return "official_result_shape_unknown"
+        tts = config.get("provider_tts_settings")
+        if not isinstance(tts, dict) or "enable" not in tts:
+            return "official_tts_config_unavailable"
+        if llm_result and bool(tts["enable"]):
+            # The fixed path additionally checks session/provider/probability;
+            # none is publicly available to a decorating plugin, so enabled
+            # TTS is conservatively treated as a real possible conversion.
+            return "official_tts"
+        use_t2i = getattr(result, "use_t2i_", _AUXILIARY_DEADLINE_EXHAUSTED)
+        if use_t2i is _AUXILIARY_DEADLINE_EXHAUSTED or (
+            use_t2i is not None and not isinstance(use_t2i, bool)
+        ):
+            return "official_result_shape_unknown"
+        configured_t2i = config.get("t2i", _AUXILIARY_DEADLINE_EXHAUSTED)
+        if not isinstance(configured_t2i, bool):
+            return "official_t2i_config_unavailable"
+        platform_settings = config.get("platform_settings")
+        if not isinstance(platform_settings, dict):
+            return "official_reply_prefix_config_unavailable"
+        # ResultDecorate applies this public config value after decorating
+        # hooks, before either T2I or aiocqhttp-forward conversion.  Direct
+        # plugin test fixtures from earlier rounds omit the default empty
+        # field, so absence is equivalent to that public default; a supplied
+        # non-string value cannot be projected safely and retains the chain.
+        reply_prefix = platform_settings.get("reply_prefix", "")
+        if not isinstance(reply_prefix, str):
+            return "official_reply_prefix_config_unavailable"
+        # initialize reads this required key before processing either branch;
+        # a missing key must retain the normal chain even when T2I is disabled.
+        raw_threshold = config.get("t2i_word_threshold", _AUXILIARY_DEADLINE_EXHAUSTED)
+        if raw_threshold is _AUXILIARY_DEADLINE_EXHAUSTED:
+            return "official_t2i_config_unavailable"
+        # A provider-forced T2I result is an explicit post-decorator owner
+        # choice.  It must retain the standard chain even when this plugin
+        # cannot predict the provider's later render input from a short text.
+        if use_t2i is True:
+            return "official_t2i"
+        t2i_may_run = use_t2i is None and configured_t2i
+        if t2i_may_run:
+            try:
+                t2i_threshold = max(int(raw_threshold), 50)
+            except (TypeError, ValueError, OverflowError):
+                # Fixed ResultDecorate.initialize catches malformed values and
+                # uses its documented fallback rather than staging a bypass.
+                t2i_threshold = 150
+            leading_plain = []
+            for component in getattr(result, "chain", ()):
+                if not isinstance(component, Plain) or not isinstance(
+                    getattr(component, "text", None), str
+                ):
+                    break
+                text = component.text
+                if not leading_plain and reply_prefix:
+                    # Fixed ResultDecorate mutates the first Plain only after
+                    # hooks.  Project that one public transformation before
+                    # deciding whether taking a remainder would bypass T2I.
+                    text = reply_prefix + text
+                leading_plain.append("\n\n" + text)
+            if len("".join(leading_plain)) > t2i_threshold:
+                return "official_t2i"
+        if event.get_platform_name() != "aiocqhttp":
+            return None
+        threshold = platform_settings.get("forward_threshold")
+        try:
+            threshold = int(threshold)
+        except (TypeError, ValueError):
+            return "official_forward_config_unavailable"
+        text_length = sum(
+            len(component.text)
+            for component in getattr(result, "chain", ())
+            if isinstance(component, Plain) and isinstance(component.text, str)
+        )
+        if reply_prefix:
+            for component in getattr(result, "chain", ()):
+                if isinstance(component, Plain):
+                    if not isinstance(getattr(component, "text", None), str):
+                        return "official_result_shape_unknown"
+                    text_length += len(reply_prefix)
+                    break
+        if text_length > threshold:
+            return "official_forward"
+        return None
+
+    def _pending_bubble_delivery_is_current(
+        self, event: AstrMessageEvent, pending: _PendingBubbleDelivery
+    ) -> bool:
+        snapshot = event.get_extra(SYS001_TURN_EXTRA)
+        lifecycle = event.get_extra(SYS001_LIFECYCLE_EXTRA)
+        generation = event.get_extra("shio.sys001.generation")
+        return (
+            not getattr(self, "_bubble_terminated", False)
+            and pending.epoch == getattr(self, "_bubble_epoch", 0)
+            and pending.instance_token is getattr(self, "_bubble_instance_token", None)
+            and id(event) == pending.event_id
+            and isinstance(snapshot, TurnSnapshot)
+            and id(snapshot) == pending.snapshot_id
+            and snapshot.message_id == pending.message_id
+            and isinstance(lifecycle, TurnLifecycle)
+            and id(lifecycle) == pending.lifecycle_id
+            and lifecycle.state not in {"blocked", "failed"}
+            and generation == pending.generation
+        )
+
+    async def _wait_between_bubbles(self, lower: float, upper: float) -> None:
+        sleeper = getattr(self, "_bubble_sleep", asyncio.sleep)
+        await sleeper(random.uniform(lower, upper))
+
+    @staticmethod
+    def _stop_bubble_after_send(event: AstrMessageEvent, status: str) -> None:
+        """Use AstrBot's public event propagation stop before Meme's hook runs."""
+        event.set_extra("shio.sys001.bubble_delivery_status", status)
+        event.stop_event()
+
+    @filter.after_message_sent(priority=100000)
+    async def send_remaining_bubbles(self, event: AstrMessageEvent) -> None:
+        """Consume one remainder plan before Meme's after-send image hook."""
+        fence = getattr(self, "_active_event_fence", None)
+        if (
+            isinstance(fence, ActiveEventFence)
+            and fence.is_managed(event)
+            and not fence.owns(event)
+        ):
+            event.set_extra("shio.sys001.pending_bubble_delivery", None)
+            event.stop_event()
+            return
+        snapshot = event.get_extra(SYS001_TURN_EXTRA)
+        lifecycle = event.get_extra(SYS001_LIFECYCLE_EXTRA)
+        pending = event.get_extra("shio.sys001.pending_bubble_delivery")
+        # Take before awaiting: repeated hooks and re-entry cannot duplicate.
+        event.set_extra("shio.sys001.pending_bubble_delivery", None)
+        if not isinstance(pending, _PendingBubbleDelivery):
+            if pending is not None:
+                # A reload gives the old dataclass a distinct identity.  It
+                # must fail closed so a later Meme hook cannot send alone.
+                self._stop_bubble_after_send(event, "stale")
+            return
+        if not self._pending_bubble_delivery_is_current(event, pending):
+            self._stop_bubble_after_send(event, "stale")
+            return
+        presentation = self._presentation_settings()
+        bounds = bubble_send_wait_bounds(
+            presentation.get("bubble_send_min_wait_seconds", 0),
+            presentation.get("bubble_send_max_wait_seconds", 0),
+        )
+        if bounds is None:
+            self._stop_bubble_after_send(event, "invalid_wait_bounds")
+            return
+        try:
+            for unit in pending.units:
+                if not self._pending_bubble_delivery_is_current(event, pending):
+                    self._stop_bubble_after_send(event, "stale")
+                    return
+                await self._wait_between_bubbles(*bounds)
+                if not self._pending_bubble_delivery_is_current(event, pending):
+                    self._stop_bubble_after_send(event, "stale")
+                    return
+                await event.send(MessageChain(chain=list(unit)))
+                # A terminate/reload can race the public await, including the
+                # final remainder.  Do not report a successful chain or let
+                # subsequent after-send hooks run when that fence moved.
+                if not self._pending_bubble_delivery_is_current(event, pending):
+                    self._stop_bubble_after_send(event, "stale")
+                    return
+        except asyncio.CancelledError:
+            fence = getattr(self, "_active_event_fence", None)
+            if isinstance(fence, ActiveEventFence):
+                fence.discard(event)
+            self._stop_bubble_after_send(event, "cancelled")
+            raise
+        except Exception:
+            fence = getattr(self, "_active_event_fence", None)
+            if isinstance(fence, ActiveEventFence):
+                fence.discard(event)
+            logger.warning("Shio remaining bubble send failed; no retry or compensation")
+            self._stop_bubble_after_send(event, "send_failed")
+            return
+        event.set_extra("shio.sys001.bubble_delivery_status", "sent")
+
+    async def _model_text_components(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        presentation: dict[str, Any],
+        *,
+        snapshot: TurnSnapshot | None = None,
+        binding: _AuxiliaryBinding | None = None,
+        deadline: float | None = None,
+        providers: list[Any] | None = None,
+        minimum: int | None = None,
+        maximum: int | None = None,
+    ) -> list[str]:
+        """Use an official Provider only for reversible visible boundaries."""
+        try:
+            configured_maximum = max(
+                1, int(presentation.get("text_component_max_segments", 3))
+            )
+            configured_minimum = max(
+                1,
+                min(
+                    configured_maximum,
+                    int(presentation.get("text_component_min_segments", 1)),
+                ),
+            )
+        except (TypeError, ValueError):
+            return [text]
+        upper = configured_maximum if maximum is None else max(1, maximum)
+        lower = configured_minimum if minimum is None else max(1, min(upper, minimum))
+        if binding is None:
+            binding = self._bind_auxiliary_call(event, snapshot)
+        if deadline is None:
+            fallback_ids = presentation.get("model_segment_fallback_provider_ids", [])
+            explicit = presentation.get("model_segment_provider_id", "")
+            if not isinstance(fallback_ids, list) or not isinstance(explicit, str):
+                return [text]
+            try:
+                timeout = float(presentation.get("model_segment_timeout_seconds", 8))
+            except (TypeError, ValueError):
+                return [text]
+            if not isfinite(timeout) or timeout <= 0:
+                return [text]
+            deadline = asyncio.get_running_loop().time() + timeout
+        if providers is None:
+            fallback_ids = presentation.get("model_segment_fallback_provider_ids", [])
+            explicit = presentation.get("model_segment_provider_id", "")
+            if not isinstance(fallback_ids, list) or not isinstance(explicit, str):
+                return [text]
+            providers = await self._auxiliary_providers(
+                event, binding, explicit_provider_id=explicit,
+                fallback_provider_ids=fallback_ids, deadline=deadline,
+            )
+        if providers is _AUXILIARY_DEADLINE_EXHAUSTED:
+            return [text]
+        if providers is None:
+            return [text]
+        for provider in providers:
+            response = await self._auxiliary_text_chat(
+                event,
+                binding,
+                provider,
+                prompt=(
+                    "Return only JSON {\"segments\":[...]}. Preserve every character "
+                    f"of this text in {lower}..{upper} nonempty segments:\n{text}"
+                ),
+                deadline=deadline,
+                deadline_sentinel=True,
+            )
+            if response is _AUXILIARY_DEADLINE_EXHAUSTED:
+                return [text]
+            if response is None or not self._auxiliary_call_is_current(event, binding):
+                continue
+            try:
+                parsed = json.loads(getattr(response, "completion_text", ""))
+            except Exception:
+                continue
+            pieces = parsed.get("segments") if set(parsed) == {"segments"} else None
+            if (
+                isinstance(pieces, list)
+                and lower <= len(pieces) <= upper
+                and all(isinstance(piece, str) and piece for piece in pieces)
+                and "".join(pieces) == text
+                and text_components_survive_standard_strip(pieces)
+                and text_component_boundaries_are_safe(text, pieces)
+            ):
+                return pieces
+        return [text]
 
     @filter.after_message_sent(priority=-100)
-    async def confirm_automatic_send_observation(
-        self,
-        event: AstrMessageEvent,
-    ) -> None:
-        tracker = self._send_observation_tracker(event)
-        if tracker is None or not tracker.pending_automatic_segment_id:
+    async def record_standard_send(self, event: AstrMessageEvent) -> None:
+        """Record RespondStage completion, never a transport-delivery receipt."""
+        fence = getattr(self, "_active_event_fence", None)
+        if (
+            isinstance(fence, ActiveEventFence)
+            and fence.is_managed(event)
+            and not fence.owns(event)
+        ):
+            event.stop_event()
             return
-        segment_id = tracker.pending_automatic_segment_id
-        visible_text = tracker.pending_automatic_text
-        self.send_receipts.mark_succeeded(segment_id)
-        record_pipeline_stage(
-            event,
-            "send_success",
-            automatic=True,
-            visible_chars=len(visible_text),
+        snapshot = event.get_extra(SYS001_TURN_EXTRA)
+        lifecycle = event.get_extra(SYS001_LIFECYCLE_EXTRA)
+        observation = event.get_extra(SYS001_FINAL_AGENT_OBSERVATION_EXTRA)
+        if isinstance(lifecycle, TurnLifecycle):
+            lifecycle.observe_send()
+        is_natural_final = (
+            not getattr(self, "_natural_terminated", False)
+            and isinstance(snapshot, TurnSnapshot) and snapshot.origin == "natural"
+            and isinstance(observation, FinalAgentObservation)
+            and observation.outcome == "final_text"
+            and isinstance(lifecycle, TurnLifecycle) and lifecycle.respond_stage_completed
+            and not event.get_extra("shio.sys001.natural_stage_committed", False)
         )
-        tracker.pending_automatic_segment_id = ""
-        tracker.pending_automatic_text = ""
-        self._observe_successful_send_segment(event, visible_text)
-        trace_context = get_trace_context(event)
-        if trace_context is not None:
-            self.performance_window.observe_latency(
-                LatencyKind.FULL_REPLY,
-                float((time.perf_counter() - trace_context.started_at) * 1000.0),
+        if is_natural_final:
+            pass
+        elif isinstance(snapshot, TurnSnapshot) and isinstance(lifecycle, TurnLifecycle) and lifecycle.respond_stage_completed:
+            await self._batch_mark_terminal(
+                snapshot.scope,
+                snapshot.message_id,
+                event.get_extra("shio.sys001.batch_generation"),
+                event.get_extra("shio.sys001.batch_watermark_token"),
             )
+        else:
+            scope = event.get_extra("shio.sys001.batch_scope")
+            message_id = getattr(getattr(event, "message_obj", None), "message_id", "")
+            await self._batch_mark_terminal(
+                scope if isinstance(scope, str) else "",
+                message_id if isinstance(message_id, str) else "",
+                event.get_extra("shio.sys001.batch_generation"),
+                event.get_extra("shio.sys001.batch_watermark_token"),
+            )
+        if isinstance(fence, ActiveEventFence):
+            fence.discard(event)
+        if not is_natural_final:
+            return
         try:
-            affect_mutation = self._settle_affect_after_send(event)
-            if (
-                isinstance(affect_mutation, AffectMutationResult)
-                and affect_mutation.status is AffectMutationStatus.REJECTED
-            ):
-                structured_log(
-                    logger,
-                    "warning",
-                    "affect.outbound_rejected",
-                    trace_id=get_trace_id(event),
-                    **affect_mutation.trace_metadata(),
+            deferred_error: BaseException | None = None
+            try:
+                await self._batch_mark_terminal(
+                    snapshot.scope,
+                    snapshot.message_id,
+                    event.get_extra("shio.sys001.batch_generation"),
+                    event.get_extra("shio.sys001.batch_watermark_token"),
                 )
-        except Exception as exc:
-            structured_log(
-                logger,
-                "error",
-                "affect.outbound_failed",
-                trace_id=get_trace_id(event),
-                failure_kind=safe_exception_kind(exc),
+            except asyncio.CancelledError as exc:
+                deferred_error = exc
+                asyncio.current_task().uncancel()
+            except Exception as exc:
+                deferred_error = exc
+            pending = event.get_extra("shio.sys001.natural_reply_pending")
+            ready = isinstance(pending, dict) and pending.get("scope") == snapshot.scope
+            generation = event.get_extra("shio.sys001.generation")
+            ready = ready and not (
+                not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation != pending.get("generation")
+                or pending.get("message_id") != snapshot.message_id
+                or not isinstance(pending.get("final_text"), str)
+                or not pending["final_text"]
+                or not snapshot.message_id
             )
-        try:
-            self._finalize_owner_action_delivery(event)
-        except Exception as exc:
-            structured_log(
-                logger,
-                "error",
-                "owner_action.delivery_finalize_failed",
-                trace_id=get_trace_id(event),
-                failure_kind=safe_exception_kind(exc),
-            )
-        payload = event.get_extra(SHIO_PAYLOAD, {})
-        if isinstance(payload, dict) and payload.get("chat_type") == "group":
-            sent_record = self.send_receipts.sent_reply_record(
-                tracker.internal_reply_id
-            )
-            if sent_record is not None:
-                scene_mutation = self.group_scenes.record_outbound(
-                    sent_record,
-                    source=SceneEntrySource.SHIO_OUTBOUND,
-                )
-                event.set_extra(SHIO_GROUP_SCENE_MUTATION, scene_mutation)
-                event.set_extra(
-                    SHIO_GROUP_SCENE_SNAPSHOT,
-                    scene_mutation.snapshot,
-                )
-                record_pipeline_stage(
-                    event,
-                    "scene_outbound",
-                    **scene_mutation.trace_metadata(),
-                )
-                if (
-                    scene_mutation.status
-                    is not SceneMutationStatus.ACCEPTED_SHIO_OUTBOUND
-                ):
-                    structured_log(
-                        logger,
-                        "error",
-                        "scene.outbound_rejected",
-                        trace_id=get_trace_id(event),
-                        **scene_mutation.trace_metadata(),
+            if ready:
+                async with self._natural_lock(snapshot.scope):
+                    ready = not (
+                    not self._natural_ready.get(snapshot.scope, False)
+                    or generation != self._natural_generations.get(snapshot.scope)
+                    or event.get_extra("shio.sys001.natural_stage_committed", False)
                     )
-        self._emit_pipeline_metrics(event)
+                    if ready:
+                        _cooldown, window_seconds, _maximum, _backoff_base, _backoff_maximum = (
+                    self._natural_cadence_settings()
+                        )
+                        candidate = natural_reply_completed(
+                    self._natural_cadence.get(snapshot.scope, NaturalCadence.empty()),
+                    now=time.time(),
+                    window_seconds=window_seconds,
+                        )
+                        if await self._persist_natural_state(
+                    scope=snapshot.scope,
+                    state=candidate,
+                    generation=generation,
+                    message_id=snapshot.message_id,
+                        ):
+                            event.set_extra("shio.sys001.natural_stage_committed", True)
+            if deferred_error is not None:
+                raise deferred_error
+        finally:
+            event.set_extra(SYS001_FINAL_AGENT_OBSERVATION_EXTRA, None)
+            event.set_extra("shio.sys001.natural_reply_pending", None)
+            event.set_extra(_SHIO_AGENT_ERROR_TOKEN_EXTRA, None)
+            event.set_extra(_SHIO_AGENT_REQUEST_EXTRA, None)
+
+    @filter.on_llm_tool_respond()
+    async def observe_official_tool_result(
+        self, event: AstrMessageEvent, tool: Any, tool_args: Any, tool_result: Any
+    ) -> None:
+        """Observe one official post-tool hook without claiming an action receipt."""
+        fence = getattr(self, "_active_event_fence", None)
+        if (
+            isinstance(fence, ActiveEventFence)
+            and fence.is_managed(event)
+            and not fence.owns(event)
+        ):
+            return
+        snapshot = event.get_extra(SYS001_TURN_EXTRA)
+        lifecycle = event.get_extra(SYS001_LIFECYCLE_EXTRA)
+        if not isinstance(snapshot, TurnSnapshot) or not isinstance(
+            lifecycle, TurnLifecycle
+        ):
+            return
+        observation = classify_tool_observation(tool, tool_args, tool_result)
+        observations = event.get_extra(SYS001_TOOL_OBSERVATIONS_EXTRA, None)
+        if not isinstance(observations, list):
+            observations = []
+            event.set_extra(SYS001_TOOL_OBSERVATIONS_EXTRA, observations)
+        observations.append(observation)
+        lifecycle.observe_tool(observation)
 
     async def terminate(self) -> None:
-        unbind_name_wake_plugin(self)
-        task = self._proactive_scheduler_task
-        self._proactive_scheduler_task = None
-        if task is not None and not task.done():
-            task.cancel("plugin_terminated")
+        """Fence late hooks from this unloaded plugin instance without writing state."""
+        fence = getattr(self, "_active_event_fence", None)
+        if isinstance(fence, ActiveEventFence):
+            fence.close()
+        deadline = (
+            asyncio.get_running_loop().time() + self._NATURAL_KV_AWAIT_SECONDS
+        )
+
+        def remaining() -> float:
+            return max(0.0, deadline - asyncio.get_running_loop().time())
+
+        self._auxiliary_terminated = True
+        self._auxiliary_epoch = getattr(self, "_auxiliary_epoch", 0) + 1
+        self._bubble_terminated = True
+        self._bubble_epoch = getattr(self, "_bubble_epoch", 0) + 1
+        self._natural_terminated = True
+        self._continuous_terminated = True
+        self._batch_terminated = True
+        self._batch_capacity_wakeup().set()
+        for scope in getattr(self, "_natural_ready", {}):
+            self._natural_ready[scope] = False
+        # The pre-fence closes the marker-to-send race while we await the
+        # mutex. A timeout still leaves the pre-fence active and termination
+        # returns without allowing this old instance to publish another action.
+        self._master_alert_terminating = True
+        master_active = (
+            bool(getattr(self, "_master_alert_ready", False))
+            or getattr(self, "_master_alert_timer", None) is not None
+            or bool(getattr(self, "_master_alert_send_tasks", set()))
+            or bool(self._master_alert_settings().get("master_alert_enabled", False))
+        )
+        if master_active:
+            master_lock = self._master_alert_mutex()
             try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        await self.proactive_scheduler_runtime.shutdown()
-        await self.generation_tasks.close()
-        await self.scope_concurrency.close()
-        await self.inference_budget.close()
-        with self._owner_action_runtime_lock:
-            if self.owner_action_lifecycle_store is not None:
-                self.owner_action_lifecycle_store.close()
-                self.owner_action_lifecycle_store = None
-                self.owner_action_durable_authority = None
-        self.runtime_continuity.close()
-        self.ledger.flush()
-        self.runtime.flush()
+                await asyncio.wait_for(
+                    master_lock.acquire(), timeout=remaining()
+                )
+            except asyncio.TimeoutError:
+                # Termination itself is bounded.  The pre-fence remains set,
+                # so an old Master continuation cannot publish after return.
+                self._master_alert_terminated = True
+            else:
+                try:
+                    self._master_alert_terminated = True
+                    self._fail_close_master_alert_locked()
+                finally:
+                    master_lock.release()
+        else:
+            self._master_alert_terminated = True
+            # No active Master state exists, but use the same revisioned
+            # publication path so a late initialize snapshot cannot revive it.
+            master_lock = self._master_alert_mutex()
+            if not master_lock.locked():
+                async with master_lock:
+                    self._fail_close_master_alert_locked()
+        await self._cancel_master_alert_timer(timeout=remaining())
+        await self._drain_master_alert_sends(timeout=remaining())
+        auxiliary_tasks = tuple(getattr(self, "_auxiliary_tasks", set()))
+        for task in auxiliary_tasks:
+            task.cancel()
+        if auxiliary_tasks and remaining() > 0:
+            # Do not let a cancellation-resistant Provider turn unload into an
+            # unbounded wait. Its callback consumes any later exception and all
+            # binding checks reject the old epoch.
+            await asyncio.wait(auxiliary_tasks, timeout=remaining())
+        # Cadence publication rechecks ``_natural_terminated`` after every
+        # public KV await.  Do not serially wait every locked scope here: that
+        # would turn one stuck official waiter into an unbounded unload.  The
+        # existing locks and their late writers are instead isolated by this
+        # instance fence and cannot republish local state.
+        kv_tasks = tuple(getattr(self, "_kv_tasks", set()))
+        if kv_tasks:
+            done, pending = await asyncio.wait(kv_tasks, timeout=0)
+            for task in pending:
+                task.cancel()
+            # Cancellation only abandons this plugin's waiter.  AstrBot's
+            # queued FIFO operation may still reach durable storage later.
+            for task in done:
+                if not task.cancelled():
+                    try:
+                        task.exception()
+                    except Exception:
+                        pass
+        getattr(self, "_natural_candidates", {}).clear()
+        for state in getattr(self, "_batch_scopes", {}).values():
+            state.wakeup.set()
+        getattr(self, "_batch_scopes", {}).clear()
+        for state in getattr(self, "_continuous_scopes", {}).values():
+            state.first_terminal.set()
+            state.wakeup.set()
+        getattr(self, "_continuous_scopes", {}).clear()
+
+
+# Keep the small public class alias used by integration examples without
+# retaining any legacy runtime entrypoint.
+Shio = ShioPlugin

@@ -1,48 +1,13 @@
-# 兼容性说明（0.5.23）
+# 兼容性边界
 
-## 已验证基线
+本候选的 metadata 只接受已审计的 AstrBot `==4.27.4`。固定基线为 4.27.4：`AstrMessageEvent` 的结构化 getter、`is_admin()`、`request_llm()`、`OnLLMRequest`、最终 LLM response、结果装饰和标准 Respond 链；`ToolSet`/`ProviderRequest.func_tool` 用于群聊当前工具可见性删减。未来版本必须重新审计并冻结，不能仅因仍在 4.x 范围内视为兼容。
 
-| 项目 | 状态 |
-|---|---|
-| AstrBot 4.26.7、4.27.2 | 已验证；生产主门为 4.27.2 |
-| Python 3.12、3.13 | 自动化覆盖；隔离容器为 3.12 |
-| QQ aiocqhttp / NapCat | 主要验证平台 |
-| 其他平台适配器 / AstrBot 5 | 尚未承诺 |
+LivingMemory、Meme Manager 和外部黑名单均为可选插件。Shio 不接管其数据或发送。固定 Meme Manager 4.15.4（`3a4cac134abf22a8617eda837bd2c9a9c1b90b1f`）只通过其公开的正常 response/decorating/after-send hooks 参与：Shio 的最终结果观察和文本布局优先级为 100000，先于其固定 99999；Meme 仍以自身情感模型/语义模式选图，多文本组件需要其“分开发送”设置。Shio 不调用 compat 发送接口或私有 helper，Meme 缺失或其 hook 异常不应拦截 AstrBot 的标准文字链。
 
-`metadata.yaml` 声明 `astrbot_version: ">=4.26.7,<5"`。当前 P10 自动化超过 1,200+ 项，但其他平台仍需真实 event/send 适配验证。
+`segmented_reply` 由 AstrBot 拥有；Shio 仅读取当前 `platform_settings.segmented_reply`，绝不改写它。使用 Shio 多气泡时应关闭 AstrBot 内置分段：标准 RespondStage 只提交首条，Shio 在公开 after-send hook 中按已审核顺序用公开 `event.send()` 发送剩余文字。每条后续文字在配置的最短/最长等待内只等一次；取消、旧回合或异常会停止，且不重试、不补发。单气泡不受影响。若 AstrBot 分段开启且为“仅 LLM、regex、`(?s).+`、无清理规则”的兼容形状，Shio 完全保留官方发送且不重复；其他开启形状会给出明确冲突状态。Meme 图片仍由 Meme Manager 选择和另发，且在所有文字之后，不计入文本气泡数量。
 
-## 常见插件组合
+自然参与先使用公开 `Context.get_using_provider_async()`／`get_provider_by_id()` 和 `Provider.text_chat(..., func_tool=None)` 作严格 JSON `REPLY`／`WAIT`／`NO_ACTION` 辅助判定；判定不带 ToolSet、不建立主会话、不发送，只有 `REPLY` 才让同一真实 event 进入 AstrBot 标准主 Agent。超时、异常、取消后的迟到结果、空或非法 JSON 均安全静默；`WAIT` 不写 cadence，`NO_ACTION` 在释放当前文本 batch 前按配置持久化 scope-local 退避，且不计回复次数或回复冷却。scope cadence 只在官方 RespondStage 完成后写入 PluginKVStoreMixin；固定 AstrBot 4.27.4 兼容前提是同进程 overlay 先更新、单 FIFO、公开 put 正常返回才代表对应 DB 操作完成。Shio 只用同一公开 key 的 pending→committed transaction，跨重启只恢复 committed cadence；8 秒有界 KV 等待失败关闭。这不是未知 KV 的 CAS/事务保证，不是网络送达 receipt，也不重试或补发。最终审核/修复可用公开 Provider 的 `text_chat(..., func_tool=None)` 在同一最终响应上进行有界 JSON keep/replace/re-review；耗尽默认阻止文本并成为 `review_exhausted`，只有明确开启最后回复才继续同一标准发送且不计该告警。主回复第三灾备仍完全由 AstrBot `fallback_chat_models` 拥有。Master 告警默认关闭，必须先由真实官方 Master 私聊绑定 UMO；可选固定 UTC+8 勿扰只延后固定脱敏摘要，`submitted` 不是网络送达，失败/不支持不重试。Skill／知识库、工具执行／确认／结果仍保留给 AstrBot和具体工具插件；Shio 只在获批边界收窄ToolSet或布局Plain。关闭 AstrBot 内置分段时，Shio 只会在固定 ResultDecorate 不可能继续把完整链改为 TTS、文本转图片或 QQ 转发的形状下提交余下文字；否则保留完整标准 RespondStage 单链并记录 `fail_closed:official_*` 状态。余下文字取消、过期或异常会通过公开 `event.stop_event()` 停止后续 after-send hook，避免 Meme 单独图片；全部余下文字成功后才轮到 Meme 的固定图片 hook。真实安装的 AstrBot/Meme/segmented-reply 协作仍未独立验证。
 
-| 插件 | 当前建议 | 0.5.0 边界 |
-|---|---|---|
-| LivingMemory 2.5.7 | 可保留 | Shio 只消费带 source/scope/subject 的资料；legacy owner-private scope 不满足 memory-write adapter；`X-01` 仍存在 |
-| AnySearch v0.3 | 可保留 | 默认只开放 `anysearch_search`、`anysearch_extract`；exact tool/runtime/schema 与当前轮 evidence 缺一即降级 |
-| 官方 Meme Manager 4.15.1 | 配对必需 | 普通／自然回复使用其既有 `on_llm_response`、`on_decorating_result`、`after_message_sent` 钩子；主动／冷场由生成模型从 Manager 当前资源包的 22 个官方类别描述中给出一个隐藏类别，Shio 校验并剥离后只调用公开 `compat_prepare_message` 与 `compat_send_prepared_message`。Manager 继续独占概率、资源、构建和发送。Shio 校验版本、唯一运行实例、公开异步方法签名与绑定，不要求整文件 hash 相同，不自造 semantic compat，也不部署定制 Manager |
-| ReNeBan v1.2.0 | 可保留 | exact hook conformance 才能形成 verified gate；missing/error/interface drift 时 Shio fail closed |
-| Parser v1.5.1 | 可保留 | 其自动输出不能回灌成人类／角色历史；接口漂移显式 degraded |
-| Group Verification / Recall Cancel / Keywords Reply | 现场共存观察 | 非 Shio authority；自动／管理输出仍按来源合同 drop 或隔离 |
-| 独立 AgentGuard | 停用或卸载 | 双重改写 `func_tool` 会破坏 Shio exact policy |
-| AstrBot 平台分段回复 | 二选一 | 与 Shio exact segments 同时开启会二次拆分 |
+即便 `segmented_reply` 是兼容形状，AstrBot ResultDecorate 与固定 Meme Manager 正常 decorating 会对每个 `Plain` 执行首尾 strip。Shio 因而只会在每个拆分段均可经该 strip 原样保留时交出多 Plain；任何段含会被删除的前后空白、换行或缩进时，Shio 整体降级为完整单 Plain，不用隐藏字符补位。该单 Plain 仍受 AstrBot 标准下游的既有首尾 strip 语义约束，Shio 不建立发送旁路改变它。
 
-P10-03 固定了 LivingMemory、AnySearch、Meme Manager、ReNeBan、Parser/gates 的 present/missing/error/timeout/interface-change 矩阵，以及 direct、quote、quoted image、仅图片和 same-media repair。
-
-## Provider 与工具
-
-- 普通被点名回复与群聊自然接话始终使用 AstrBot 当前会话 Provider；`replyer_provider_id` 只指定冷场主动续题和首稿被拦后的单次 repair，留空时这两阶段也使用当前会话 Provider。
-- 未点名自然接话会在最终回复前增加至多一次 participation 语义调用。该调用使用原生文本 contexts 与纯 current body，`image_urls=[]`、`audio_urls=[]`、`func_tool=None`、无 tool result、无重试／repair／第二 Provider；Provider 必须返回五键严格 JSON，旧的自由文本或 reasoning-only 输出会失败关闭。
-- 需要检索时 Provider 必须支持 AstrBot tool call；模型文本声称“已搜索”不能替代 sealed tool result。
-- 工具结果必须绑定 exact scope、sender、target、generation 和 broker permit；迟到或跨轮结果丢弃。
-- 最终回复若含 DSML、Meme XML/Python/JSON、裸参数、hidden channel 或工具模板，只允许一次无工具 repair，仍失败则不发送。
-- direct/quoted/image-only media 使用 AstrBot 原生 transport；URL/base64 不进入 typed prompt 或日志。
-
-## 参与、主动发起与 owner action
-
-- 自然称名和未点名参与都进入同一 typed admission/target/guard/send 链，不创建旧回复器。明确称名／Reply／@ 星汐不消耗 participation 调用；明确 Reply／@ 其他真实成员也不调用且不抢话。
-- 未点名候选在语义前仍受功能、allowlist、可信上下文、continuity、capacity、cooldown、窗口和 backoff 约束。语义 `WAIT` 不消费 cadence 状态，`NO_ACTION` 只产生有界 backoff；迟到结果不会取消较新的回复或进入发送链。
-- 主动发起已经实现，但 `proactive_initiation_enabled` 默认关闭且空 allowlist 永不触发；不要与 AstrBot 内置主动回复同时开启。
-- 主动类别 compatibility 是 category transport，不是 Manager 的逐图 caption/tag/vector 语义检索；二者必须在日志和验收中分开。缺少、重复、未知或泄漏到正文后的类别标记会触发唯一一次同上下文 repair，仍失败则不发送该轮主动内容。
-- 四个 owner action 适配器保持默认关闭。现场 runtime allowlist 为空、LivingMemory 为 legacy scope，Shell 永久硬关闭，因此 0.5.0 不承诺真实 owner action 执行。
-
-## 外部限制
-
-`X-01`：LivingMemory 被动捕获可能早于 ReNeBan/Shio admission。Shio 能保证自身 ledger/Scene/Affect/Learning/Tool/Reply 零消费和零提交，不能保证 LivingMemory 零存储。可选 O1 尚未执行，且只有 P10 完成后经用户确认才允许更新第三方并验证上游方案。
+群聊近期上下文现在只读固定 AstrBot 的 `Context.message_history_manager.get(platform_id, user_id, page_size)`；需启用官方 `group_message_history_enable` 且关闭 `group_icl_enable`。Shio 将带 sender ID、行 ID、UTC `created_at` 和结构化 content 的行投影为模型上下文，删除黑名单 sender 的整行；它不写官方历史、不用 conversation role/content 作为回退，也不触碰 LivingMemory。文本连续窗口保存当前/等待真实 event 的 scope、watermark identity、generation 和安静 deadline：首条与后续都等待，只有最后文本 event 继续一次。Image/File/Record/Video/Reply 不加入文本批次，而以自身官方默认链处理；命令也保持官方链。scope 只在官方终态 hook 释放，缺少终态则到重载前保持失败关闭，永不重投或补发。
