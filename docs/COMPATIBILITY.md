@@ -1,13 +1,108 @@
-# 兼容性边界
+# 兼容性说明
 
-本候选的 metadata 只接受已审计的 AstrBot `==4.27.4`。固定基线为 4.27.4：`AstrMessageEvent` 的结构化 getter、`is_admin()`、`request_llm()`、`OnLLMRequest`、最终 LLM response、结果装饰和标准 Respond 链；`ToolSet`/`ProviderRequest.func_tool` 用于群聊当前工具可见性删减。未来版本必须重新审计并冻结，不能仅因仍在 4.x 范围内视为兼容。
+## 当前支持范围
 
-LivingMemory、Meme Manager 和外部黑名单均为可选插件。Shio 不接管其数据或发送。固定 Meme Manager 4.15.4（`3a4cac134abf22a8617eda837bd2c9a9c1b90b1f`）只通过其公开的正常 response/decorating/after-send hooks 参与：Shio 的最终结果观察和文本布局优先级为 100000，先于其固定 99999；Meme 仍以自身情感模型/语义模式选图，多文本组件需要其“分开发送”设置。Shio 不调用 compat 发送接口或私有 helper，Meme 缺失或其 hook 异常不应拦截 AstrBot 的标准文字链。
+| 项目 | 状态 |
+| --- | --- |
+| Shio | `0.5` 源码预览版 |
+| AstrBot | 仅 `4.27.4` |
+| 平台 | QQ `aiocqhttp` |
+| Python | 跟随 AstrBot 4.27.4 运行环境 |
+| Meme Manager | 可选；当前链路按 4.15.4 的公开 Hook 检查 |
+| LivingMemory | 可选；由其自身和 AstrBot 管理 |
 
-`segmented_reply` 由 AstrBot 拥有；Shio 仅读取当前 `platform_settings.segmented_reply`，绝不改写它。使用 Shio 多气泡时应关闭 AstrBot 内置分段：标准 RespondStage 只提交首条，Shio 在公开 after-send hook 中按已审核顺序用公开 `event.send()` 发送剩余文字。每条后续文字在配置的最短/最长等待内只等一次；取消、旧回合或异常会停止，且不重试、不补发。单气泡不受影响。若 AstrBot 分段开启且为“仅 LLM、regex、`(?s).+`、无清理规则”的兼容形状，Shio 完全保留官方发送且不重复；其他开启形状会给出明确冲突状态。Meme 图片仍由 Meme Manager 选择和另发，且在所有文字之后，不计入文本气泡数量。
+`metadata.yaml` 使用 `astrbot_version: "==4.27.4"`。这不是保守的展示文字，而是当前实现依赖固定 Hook、配置形状、PluginKV 和发送顺序的真实边界。
 
-自然参与先使用公开 `Context.get_using_provider_async()`／`get_provider_by_id()` 和 `Provider.text_chat(..., func_tool=None)` 作严格 JSON `REPLY`／`WAIT`／`NO_ACTION` 辅助判定；判定不带 ToolSet、不建立主会话、不发送，只有 `REPLY` 才让同一真实 event 进入 AstrBot 标准主 Agent。超时、异常、取消后的迟到结果、空或非法 JSON 均安全静默；`WAIT` 不写 cadence，`NO_ACTION` 在释放当前文本 batch 前按配置持久化 scope-local 退避，且不计回复次数或回复冷却。scope cadence 只在官方 RespondStage 完成后写入 PluginKVStoreMixin；固定 AstrBot 4.27.4 兼容前提是同进程 overlay 先更新、单 FIFO、公开 put 正常返回才代表对应 DB 操作完成。Shio 只用同一公开 key 的 pending→committed transaction，跨重启只恢复 committed cadence；8 秒有界 KV 等待失败关闭。这不是未知 KV 的 CAS/事务保证，不是网络送达 receipt，也不重试或补发。最终审核/修复可用公开 Provider 的 `text_chat(..., func_tool=None)` 在同一最终响应上进行有界 JSON keep/replace/re-review；耗尽默认阻止文本并成为 `review_exhausted`，只有明确开启最后回复才继续同一标准发送且不计该告警。主回复第三灾备仍完全由 AstrBot `fallback_chat_models` 拥有。Master 告警默认关闭，必须先由真实官方 Master 私聊绑定 UMO；可选固定 UTC+8 勿扰只延后固定脱敏摘要，`submitted` 不是网络送达，失败/不支持不重试。Skill／知识库、工具执行／确认／结果仍保留给 AstrBot和具体工具插件；Shio 只在获批边界收窄ToolSet或布局Plain。关闭 AstrBot 内置分段时，Shio 只会在固定 ResultDecorate 不可能继续把完整链改为 TTS、文本转图片或 QQ 转发的形状下提交余下文字；否则保留完整标准 RespondStage 单链并记录 `fail_closed:official_*` 状态。余下文字取消、过期或异常会通过公开 `event.stop_event()` 停止后续 after-send hook，避免 Meme 单独图片；全部余下文字成功后才轮到 Meme 的固定图片 hook。真实安装的 AstrBot/Meme/segmented-reply 协作仍未独立验证。
+## AstrBot 4.27.4 依赖点
 
-即便 `segmented_reply` 是兼容形状，AstrBot ResultDecorate 与固定 Meme Manager 正常 decorating 会对每个 `Plain` 执行首尾 strip。Shio 因而只会在每个拆分段均可经该 strip 原样保留时交出多 Plain；任何段含会被删除的前后空白、换行或缩进时，Shio 整体降级为完整单 Plain，不用隐藏字符补位。该单 Plain 仍受 AstrBot 标准下游的既有首尾 strip 语义约束，Shio 不建立发送旁路改变它。
+Shio 当前使用：
 
-群聊近期上下文现在只读固定 AstrBot 的 `Context.message_history_manager.get(platform_id, user_id, page_size)`；需启用官方 `group_message_history_enable` 且关闭 `group_icl_enable`。Shio 将带 sender ID、行 ID、UTC `created_at` 和结构化 content 的行投影为模型上下文，删除黑名单 sender 的整行；它不写官方历史、不用 conversation role/content 作为回退，也不触碰 LivingMemory。文本连续窗口保存当前/等待真实 event 的 scope、watermark identity、generation 和安静 deadline：首条与后续都等待，只有最后文本 event 继续一次。Image/File/Record/Video/Reply 不加入文本批次，而以自身官方默认链处理；命令也保持官方链。scope 只在官方终态 hook 释放，缺少终态则到重载前保持失败关闭，永不重投或补发。
+- `AstrMessageEvent` 的结构化消息、发送者、会话、@、Reply 和管理员信息；
+- `event.request_llm()`；
+- `OnLLMRequest`、`OnLLMResponse`、Agent 开始/结束、结果装饰和 after-send Hook；
+- `ProviderRequest.func_tool` 与 `ToolSet`；
+- AstrBot 当前 Provider 和按 ID 选择的 Provider；
+- PluginKV；
+- 官方 conversation 和标准 Respond 链；
+- 平台公开 `event.send()`。
+
+升级到其它 AstrBot 版本前，应逐项检查这些接口和实际调用顺序，并在真实 Docker Pipeline 中验证。不能只把兼容范围改成 `<5`。
+
+## Provider
+
+正式聊天模型、工具调用和 `fallback_chat_models` 完全由 AstrBot 管理。
+
+Shio 的辅助模型仅用于：
+
+- 智能名称判断；
+- 自然参与判断；
+- 最终文本审核与修改；
+- 模型分段。
+
+辅助调用不带工具、不创建第二个正式 conversation、不发送消息。设置页通过 AstrBot 的 `select_provider` 和 `select_providers` 选择已有模型。
+
+## Meme Manager
+
+Shio 不直接选择或发送表情包。当前协作目标是：
+
+1. Shio 先观察最终审核文本并完成文字布局；
+2. AstrBot 发送标准文字；
+3. Shio 在安全条件下发送余下文字气泡；
+4. Meme Manager 再根据自身设置单独发图。
+
+如果后续文字取消、过期或发送失败，Shio 会停止事件的后续 Hook，避免只剩一张脱离文字的表情包。
+
+其它 Meme Manager 版本或不同 Hook 优先级需要重新验证。
+
+## AstrBot 分段回复
+
+使用 Shio 控制多气泡时，应关闭 AstrBot 内置 `segmented_reply`，避免二次拆分。
+
+如果 AstrBot 分段仍开启，Shio 只在固定兼容形状下完全交还官方发送；其它形状会记录冲突并避免重复发送。Shio 不会自动修改 AstrBot 设置。
+
+## TTS、文本转图片和 QQ 转发
+
+这些功能属于 AstrBot ResultDecorate。只要它们可能继续改写完整结果，Shio 就不能提前拿走余下文字气泡，而应保留完整官方单链。
+
+因此，设置了多气泡上限不代表所有回复都会拆开。
+
+## LivingMemory
+
+LivingMemory 是独立的长期记忆来源。Shio 不读取、迁移或过滤它的持久数据，也不会把自己的普通群友黑名单伪装成 LivingMemory 的权限规则。
+
+如果记忆内容已经进入 AstrBot 请求，Shio 只能保持该官方/插件链的既有对象，不能保证第三方记忆本身带有可验证的发送者身份。
+
+## 群聊上下文：当前不兼容点
+
+当前 0.5 仍要求 `group_message_history_enable=true` 且 `group_icl_enable=false` 后读取 `message_history_manager`，再改写 `ProviderRequest.contexts`。这项实现已经确认需要纠正：
+
+- 持久化群聊记录的官方用途是保存记录和提供查询工具；
+- `group_icl_enable` 才是当前请求的官方群聊上下文注入；
+- 写入 `req.contexts` 可能污染长期 conversation；
+- 当前做法也无法正确利用官方群聊媒体转述。
+
+所以旧版“开启持久化记录、关闭官方群聊注入”的搭配不再是推荐配置。修复前只建议在隔离测试会话中使用 0.5。
+
+## 平台媒体
+
+图片、语音、文件和视频的下载与预处理属于 AstrBot 和平台适配器。QQ 临时媒体 URL 下载 400 不能由 Shio 修复或绕过；媒体失败时 Shio 也不会伪造图片内容。
+
+## 明确不兼容
+
+- AstrBot 4.27.4 以外的未审计版本；
+- 非 `aiocqhttp` 平台；
+- 依赖旧 Shio 0.4.x Planner、表达库、主动话题或故障补答数据的配置；
+- 期望 Shio 提供独立管理员、工具执行器、沙箱或平台发送器的用法；
+- 把旧配置字段自动迁移到 `sys001` 的安装方式。
+
+## 验证边界
+
+轻量单元测试只能验证规则和回归条件。下列内容必须使用真实 AstrBot 4.27.4 Docker 环境：
+
+- 官方群聊上下文注入和 conversation 保存；
+- 图片转述和 QQ 媒体；
+- Provider 工具调用与 fallback；
+- ResultDecorate、分段、后续气泡和 Meme 顺序；
+- 插件重载和旧实例隔离。
+
+Docker 验证通过仍不等于真实 QQ 用户验收。

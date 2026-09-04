@@ -1,45 +1,230 @@
-# 星汐（Shio）SYS-001
+# 星汐（Shio）
 
-星汐是 AstrBot 插件，不是独立机器人或发送器。当前为本地候选：已做 Codex 自测，尚未独立验证、验收或发布。
+星汐是 AstrBot 的自然聊天增强插件。它不替代 AstrBot，而是在官方事件链上补充群聊自然参与、连续消息等待、当前回合事实、普通群友工具可见性收窄、发送前检查和文本气泡布局。
 
-## 官方与插件职责
+当前版本为 **0.5 源码预览版**，只声明兼容 AstrBot **4.27.4** 和 QQ **aiocqhttp**。它仍有尚未修复的群聊上下文问题，不应直接当作稳定生产版。
 
-| 责任 | owner |
+## 它现在能做什么
+
+- 区分真实 Master、普通群友和获准私聊用户。
+- 识别 @机器人、Reply 机器人、AstrBot 官方唤醒和自然名称直呼。
+- 对未点名的群消息先判断 `REPLY`、`WAIT` 或 `NO_ACTION`，再决定是否进入主聊天模型。
+- 等待同一会话短时间内的连续文本，把一批消息合并为一次回复机会。
+- 向当前模型请求补充发送者、机器人、群聊、时间、@ 和 Reply 等回合事实。
+- 对普通群友当前可见的 AstrBot 工具做单向删减。
+- 在发送前审核同一条回复，并可在有限次数内修改后重新审核。
+- 将文本合并为一段、按句分段，或使用指定模型给出可逆分段。
+- 在满足官方链路安全条件时发送后续文字气泡，并让 Meme Manager 继续负责表情包。
+- 在连续失败达到阈值时，通过 AstrBot 主动消息接口向已绑定的 Master 私聊提交脱敏摘要。
+
+## 它不会重新实现什么
+
+以下能力始终由 AstrBot 或对应插件负责：
+
+| 能力 | 负责方 |
 | --- | --- |
-| Persona、conversation、当前 Provider 与 `fallback_chat_models` | AstrBot |
-| 管理员、工具权限、内置指令、沙箱 | AstrBot / 工具插件 |
-| 媒体、ResultDecorate、Respond 和发送 | AstrBot |
-| 真实入口、当前回合事实、名称语义、自然参与 | Shio |
-| 群聊当前 ToolSet 单向删减、最终结果观察、文本气泡布局与剩余气泡编排 | Shio |
+| Master 身份、管理员权限 | AstrBot |
+| Persona、conversation、主模型和 fallback | AstrBot |
+| 内置指令、工具执行、确认和沙箱 | AstrBot / 工具插件 |
+| 媒体下载、图片理解、结果装饰和标准首发 | AstrBot |
+| 长期记忆 | LivingMemory 等记忆插件 |
+| 表情包选择和图片发送 | Meme Manager |
+| 当前回合事实、自然参与和连续消息等待 | Shio |
+| 普通群友当前工具可见性删减 | Shio |
+| 最终文本检查和气泡布局 | Shio |
 
-Shio 不建第二 Provider、第二延迟回复 timer、合成 event 或发送链；仅有 D-080 的有界 Master 告警 timer。私聊 ToolSet 保持 AstrBot 当前对象。
+旧公开版中的 Planner/Replyer、表达检索库、关系学习、主动开启话题、故障恢复补答队列、主人快捷命令和第二套 Agent 权限守卫已经不属于当前 0.5。
 
-## 未来本地设置依赖
+## 一条消息怎样经过星汐
 
-先在 AstrBot 设置 `admins_id`（官方 Master）、Persona、`wake_prefix`、`disable_builtin_commands` 和 `fallback_chat_models`。再设置 Shio：
+```text
+QQ 真实消息
+  → AstrBot 事件与管理员/唤醒判断
+  → Shio 范围检查与连续消息等待
+  → 未点名群聊的自然参与判断
+  → event.request_llm()
+  → AstrBot Persona / conversation / Provider / fallback / 工具
+  → Shio 最终文本检查与气泡布局
+  → AstrBot 结果装饰和首条发送
+  → Shio 可选后续文字气泡
+  → Meme Manager 可选表情包
+```
 
-- `private_allowed_sender_ids`：普通私聊精确名单；每项填写一个 QQ 号，空列表没有普通用户获准。
-- `group_allowed_scopes`：普通群总入口名单；每项直接填写一个群号，空列表没有普通群获准。非 Master 时用户或群禁用名单优先；Master 只来自 AstrBot 官方角色。已保存的 R22 会话值仍可兼容，但新设置不要填写、拼接或查询会话标识。
-- AstrBot 群近期历史需在其自身配置启用 `provider_ltm_settings.group_message_history_enable`，并关闭会重复注入无结构文本的 `group_icl_enable`。Shio 只读该官方历史、按真实 sender ID 删除黑名单整条记录；不可用时只保留当前真实消息。
-- 名称模式及语义模型；自然参与开关、允许自然参与的群号、前置判定辅助模型/备用/超时与说明。自然参与先严格判定 `REPLY`／`WAIT`／`NO_ACTION`，判定阶段没有 ToolSet、主会话或发送，只有 `REPLY` 才进入 AstrBot 主 Agent；`WAIT`、非法或不可用判定均不写 cadence，`NO_ACTION` 会按 `natural_no_action_backoff_base_seconds`／`natural_no_action_backoff_max_seconds` 在同一 scope 持久化短暂退避，但不计回复次数或回复冷却。再配置 `natural_reply_cooldown_seconds`、`natural_frequency_window_minutes`、`natural_max_replies_per_window`。自然 cadence 只按每个真实会话的 RespondStage 完成持久化，不是网络送达确认；群号不会合并不同平台或机器人会话。首次遇到获准群聊时才读取该真实会话的已有状态。候选只兼容已审计的 AstrBot `==4.27.4`；固定版本的公开插件 KV 在同进程按 FIFO 写入、先更新官方 overlay。Shio 在同一 key 先写 `pending`、再写同 transaction 的 `committed`，重启只恢复 committed cadence。每次 KV 等待及终止 drain 上限为 8 秒；超时、异常或取消均 fail-closed。该兼容条件不是任意 KV 的 CAS 或事务保证；升级版本必须重新审计并冻结。
-- 友好 sender 与普通结构化能力名单；友好用户不是 Master，`astr_kb_search` 对所有群聊用户保留。
-- Master 表达规则及文本组件布局。
-- 最终审核范围（core/additional/combined）、辅助 Provider、有界“审核→修复→重新审核”与最后回复开关；耗尽时默认阻止当前文本并按规则告警，只有明确开启最后回复才让同一最终响应继续标准发送，绝不创建第二次发送。
-- Master 告警默认关闭。Master 必须先以真实私聊完成官方 UMO 绑定；固定 UTC+8 的可选勿扰时段只延后固定脱敏摘要。`submitted` 仅表示交给 AstrBot 主动发送接口，不代表网络送达；失败不重试，摘要不含正文、QQ 或会话 ID。
-- 连续窗口开关、秒数与群数上限：获准的文本消息（普通群友、Master普通发言、文本@／wake及允许私聊）都先等待同一滑动安静窗口；最后真实文本 watermark 只发起一次标准请求，较早文本以独立结构化来源提供。Image/File/Record/Video/Reply 是各自的 AstrBot 官方边界 event，不跨 event 合并；其同 scope 后续文本只在官方终态后开始下一批。明确命令继续由 AstrBot/命令插件处理，不由 Shio 排队。
+星汐只处理真实事件，不合成聊天事件，也不在后台建立第二条主回复链。
 
-文本布局可选 `model`、`plugin` 或 `single`。`model` 仅用公开 Provider 生成可逆 JSON 文本边界，失败保留全文单组件；`plugin` 只按句合并且不丢字；`single` 合并连续 Plain。使用 Shio 多气泡时，请关闭 AstrBot 内置分段：AstrBot 标准链仍发送首条，Shio 再通过公开发送接口按“气泡间最短/最长等待”依次发送剩余文字。单气泡不受影响。AstrBot 内置分段若以原样兼容形状开启，则完全保留官方发送，Shio 不会重复发送；若开启但不兼容，会明确报告冲突且不会改写 AstrBot 设置。Meme 图片始终另发、位于全部文字之后，且不计入文本气泡数量。AstrBot 与固定 Meme Manager 会对每个 Plain 做首尾 strip，因此多组件只在每段经该下游语义仍原样时保留；否则安全降回完整单组件。
+## 使用要求
 
-## 旧配置、限制与回滚
+- AstrBot：`4.27.4`
+- 平台：QQ `aiocqhttp`
+- 至少一个 AstrBot 已加载的聊天模型
+- 可选：Meme Manager、LivingMemory
 
-旧 0.5.x 配置/state 完全不读、不迁移，也不自动删除；未来安装前备份 AstrBot/插件配置和相关数据，回滚时恢复备份并移除候选版本。部署或重启需 Owner 另行批准。
+当前 metadata 使用精确版本约束 `==4.27.4`。升级 AstrBot 前需要重新检查 Hook、消息历史、Provider、结果装饰和发送顺序，不能只改版本号。
 
-- 无网络送达成功回执：自然 cadence 只在 AstrBot RespondStage 完成时同 scope 持久化，某一段的真实网络结果不会被 Shio 推断、重试或补发。
-- 旧 AstrBot conversation 的 role/content 不作为可净化群历史；只使用官方群历史中的真实 sender、行 ID、UTC 时间和结构化内容。旧历史缺少平台 message ID 或 Reply sender/time 时会省略，LivingMemory 不受 Shio 过滤。
-- D-093 已实现：文本首条与后续都等待安静窗口，watermark 只在 prompt 中表示一次，早期文本和官方群历史行不会重复。scope 只在 AstrBot 官方终态 hook 可证实时释放；若没有终态则保持静默到插件重载，Shio 不接管工具取消或发送。真实安装环境的 AstrBot/Meme 运行顺序仍未独立验证。
-- D-078／D-079 已关闭对应选择：Skill、知识库与工具执行／确认／结果继续由 AstrBot 和具体工具插件拥有；Shio 只收窄群聊当前公开 ToolSet，不逐项投影 Skill 或非 agentic 知识库，也不建立动作回执。
-- post-tool 是观察而非动作成功回执；主回复第三灾备仍由 AstrBot `fallback_chat_models` 拥有。最终审核可使用有界辅助 Provider 修改同一响应；Master 告警仅在已绑定私聊、阈值达成且非勿扰时通过 AstrBot 官方接口提交。
-- 关闭 AstrBot 内置 `segmented_reply` 后，Shio 只会在固定 ResultDecorate 不会再执行 TTS、文本转图片或 QQ 转发的形状下发送剩余文字；这些官方后置处理只要可能改写完整链，Shio 就保留完整标准 RespondStage 单链并记录可读降级状态。剩余文字取消、过期或发送异常时会停止该 event 的后续 hook，避免固定 Meme Manager 单独发送图片；成功时 Meme 图片仍在全部文字之后。真实安装环境的多气泡/Meme 顺序仍需独立验证。
-- D-074 的群冷场续题与私聊主动关心暂缓，候选没有字段或状态。
+## 当前重要限制
 
-本地测试不证明真实 AstrBot、发送、fallback 或可选第三方顺序；未部署、重启、提交、推送、PR 或发布。
+0.5 仍有两项相关问题：
+
+1. 当前实现可能把官方群聊历史写入 AstrBot 的 `ProviderRequest.contexts`，随后进入长期 conversation。停用 Shio 不会自动清除已经写入的会话，因此可能继续出现复读或异常工具调用上下文。
+2. 当前实现错误地依赖“持久化群聊消息记录”，而没有复用 AstrBot 专门用于当前请求的“群聊消息记录注入上下文”链路。
+
+在这两项修复并通过真实 AstrBot 4.27.4 Docker 验证前：
+
+- 不要在重要的现有会话中把 0.5 当作稳定版使用。
+- 不要继续按照旧文档强制开启持久化群聊记录并关闭官方群聊上下文注入。
+- 停用插件后如仍复读，不要直接删除数据库；先备份并确认受影响 conversation。
+
+更多说明见[故障排查](docs/TROUBLESHOOTING.md)。
+
+## 安装
+
+0.5 当前是源码快照，尚未作为稳定 Release 发布。准备测试时：
+
+1. 备份 AstrBot 配置、插件配置和相关会话数据。
+2. 确认 AstrBot 版本恰好是 `4.27.4`。
+3. 使用发布包时，压缩包顶层应直接包含 `astrbot_plugin_shio/`，其中能看到 `main.py`、`metadata.yaml`、`_conf_schema.json` 和 `core/`。
+4. 通过 AstrBot WebUI 的插件管理页面安装或更新。
+5. 先保持自然参与、发送前检查和 Master 通知关闭，完成基础范围设置。
+6. 在专用测试群验证，再决定是否用于常用群。
+
+完整步骤与回退边界见[安装与回退](docs/INSTALLATION_AND_ROLLBACK.md)。
+
+## 首次配置
+
+### 先配置 AstrBot
+
+在 AstrBot 中配置：
+
+- 管理员 QQ 号；
+- Persona；
+- 当前聊天模型与 `fallback_chat_models`；
+- 内置指令是否禁用；
+- 工具权限、确认和沙箱；
+- 平台发送与媒体处理。
+
+这些设置不会由 Shio 复制。你在 AstrBot 中关闭某个官方工具后，Shio 不会重新把它加回来。
+
+### 再配置 Shio
+
+建议按这个顺序：
+
+1. 在“聊天范围”填写允许私聊的 QQ 号和允许聊天的群号。
+2. 选择名称唤醒使用“直接识别”还是“智能判断”。
+3. 保持“允许自然参与”关闭，先验证 @、Reply 和名称直呼。
+4. 验证连续消息等待是否符合群聊节奏。
+5. 再按需配置普通群友可见工具、发送前检查、Master 通知和消息气泡。
+
+所有“模型”字段都应从 AstrBot 已有模型中下拉选择，不需要手写 Provider ID。如果下拉列表为空，先确认模型已在 AstrBot 中加载，再重载插件或重启 AstrBot。
+
+逐项解释和推荐值见[设置指南](docs/SETTINGS_GUIDE.md)。
+
+## 不同用户会发生什么
+
+| 场景 | Shio 行为 |
+| --- | --- |
+| AstrBot Master 私聊 | 绕过普通私聊名单；权限仍由 AstrBot 决定 |
+| 普通用户私聊 | 只有 QQ 号在允许名单中才进入 |
+| 群内 @ / Reply 机器人 / 官方唤醒 | 在群范围允许后进入必回链 |
+| 群内直接叫机器人名字 | 按名称唤醒模式判断 |
+| 群内未点名聊天 | 只有开启自然参与且群号获准时，才做前置判断 |
+| 禁用 QQ 号或群号 | 非 Master 优先拒绝 |
+
+Master 的普通未点名群消息不会因为管理员身份自动变成必回；它与其他未点名群消息一样进入自然参与判断。Master 权限和“机器人是否应该插话”是两件不同的事。
+
+## 连续消息等待
+
+开启后，同一会话的第一条文本也会等待一个短暂安静窗口。窗口内每出现一条新文本，等待时间重新计算；最后一个真实事件只发起一次正式请求，前面的文本作为这一批的来源。
+
+- 群聊按同一真实会话合并所有参与者的连续文本。
+- 私聊只会涉及当前对端。
+- 明确命令继续由 AstrBot 命令链处理。
+- 图片、文件、语音、视频和 Reply 等官方边界事件不会被伪造成一条合成消息。
+
+默认等待 3 秒。群聊很活跃时不要盲目加长，否则会明显增加响应延迟。
+
+## 普通群友工具可见性
+
+Shio 只删除当前请求中普通群友不应看见的工具：
+
+- Master：Shio 不删减当前 AstrBot ToolSet。
+- 友好群友：Shio 不删减当前 AstrBot ToolSet，但其真实执行权限仍由 AstrBot 和工具插件判断。
+- 普通群友：只保留配置的工具名，以及 AstrBot 知识库搜索 `astr_kb_search`。
+- 私聊：Shio 不改写当前 ToolSet。
+
+这不是新的沙箱，也不会绕过 AstrBot 的执行确认。
+
+## 发送前检查
+
+发送前检查只处理同一条 AstrBot 最终文本：
+
+- “基础规则”使用插件内置的一致性与安全规则。
+- “附加规则”只使用你填写的审核说明。
+- “基础加附加”同时使用两者。
+- 开启“允许修改回复”后，审核模型可以给出完整替换文本；修改后还会重新审核。
+- 审核耗尽时默认不发送文本。只有显式开启“审核未通过时仍回复”才会继续发送最后版本。
+
+审核模型调用不带工具，不执行动作，也不会创建第二条聊天回复。
+
+## 文本气泡和表情包
+
+文本布局有三种：
+
+- **合并为一段**：最稳妥，所有连续文本合并为一个组件。
+- **按句分段**：插件按句子边界拆分，并保证不丢字。
+- **模型分段**：辅助模型只返回文本边界；内容必须与原文完全一致，否则退回单段。
+
+使用 Shio 多气泡时，应关闭 AstrBot 内置分段，避免官方再次拆分。AstrBot 仍负责第一条标准发送；只有在后置 TTS、文本转图片、QQ 转发等不会被绕过时，Shio 才发送剩余文字。取消、插件重载或发送失败会停止后续气泡，不重试、不补发。
+
+Meme Manager 是否发表情包与 Shio 的情感辅助模型无关。Meme Manager 继续通过自己的官方 Hook 读取最终文本、选图并单独发图；图片不计入 Shio 的文字段数。
+
+## Master 故障通知
+
+故障通知默认关闭。启用前，Master 必须先与机器人完成一次真实私聊，使 Shio 能记录 AstrBot 官方私聊目标。达到连续失败阈值后，Shio 只提交固定的脱敏摘要：
+
+- 不包含群聊正文、QQ 号或会话 ID；
+- 可以设置 UTC 偏移和勿扰时间；
+- “已提交”只代表交给 AstrBot 主动消息接口，不代表 QQ 网络送达；
+- 失败不自动重试。
+
+## 隐私
+
+星汐会在当前请求中处理 QQ 号、群号、昵称、消息时间、@、Reply 和近期群聊文本。所选在线聊天模型、审核模型或分段模型可能接收对应内容。
+
+自然参与节奏和 Master 故障状态会使用 AstrBot 插件 KV 保存有限的计数与时间；连续消息批次保存在内存。当前 0.5 的群历史写入方式存在已知缺陷，因此不应承诺群聊上下文只停留在当前请求中，直到该问题完成修复。
+
+## 文档
+
+- [设置指南](docs/SETTINGS_GUIDE.md)
+- [架构说明](docs/ARCHITECTURE.md)
+- [兼容性边界](docs/COMPATIBILITY.md)
+- [安装与回退](docs/INSTALLATION_AND_ROLLBACK.md)
+- [故障排查](docs/TROUBLESHOOTING.md)
+- [开发避坑](docs/PITFALL_LEDGER.md)
+- [代码审查清单](docs/REVIEW_PLAYBOOK.md)
+
+## 反馈问题
+
+请提供：
+
+1. AstrBot、Shio 和相关插件版本；
+2. 平台适配器和聊天模型类型；
+3. 是否启用 AstrBot 内置分段、群聊上下文、Meme Manager 和 LivingMemory；
+4. 可复现步骤、期望行为和实际行为；
+5. 从收到消息到本轮结束的脱敏日志。
+
+不要公开 API Key、Cookie、真实私聊内容、未脱敏 QQ 号、群号或他人记忆。
+
+## 开发
+
+当前运行代码主要位于：
+
+- `main.py`：AstrBot Hook 与运行时生命周期；
+- `core/sys001.py`：可独立测试的规则与数据结构；
+- `core/active_event_fence.py`：插件重载后的旧事件隔离；
+- `tests/`：回归测试。
+
+自动化测试只能证明相应测试场景，不能替代真实 AstrBot 4.27.4、真实插件组合和 QQ 群聊验证。涉及 Pipeline 顺序、媒体、气泡、Meme 或 conversation 的修复，应在真实 Docker 环境中验证。
+
+## 许可
+
+本项目使用 MIT License，详见 [LICENSE](LICENSE)。

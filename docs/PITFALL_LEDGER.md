@@ -1,36 +1,117 @@
-# SYS-001 坑位台账
+# 开发陷阱清单
 
-| ID | 禁止误判 | 当前合同 |
-| --- | --- | --- |
-| S-001 | 第二 Provider、合成 event 或第二发送链 | 只从真实 event `request_llm` 进入官方链。 |
-| S-002 | 猜测身份或 history provenance | 单一 snapshot 只用官方字段；CR-013 保持。 |
-| S-003 | 复制权限或授予 Master | Master 只来自 `event.is_admin()`；群 ToolSet 仅单向删减。 |
-| S-004 | 恢复工具或投影 Skill | 不从全局库取回；Skill/非 agentic KB 来源未知。 |
-| S-005 | post-tool/final hook 当成功或 attempt | 仅保守观察，不形成回执或告警。 |
-| S-006 | 把 D-089 的余段编排误判为第二 adapter 或网络 receipt | 以本表后唯一的 D-089 owner 合同为准；它不等于网络送达或第二发送 owner。 |
-| S-007 | 空名单/友好名单扩大范围 | 空 allow 拒绝普通用户；Master bypass，友好不升权。 |
-| S-008 | 自然 cadence 当网络送达或扩大 D-074 | 仅同 scope RespondStage cadence；冷场和私聊主动零残留。 |
-| S-009 | conversation role/content 当可按 QQ 净化的群历史 | 仅读取官方群 `PlatformMessageHistory`；支持 AstrBot SQLite 的 naive UTC 时间，仍拒绝不可解释值；历史不可用只保留当前 event，LivingMemory 不过滤。 |
-| S-010 | 文本窗口绕过、跨 event 媒体拼接、旧 event 二次请求或后台补发 | 所有获准文本进入同一安静窗口，唯一 watermark identity 继续一次；Image/File/Record/Video/Reply 和明确命令保持 AstrBot 官方边界。scope 只在官方终态释放，无终态保持失败关闭到重载，状态无正文/媒体，重载静默清空。 |
-| S-011 | 让带工具主 Agent 再决定自然静默 | REPLY 前唯一无工具辅助判定拥有 `WAIT`／`NO_ACTION`；主 Agent 只能生成正常可见结果。 |
-| S-012 | 辅助 Provider 单条 lookup 异常抹掉后备 | current／显式／fallback route 各自隔离，保留健康对象并在每次 await 后验证 event epoch／token。 |
-| S-013 | 并发非 REPLY 候选回退 scope 活动 generation，或丢失 NO_ACTION 退避 | 每 scope 将预判候选序号与已进入主 Agent 的活动 generation 分离；WAIT／invalid／timeout 只退休自身候选；NO_ACTION 在释放当前文本 batch 前用同一 PluginKV cadence key 写短暂退避，但不取消已启动 turn、计成功次数或计回复冷却。 |
-| S-014 | 把公开 KV 当 CAS，或恢复 pending／event lifecycle | 只依赖固定 AstrBot 4.27.4 同进程 FIFO＋overlay；同 key pending→committed，重启仅恢复 committed cadence，8 秒超时 fail-closed。 |
+这份文件记录当前架构最容易再次走错的地方。它不是 Agent 流程或发布门。
 
-<!-- SYS001_D089_OWNER_CONTRACT_BEGIN -->
-```json
-{
-  "contract": "SYS001-D089-owner-v1",
-  "astrbot_owner": ["adapter", "standard_first_send", "official_segmented"],
-  "shio_when": {"fixed_safe": true, "official_segmented": "disabled"},
-  "shio_action": ["public_event_send", "orchestrate_remaining_bubbles", "await_remaining_bubbles"],
-  "shio_not_owner": ["network_receipt", "retry", "compensation", "second_adapter"]
-}
-```
-<!-- SYS001_D089_OWNER_CONTRACT_END -->
-<!-- SYS001_D089_OWNER_RENDER_BEGIN -->
-D-089 owner 合同：AstrBot 拥有 adapter、标准首发和官方 segmented；只有 fixed-safe 且官方 segmented 关闭时，Shio 才通过公开 `event.send()` 编排并等待剩余气泡。Shio 不拥有网络 receipt、retry、compensation 或第二 adapter。
-<!-- SYS001_D089_OWNER_RENDER_END -->
-# R10 timer ownership note
+## 先分清 AstrBot 和 Shio
 
-Shio 不建立延迟回复 timer。唯一的插件 timer 是 D-080 的有界 Master 告警勿扰期调度；它不参与自然参与、连续窗口或文本发送，也不代表网络送达。
+| 不要这样做 | 正确边界 |
+| --- | --- |
+| 在 Shio 里再建管理员系统 | 只读取 AstrBot `event.is_admin()` |
+| 复制 Persona 和 conversation | 正式请求继续使用 AstrBot 对象 |
+| 自建主 Provider fallback | 使用 AstrBot `fallback_chat_models` |
+| 包装所有工具执行和确认 | 只删减普通群友当前可见 ToolSet |
+| 自建媒体下载或平台 adapter | 交给 AstrBot 和平台插件 |
+| 用后台任务重新发聊天回复 | 只从真实事件进入官方链 |
+| 把 post-tool Hook 当动作成功 | 它只能说明拿到了一个观察结果 |
+
+## `ProviderRequest.contexts` 不是安全的临时草稿区
+
+当前最重要的教训：写进请求对象的历史可能随 Agent 结果进入 AstrBot conversation。停用插件不会自动撤销已保存内容。
+
+任何上下文改动都必须检查：
+
+- 数据在当前请求哪个阶段加入；
+- conversation 在哪个阶段读取和保存；
+- 同一条消息是否同时出现在 prompt、官方群聊注入、批次和历史中；
+- 插件停用或重载后，已保存内容是否仍会继续影响模型。
+
+## 不要用错误的官方功能补另一个功能
+
+“持久化群聊消息记录”和“群聊消息记录注入上下文”用途不同：
+
+- 前者保存记录并提供查询工具；
+- 后者把近期群聊临时加入当前请求。
+
+自然聊天需要当前请求上下文时，应先复用后者。不要因为前者有 sender ID 或行 ID，就整批复制进主 conversation。
+
+## Master 权限不等于每句话必回
+
+Master 身份决定权限，不决定机器人是否应该插话：
+
+- Master 的 @、Reply、官方唤醒和获准私聊属于明确回复；
+- Master 在群里的普通未点名发言仍走自然参与；
+- Shio 不新增“管理员说什么都必回”的隐含规则。
+
+## 连续消息只能有一个 owner
+
+同一会话的当前生成、等待中的后续文本、冷却提交和终态释放必须属于同一批次状态。
+
+不要：
+
+- 每来一条消息启动一轮正式请求；
+- 让旧请求读取晚于其 watermark 的未来消息；
+- 把机器人自己的上一条回复当成群友新消息；
+- 合成一个脱离真实事件的新消息；
+- 因等待超时而后台补发。
+
+## 工具可见性不是工具权限
+
+Shio 可以从普通群友的当前 ToolSet 删除名称，但不能据此声称：
+
+- 已授权某个工具；
+- 工具一定只读；
+- 工具执行成功；
+- AstrBot 沙箱可以省略。
+
+友好群友只是“不由 Shio 删减”，仍不是 Master。
+
+## 分段有三层
+
+需要同时区分：
+
+1. Shio 文本组件布局；
+2. AstrBot `segmented_reply`；
+3. 平台实际消息发送。
+
+最多 3 个 Shio 文本组件，不代表平台一定只发送 3 条；如果 AstrBot 再次分段，会出现二次拆分。由 Shio 控制气泡时应关闭 AstrBot 内置分段。
+
+RespondStage 完成也不是网络送达回执。Shio 不应重试、补发或声称消息已到达 QQ。
+
+## Meme 与“情感辅助”不是同一个开关
+
+Meme Manager 自己通过最终文本和自身配置选图。没有开启 Shio 的名称、自然参与或审核模型，不代表 Meme 不会发图。
+
+如果正文中直接出现 `&&meme:...&&`，应检查 Hook 顺序和标记消费，而不是让主模型继续生成更多标记。
+
+## 辅助模型必须有硬边界
+
+名称判断、自然参与、审核和模型分段：
+
+- 不带工具；
+- 不写主 conversation；
+- 不发送消息；
+- 当前模型与备用模型共享一个总 deadline；
+- 取消、插件重载和迟到结果不能改写新实例状态；
+- 解析失败时使用明确的安全结果。
+
+## 日志不要保存群聊正文
+
+自然参与判定日志只需要标准结果和耗时。公开问题报告应脱敏 QQ 号、群号、媒体 URL、Provider 凭据和私聊正文。
+
+## 测试桩不能冒充真实 Pipeline
+
+本地对象测试适合验证纯规则，但以下内容必须在真实 AstrBot 4.27.4 Docker 中检查：
+
+- conversation 保存；
+- `group_icl_enable` 注入；
+- 媒体转述；
+- Agent 工具循环；
+- ResultDecorate；
+- after-send、气泡和 Meme；
+- 插件重载。
+
+只看到测试通过、插件加载或 WebUI 200，都不能证明真实聊天链正确。
+
+## 文档必须跟代码一起更新
+
+删除功能后，README、设置指南、兼容说明、metadata 和 GitHub 仓库简介都需要核对。旧功能不能因为文档还在就继续被当成产品承诺。

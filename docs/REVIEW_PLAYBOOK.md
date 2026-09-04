@@ -1,31 +1,122 @@
-# SYS-001 审查手册
+# 开发与审查清单
 
-确认真实 event 只进入一次 `request_llm`，Persona/conversation/fallback/media/Respond 仍由 AstrBot。检查 snapshot 官方字段、空名单、block 优先和 Master bypass；私聊 ToolSet 原对象不变，群聊仅从当前 ToolSet 单向删减，Skill 不伪造来源。
+这是一份普通代码审查清单，不启用旧项目专用 Agent 流程。
 
-检查 post-tool 仅观察、最终 hook 不代表 Provider attempt；审核必须是有界的审核→修复→重新审核，耗尽默认 `review_exhausted` 并阻止文本，最后回复只可由明确开关允许且不计告警。自然 `WAIT`、非法和不可用判定不改变 cadence；`NO_ACTION` 在释放当前文本 batch 前以同一 scope PluginKV key 的 pending→committed 写入短暂退避，不增加成功次数或回复冷却；普通自然文本只在同 event/generation/message binding 的 RespondStage 完成后一次性提交成功 cadence；direct 不能递增自然 generation。多 Plain 不自动等于多消息；不存在网络 receipt、发送补偿或第二 adapter。D-089 owner 以本段后唯一的结构化合同为准。确认 `model` 分段失败完整降级、`segmented_reply` 只读检查官方 `content_cleanup_rule`，以及 Shio 100000 优先级先于固定 Meme Manager 4.15.4 的 99999 正常 hook。D-074 来源在 schema、代码和测试中零残留；其余 CR 缺口不得旁路补齐。
+## 改动前
 
-<!-- SYS001_D089_OWNER_CONTRACT_BEGIN -->
-```json
-{
-  "contract": "SYS001-D089-owner-v1",
-  "astrbot_owner": ["adapter", "standard_first_send", "official_segmented"],
-  "shio_when": {"fixed_safe": true, "official_segmented": "disabled"},
-  "shio_action": ["public_event_send", "orchestrate_remaining_bubbles", "await_remaining_bubbles"],
-  "shio_not_owner": ["network_receipt", "retry", "compensation", "second_adapter"]
-}
-```
-<!-- SYS001_D089_OWNER_CONTRACT_END -->
-<!-- SYS001_D089_OWNER_RENDER_BEGIN -->
-D-089 owner 合同：AstrBot 拥有 adapter、标准首发和官方 segmented；只有 fixed-safe 且官方 segmented 关闭时，Shio 才通过公开 `event.send()` 编排并等待剩余气泡。Shio 不拥有网络 receipt、retry、compensation 或第二 adapter。
-<!-- SYS001_D089_OWNER_RENDER_END -->
+- 明确问题属于 AstrBot、Shio、Provider、平台适配器还是第三方插件。
+- 读取 AstrBot 4.27.4 对应阶段的官方源码。
+- 画出真实事件从入口到 conversation 保存、结果装饰和发送的顺序。
+- 先建立能复现旧行为的测试。
+- 确认是否必须使用真实 Docker Pipeline；不要用本地 Stub 替代关键集成链。
 
-检查自然参与只有前置无工具辅助调用可返回 `WAIT`／`NO_ACTION`；REPLY 后主 Agent 不再收到或解释静默协议，即使先调用工具再输出同字面量也必须保持普通可见文本。名称／自然分类器共享 snapshot、结构化 @／Reply、时间及按黑名单净化并排除当前行的官方群历史；`DIRECT_OTHER`是谨慎判定事实，不得由缺失上下文擅自改写。
+## 范围检查
 
-检查同一 scope 并发预判时，候选序号不等于已进入主 Agent 的活动 generation：E2/E3 的 `WAIT`、`NO_ACTION`、invalid、timeout、取消或迟到只能退休各自候选，不能回退 E1；E1 仍必须经审核并在标准 RespondStage 完成后恰好提交一次 cadence。后续真实 `REPLY` 仍应提高活动 generation 并 fence 旧 E1 的 cadence，重载/epoch 使迟到候选静默失效。
+- 改动是否只解决已确认的问题和必要后果。
+- 是否顺便增加了第二管理员、Provider、工具执行器、会话、媒体或发送器。
+- 是否引入新的后台回复、自动重试或数据迁移。
+- 是否修改 AstrBot 核心来配合插件。
+- 是否把旧版 Planner/Replyer、表达库、主动话题或故障补答结构带回。
 
-检查 D-075 KV 只使用公开 PluginKVStoreMixin：固定 4.27.4 的同进程 FIFO/overlay 是兼容前提，不得表述为任意 KV 的 CAS。每次 cadence 写必须同 key `pending` 后同 transaction `committed`；初始化只接受 committed，且 KV await/termination drain 的 8 秒上限、timeout/cancel fail-closed 与 overlay/durable restart 矩阵都必须有实际回归。
+## 入口和身份
 
-检查群聊 request 的 `contexts` 只来自官方 `message_history_manager` 行投影：黑名单 sender 整行消失，bot 为 `assistant_self`，AstrBot SQLite 支持的 naive UTC `created_at` 规范为 aware UTC，非 datetime 或不可解释时区仍拒绝；旧行缺少平台 message ID 或 Reply sender/time 不得猜测，官方群历史关闭/读取失败时 contexts 为空而非回退 conversation 文本，LivingMemory 字段保持原对象。检查获准文本的首条和后续都等待、每 scope 只有最后真实 watermark identity 进入一次请求，deadline 每条重置，watermark 不重复进入 contexts，批次行不和官方群历史重复。Image/File/Record/Video/Reply 是官方边界 event，命令保持官方 handler，不得由 Shio 排队/重放。无终态 hook 时 scope 必须保持失败关闭到重载，不得以私有 deadline 释放或声称取消工具；状态不得保存正文/媒体，容量和重载必须静默失败关闭。所有辅助 purpose 的 current／显式／fallback Provider lookup 要逐 route 隔离；错误、超时、取消或迟到不得抹掉健康 route 或改写 event。
-# R10 timer ownership check
+- Master 只来自 `event.is_admin()`。
+- QQ 号、群号、机器人号和消息 ID 来自当前真实事件。
+- @ 和 Reply 的目标没有通过昵称或正文猜测。
+- 禁用名单只影响预期用户，Master 例外清楚。
+- Master 的普通未点名群消息不会被错误升级为必回。
 
-确认 Shio 没有第二延迟回复 timer；唯一允许的 `asyncio.sleep`/timer 是 D-080 Master 告警的有界勿扰期 worker，不能用于自然参与、连续窗口或发送循环。
+## 连续消息和自然参与
+
+- 同一会话只有一个批次 owner。
+- 首条文本也等待安静窗口。
+- 后续消息只更新等待批次，不启动交错正式请求。
+- 最后一个真实事件是唯一 watermark。
+- 旧请求不能读取未来消息。
+- 自然参与只在正式 Agent 前返回 `REPLY / WAIT / NO_ACTION`。
+- 非法、超时、取消和迟到结果保持安静。
+- 冷却只在官方 RespondStage 完成后提交。
+- 机器人自己的输出不会回流成群友输入。
+
+## 上下文和 conversation
+
+- 当前消息没有同时出现在 prompt、批次、官方群聊注入和历史中。
+- 临时群聊上下文不会保存进长期 conversation。
+- 没有整批复制持久化群聊历史到 `req.contexts`。
+- `group_icl_enable` 的官方注入和消费顺序有真实测试。
+- 图片转述按 AstrBot 官方配置工作。
+- 关闭 Shio 后，新请求不再带 Shio 上下文。
+
+## 工具
+
+- 私聊和 Master 当前 ToolSet 不被 Shio 扩大或替换。
+- 普通群友只从当前 ToolSet 单向删减。
+- Shio 不从全局 registry 把已关闭工具加回来。
+- 工具权限、确认、执行和结果仍由 AstrBot/工具插件处理。
+- post-tool 只记录观察，不声称动作成功。
+
+## 辅助 Provider
+
+- 使用 AstrBot 已加载 Provider。
+- 设置页模型字段使用下拉选择。
+- 调用不带工具、不写主 conversation、不发送消息。
+- 当前模型和备用模型共用总 deadline。
+- 每次 await 后检查事件、generation、插件实例和取消状态。
+- 空结果和错误 JSON 有确定的安全处理。
+
+## 最终审核
+
+- 只修改同一条最终回复。
+- 修复次数有明确上限。
+- 每次修改后重新审核。
+- 审核耗尽时的“阻止/仍发送”只由设置决定。
+- 不因审核失败另起第二条回复。
+
+## 气泡、Meme 和发送
+
+- Shio 文本段数与 AstrBot 分段设置没有叠加。
+- 分段拼接后与原文完全一致。
+- Unicode、空白、代码块和非文本组件顺序不被破坏。
+- TTS、文本转图片和 QQ forward 可能运行时保留官方单链。
+- AstrBot 负责标准首发。
+- 后续气泡使用公开接口，取消/重载/失败后不重试。
+- Meme Manager 读取最终审核文本，图片位于全部文字之后。
+- Meme 图片不计入文本段数。
+- 没有把 RespondStage 当成网络送达回执。
+
+## 生命周期
+
+- 插件重载后旧实例不能继续处理同一事件。
+- 迟到辅助模型结果不能改写新实例。
+- 等待中的 KV、Master 通知和气泡任务有界退出。
+- 内存批次不在重载后恢复或补发。
+- 没有残留会弹出窗口的本机后台进程。
+
+## 数据安全
+
+- 不自动迁移旧配置和旧 state。
+- 不自动删除 conversation、群聊历史或数据库。
+- 数据清理有精确目标、备份和单独批准。
+- 日志与测试夹具不包含真实密钥、QQ 号、群号和未脱敏正文。
+
+## 文档与版本
+
+- `metadata.yaml`、README、设置指南和兼容说明一致。
+- 版本号遵循 Owner 确认，不用候选 R 编号代替产品版本。
+- 删除的功能不再出现在 GitHub 介绍中。
+- 已知问题不会被描述成已修复或已验收。
+- 本地验证、Docker 验证、部署健康和 Owner 真实验收分别说明。
+
+## 完成前证据
+
+至少保存并报告：
+
+- 改动文件清单；
+- 旧行为复现和修复后的对照；
+- 轻量测试结果；
+- 真实 AstrBot 4.27.4 Docker Pipeline 结果；
+- 未测试的真实 QQ、Provider 或第三方插件范围；
+- 是否修改配置、数据、生产或 GitHub；
+- 回退方式。
+
+只有证据实际生成后，才能写“已通过”或“已修复”。
