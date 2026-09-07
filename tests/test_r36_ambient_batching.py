@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -229,9 +230,14 @@ class AmbientBatchingHookTests(unittest.IsolatedAsyncioTestCase):
         request = results[-1]
         request.system_prompt = ""
         request.func_tool = None
+        request.contexts = []
+        request.extra_user_content_parts = []
         await plugin.attach_turn_and_project_capabilities(third, request)
-        self.assertEqual(2, len(request.contexts))
-        batch = [json.loads(item["content"]) for item in request.contexts]
+        self.assertEqual([], request.contexts)
+        self.assertTrue(all(event.call_llm for event in (first, second, third)))
+        part = request.extra_user_content_parts[0]
+        self.assertTrue(part._no_save)
+        batch = [json.loads(item["content"]) for item in json.loads(part.text.split("=", 1)[1])]
         self.assertEqual(["A-1", "B-2"], [item["platform_message_id"] for item in batch])
         self.assertEqual(["first", "second"], [item["message_text"] for item in batch])
 
@@ -246,6 +252,16 @@ class AmbientBatchingHookTests(unittest.IsolatedAsyncioTestCase):
         # No configured Provider means natural classification fails closed.
         self.assertIsNone(await task)
         self.assertFalse(master.get_extra("shio.sys001.batch_mandatory"))
+
+    async def test_master_ambient_outside_natural_scopes_does_not_classify(self):
+        plugin = _plugin(natural=True)
+        plugin.config["sys001"]["group"]["natural_group_scopes"] = ["qq:group:other"]
+        master = _Inbound("M-outside", "ordinary", admin=True, directed=False)
+        task = asyncio.create_task(anext(plugin.request_event_bound_reply(master), None))
+        await asyncio.sleep(0)
+        await _close_window(plugin)
+        self.assertIsNone(await task)
+        self.assertIsNone(master.get_extra("shio.sys001.natural_decision_attempts"))
 
     async def test_any_direct_message_makes_the_whole_batch_one_mandatory_request(self):
         plugin = _plugin(natural=True)
@@ -674,6 +690,17 @@ class R38BoundaryFenceRegressions(unittest.IsolatedAsyncioTestCase):
 
 
 class NaturalDecisionUnavailableAuditTests(unittest.IsolatedAsyncioTestCase):
+    async def test_natural_decision_emits_only_outcome_and_elapsed_time(self):
+        plugin = _plugin(natural=True)
+        plugin.config["sys001"]["group"]["natural_decision_timeout_seconds"] = 0
+        event = _Inbound("private-event-id", "private group body")
+        snapshot = MAIN.create_snapshot(event, origin="natural")
+        audit_logger = logging.getLogger("shio-natural-test")
+        with patch.object(MAIN, "logger", audit_logger), self.assertLogs(audit_logger, level="INFO") as captured:
+            await plugin._decide_natural_participation(event, snapshot)
+        self.assertEqual(1, len(captured.records))
+        self.assertRegex(captured.records[0].getMessage(), r"^Shio natural decision=unavailable elapsed_ms=\d+$")
+
     async def test_every_unavailable_exit_is_a_redacted_event_local_audit(self):
         cases = (
             ("invalid_config", lambda plugin: plugin.config["sys001"]["group"].update(

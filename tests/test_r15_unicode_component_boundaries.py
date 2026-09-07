@@ -66,6 +66,19 @@ def _fixture_boundaries(clusters: tuple[str, ...]) -> frozenset[int]:
 
 
 class R15UnicodeComponentBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    def test_everyday_punctuation_and_intact_emoji_do_not_disable_sentence_split(self):
+        for middle in ('蛋糕备好了——今天真开心', '你说“太好了”', '一起庆祝👩\u200d💻', '收到👍🏽', '喝杯cafe\u0301'):
+            with self.subTest(middle=middle):
+                text = f'真棒！\n{middle}。\n继续加油！'
+                pieces = SYS001.split_text_components(text, minimum=1, maximum=3)
+                self.assertEqual(['真棒！\n', middle + '。\n', '继续加油！'], pieces)
+                self.assertTrue(SYS001.text_component_boundaries_are_safe(text, pieces))
+
+    def test_complex_character_after_punctuation_is_not_split_from_its_base(self):
+        text = '第一句！\u0301继续。\n第二句。'
+        pieces = SYS001.split_text_components(text, minimum=1, maximum=3)
+        self.assertEqual(['第一句！\u0301继续。\n', '第二句。'], pieces)
+
     def test_cluster_fixtures_allow_no_internal_plain_boundary(self):
         for name, clusters in _CLUSTER_FIXTURES:
             with self.subTest(name=name):

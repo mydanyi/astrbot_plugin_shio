@@ -288,7 +288,7 @@ with Session(e) as session:
         self.assertEqual(1, len(classifier.calls))
         self.assertIn("STRUCTURED_ADDRESS=DIRECT_OTHER", classifier.calls[0]["prompt"])
 
-    async def test_natural_classifier_receives_same_official_history_projection_as_main_request(self):
+    async def test_natural_classifier_does_not_read_persistent_group_history(self):
         history = [SimpleNamespace(
             id=7, created_at=datetime(2024, 1, 1), sender_id="303", sender_name="past",
             content={"type": "user", "message": [{"type": "plain", "text": "past context"}]},
@@ -313,8 +313,8 @@ with Session(e) as session:
         prompt = provider.calls[0]["prompt"]
         self.assertIn("sender_id=202", prompt)
         self.assertIn("DIRECT_OTHER", prompt)
-        self.assertIn("past context", prompt)
-        self.assertIn("2024-01-01T00:00:00+00:00", prompt)
+        self.assertNotIn("past context", prompt)
+        self.assertNotIn("OFFICIAL_HISTORY=", prompt)
 
     async def test_continuous_missing_terminal_fails_closed_in_bounded_time(self):
         plugin = _plugin(FakeContext(), group={

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import re
 import secrets
 import time
 from collections.abc import AsyncGenerator
@@ -23,6 +24,8 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, ResultContentType,
 from astrbot.api.message_components import Plain
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.agent.message import TextPart
+from astrbot.builtin_stars.astrbot.group_chat_context import GROUP_HISTORY_HEADER
 
 from .core.active_event_fence import ActiveEventFence
 from .core.sys001 import (
@@ -65,7 +68,6 @@ from .core.sys001 import (
     prune_natural_cadence,
     decode_natural_cadence_record,
     encode_natural_cadence_record,
-    project_official_group_history,
     text_component_boundaries_are_safe,
     text_components_survive_standard_strip,
 )
@@ -1488,70 +1490,23 @@ class ShioPlugin(Star):
         except Exception:
             return None
 
-    async def _official_group_history_contexts(
-        self, event: AstrMessageEvent, snapshot: TurnSnapshot
-    ) -> list[dict[str, str]]:
-        """Read the one approved, provenance-bearing group-history projection."""
-        if snapshot.is_private:
-            return []
+    def _official_icl_enabled(self, event: AstrMessageEvent) -> bool:
+        """AstrBot's group ICL owns current-request group-context injection.
+
+        When ``group_icl_enable`` is on, the official GroupChatContext records
+        real group messages and injects the pending window through
+        ``extra_user_content_parts``. Our request hook marks that window temp.
+        Shio must not build a second group-context system beside it.
+        """
         try:
             config = self.context.get_config(umo=event.unified_msg_origin)
             settings = config.get("provider_ltm_settings", {})
-            if (
-                not isinstance(settings, dict)
-                or not settings.get("group_message_history_enable", False)
-                or settings.get("group_icl_enable", False)
-            ):
-                return []
-            manager = getattr(self.context, "message_history_manager", None)
-            get_history = getattr(manager, "get", None)
-            if not callable(get_history):
-                return []
-            try:
-                limit = int(settings.get("group_message_history_max_cnt", 50))
-            except (TypeError, ValueError):
-                return []
-            if not 1 <= limit <= 700:
-                return []
-            records = await get_history(
-                platform_id=event.get_platform_id(), user_id=snapshot.scope, page_size=limit
-            )
-            if not isinstance(records, list):
-                return []
-            current_row_id = event.get_extra(
-                "_current_platform_message_history_id",
-                getattr(event, "_current_platform_message_history_id", None),
-            )
-            if isinstance(current_row_id, bool) or not isinstance(current_row_id, int):
-                current_row_id = None
-            # R37 batch requests have a real watermark event.  If AstrBot did
-            # not expose its platform-history row id, an upper bound cannot be
-            # proven, so omit official history rather than allow future rows.
-            batch = event.get_extra("shio.sys001.batch", ())
-            if batch and current_row_id is None:
-                return []
-            excluded_history_row_ids: frozenset[int] = frozenset()
-            if isinstance(batch, tuple) and all(isinstance(item, _BatchMessage) for item in batch):
-                row_ids = [item.history_row_id for item in batch]
-                # Each batch participant is already supplied as explicit
-                # provenance. If AstrBot did not expose every matching history
-                # row id, omitting history is safer than duplicating a real
-                # participant through a second owner.
-                if any(row_id is None for row_id in row_ids):
-                    return []
-                excluded_history_row_ids = frozenset(row_ids)
-            ingress = self._ingress_settings()
-            return project_official_group_history(
-                records,
-                blocked_sender_ids=self._ingress_ids(ingress, "blocked_sender_ids"),
-                current_history_row_id=current_row_id,
-                watermark_history_row_id=current_row_id,
-                excluded_history_row_ids=excluded_history_row_ids,
-            )
-        except asyncio.CancelledError:
-            raise
         except Exception:
-            return []
+            return False
+        return isinstance(settings, dict) and bool(
+            settings.get("group_icl_enable", False)
+        )
+
 
     async def _visible_name_wake(self, event: AstrMessageEvent) -> bool:
         """Only extend AstrBot's configured wake words into visible text."""
@@ -1581,7 +1536,7 @@ class ShioPlugin(Star):
             matched,
             snapshot,
             address,
-            history_contexts=await self._official_group_history_contexts(event, snapshot),
+            history_contexts=[],
         )
         explicit_provider_id = str(
             settings.get("name_semantic_provider_id", "")
@@ -1740,6 +1695,7 @@ class ShioPlugin(Star):
                 "outcome": outcome,
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
             })
+            logger.info("Shio natural decision=%s elapsed_ms=%d", outcome, attempts[-1]["elapsed_ms"])
 
         settings = self._group_settings()
         binding = self._bind_auxiliary_call(event, snapshot)
@@ -1761,7 +1717,6 @@ class ShioPlugin(Star):
         # Provider lookup and its tool-free response, not local projection.
         try:
             address = address_decision(event.get_messages(), snapshot.self_id)
-            history = await self._official_group_history_contexts(event, snapshot)
             batch = event.get_extra("shio.sys001.batch", ())
             batch_contexts = (
                 self._batch_contexts(batch[:-1])
@@ -1775,7 +1730,7 @@ class ShioPlugin(Star):
                 "or a reply text.\n\n"
                 f"RULES:\n{self._natural_prompt()}\n\n"
                 f"STRUCTURED_ADDRESS={address}\n{snapshot.model_context()}\n"
-                f"OFFICIAL_HISTORY={json.dumps(history, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"OFFICIAL_ICL_ACTIVE={'true' if self._official_icl_enabled(event) else 'false'}\n"
                 f"REAL_BATCH={json.dumps(batch_contexts, ensure_ascii=False, separators=(',', ':'))}\n"
                 f"MESSAGE:\n{snapshot.message_text}"
             )
@@ -2122,14 +2077,20 @@ class ShioPlugin(Star):
             )
         return True
 
-    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
+    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL, priority=-1000000)
     async def request_event_bound_reply(
         self, event: AstrMessageEvent
     ) -> AsyncGenerator[ProviderRequest, None]:
-        """Accept one real inbound event and hand it back to AstrBot's agent."""
+        """Schedule after official/third-party inbound context collectors."""
         if event.get_extra("handlers_parsed_params", {}):
             return
         provisional = create_snapshot(event, origin="pending")
+        # QQ friend/typing notices can be empty private events. The official
+        # Agent declines an empty request without final/send hooks, so such
+        # events must never acquire a batch owner. Media/Reply retain their
+        # existing official construction and boundary handling below.
+        if not provisional.message_text.strip() and not self._has_official_boundary_component(event):
+            return
         ingress = self._ingress_settings()
         entry = admit_ingress(
             provisional,
@@ -2178,18 +2139,13 @@ class ShioPlugin(Star):
                 natural_enabled=bool(group.get("natural_participation_enabled", False)),
                 allowed_group_scopes=self._natural_scopes(),
             )
-            # AstrBot's Master role remains the sole authority source.  It
-            # bypasses Shio admission lists, but an undirected group utterance
-            # is still a natural-participation candidate rather than an
-            # invented mandatory-reply privilege.
-            if (
-                decision.disposition != "request"
-                and provisional.is_master
-                and not provisional.is_private
-                and bool(group.get("natural_participation_enabled", False))
-                and provisional.message_text.strip()
-            ):
-                decision = EntryDecision("request", "natural", "master_natural_event")
+            # Master bypasses admission lists, not the configured locations
+            # where Shio may participate in undirected group conversation.
+        # Every admitted text event belongs to this batch, including events
+        # retired in favour of a later one. Otherwise ProcessStage launches
+        # its default Agent for a retired @/private event after this handler
+        # returns, producing a second reply outside the batch.
+        event.should_call_llm(True)
         batch_entry = await self._batch_join_and_wait(
             event,
             create_snapshot(event, origin=decision.origin if decision.disposition == "request" else "natural"),
@@ -2329,6 +2285,16 @@ class ShioPlugin(Star):
         lifecycle = event.get_extra(SYS001_LIFECYCLE_EXTRA)
         if not isinstance(snapshot, TurnSnapshot):
             return
+        # Reply/media requests are constructed by AstrBot, not our text-batch
+        # handler. Bind that official request too, before on_agent_begin, so
+        # its tool-loop drafts cannot escape the same final-only send guard.
+        if (
+            isinstance(lifecycle, TurnLifecycle)
+            and event.get_extra("shio.sys001.boundary_token") is not None
+            and event.get_extra(_SHIO_AGENT_REQUEST_EXTRA) is None
+        ):
+            event.set_extra(_SHIO_AGENT_REQUEST_EXTRA, req)
+            lifecycle.begin_request()
         if (
             isinstance(lifecycle, TurnLifecycle)
             and isinstance(fence, ActiveEventFence)
@@ -2351,10 +2317,60 @@ class ShioPlugin(Star):
                     f"{relationship_prompt}"
                 )
             self._project_group_visible_tools(snapshot, req)
+            self._complete_meme_selection_context(event, req)
         except BaseException:
             if isinstance(fence, ActiveEventFence):
                 fence.discard(event)
             raise
+
+    @staticmethod
+    def _complete_meme_selection_context(
+        event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        """Complete Meme 5's event-local auxiliary context, not chat history.
+
+        Its earlier request hook copies past conversation messages but omits
+        ProviderRequest.prompt. The selector must also see this turn's wishes
+        (including requests for text only). The key exists only when Meme's
+        auxiliary mode prepared it; tool mode and an absent Meme are untouched.
+        """
+        key = "meme_manager_emotion_context_lines"
+        lines = event.get_extra(key)
+        prompt = str(req.prompt or "").strip()
+        if not isinstance(lines, list) or not prompt:
+            return
+        prefix = "当前用户消息（本轮选图以此为准）: "
+        history = [line for line in lines if isinstance(line, str) and not line.startswith(prefix)]
+        event.set_extra(key, [*history, prefix + prompt])
+        if event.get_extra("meme_manager_semantic_mode") == "llm":
+            req.system_prompt = (req.system_prompt or "") + (
+                "\n\n[Shio 当前配图分工]\n"
+                "表情包由回复后的独立选图器处理，你只生成聊天正文。"
+                "不要生成 &&meme:...&& 图片标记，也不要调用 search_memes；"
+                "历史中的这类标记和调用不代表本轮可用工具。"
+                "其它任务只使用本轮工具清单中实际提供的工具。"
+            )
+
+    @filter.on_llm_response(priority=99999)
+    async def prepare_meme_auxiliary_response(
+        self, event: AstrMessageEvent, response: LLMResponse
+    ) -> None:
+        """Leave semantic selection exclusively to Meme's auxiliary hook.
+
+        Old tool-mode history can make the main model emit old IDs. In llm
+        mode those are not a current selection, even if a new search happens
+        to return the same ID. Tool mode remains entirely owned by Meme.
+        """
+        if event.get_extra("meme_manager_semantic_mode") != "llm":
+            return
+        response.completion_text = re.sub(
+            r"&&meme:[A-Za-z0-9_-]+&&", "", response.completion_text or ""
+        ).strip()
+        chain = getattr(response, "result_chain", None)
+        if chain is not None:
+            for part in chain.chain:
+                if isinstance(part, Plain):
+                    part.text = re.sub(r"&&meme:[A-Za-z0-9_-]+&&", "", part.text).strip()
 
     async def _apply_official_group_history(
         self,
@@ -2362,21 +2378,37 @@ class ShioPlugin(Star):
         snapshot: TurnSnapshot,
         req: ProviderRequest,
     ) -> None:
-        """Replace only group conversation contexts with sanitizable official rows."""
-        if snapshot.is_private:
+        """Keep official group ICL and earlier batch messages request-local.
+
+        The official hook runs before this one. AstrBot 4.27.4 does not mark
+        its ICL TextPart temporary, so explicitly use ContentPart.mark_as_temp
+        before the request is assembled. Never query persisted group history
+        here and never replace the official conversation in req.contexts.
+        """
+        has_official_context = False
+        if not snapshot.is_private and self._official_icl_enabled(event):
+            for part in req.extra_user_content_parts:
+                if isinstance(part, TextPart) and part.text.startswith(GROUP_HISTORY_HEADER):
+                    part.mark_as_temp()
+                    has_official_context = True
+        if has_official_context:
+            event.set_extra("shio.sys001.group_context_owner", "official_icl")
             return
-        # A current conversation may already have expanded to role/content JSON
-        # before this hook.  It has no sender provenance and is never a safe
-        # fallback for group filtering.
-        req.contexts = []
-        history = await self._official_group_history_contexts(event, snapshot)
+
         batch = event.get_extra("shio.sys001.batch", ())
-        if isinstance(batch, tuple) and all(isinstance(item, _BatchMessage) for item in batch):
-            # The watermark is the request prompt and must not appear again as
-            # a batch context. Earlier real events remain explicit once only.
-            req.contexts = [*history, *self._batch_contexts(batch[:-1])]
-        else:
-            req.contexts = history
+        earlier = (
+            self._batch_contexts(batch[:-1])
+            if isinstance(batch, tuple) and all(isinstance(item, _BatchMessage) for item in batch)
+            else []
+        )
+        if earlier:
+            req.extra_user_content_parts.append(
+                TextPart(
+                    text="SHIO_REAL_BATCH_EARLIER="
+                    + json.dumps(earlier, ensure_ascii=False, separators=(",", ":"))
+                ).mark_as_temp()
+            )
+        event.set_extra("shio.sys001.group_context_owner", "real_batch" if earlier else "none")
 
     def _project_group_visible_tools(
         self,
@@ -2541,12 +2573,25 @@ class ShioPlugin(Star):
             return
         review = _FinalReviewOutcome(str(getattr(response, "completion_text", "")))
         if isinstance(response.completion_text, str) and response.completion_text:
-            review = await self._review_final_text(
-                event, snapshot, response.completion_text
-            )
+            try:
+                review = await self._review_final_text(
+                    event, snapshot, response.completion_text
+                )
+            except Exception:
+                # Preserve the configured review-failure policy. A failed
+                # review is still a final response, never an intermediate draft.
+                logger.warning(
+                    "Shio final review failed.",
+                    exc_info=True,
+                )
+                review = _FinalReviewOutcome(str(response.completion_text), exhausted=True)
             if review.stale:
                 # A reloaded instance or superseded natural turn must not
                 # reinterpret this old response, alert, or alter its result.
+                # The marker below lets layout_text_components keep this
+                # final response visible instead of treating the missing
+                # FinalAgentObservation as an intermediate tool-loop draft.
+                event.set_extra("shio.sys001.final_review_stale", True)
                 if isinstance(fence, ActiveEventFence):
                     fence.discard(event)
                 return
@@ -2649,7 +2694,7 @@ class ShioPlugin(Star):
     async def observe_main_agent_done(
         self, event: AstrMessageEvent, run_context: Any, _response: LLMResponse
     ) -> None:
-        """Retire a completed public Agent run before another handler can own it."""
+        """End generation; final presentation and sending still own the turn."""
         fence = getattr(self, "_active_event_fence", None)
         if (
             isinstance(fence, ActiveEventFence)
@@ -2675,14 +2720,12 @@ class ShioPlugin(Star):
         snapshot = event.get_extra(SYS001_TURN_EXTRA)
         if (
             isinstance(snapshot, TurnSnapshot)
-            and snapshot.origin == "natural"
             and isinstance(observation, FinalAgentObservation)
-            and observation.outcome == "final_text"
+            and observation.outcome in {"final_text", "review_exhausted"}
         ):
-            # RespondStage owns the natural cadence boundary.  Keep this
-            # observation and exact request binding through after-send, where
-            # record_standard_send commits the visible reply before retiring
-            # the event-local ownership markers.
+            # AstrBot invokes OnAgentDone before ResultDecorate/Respond for
+            # non-streaming QQ. Keep the final observation for ALL origins,
+            # including private and directed group turns, until after-send.
             event.set_extra(_SHIO_AGENT_ERROR_TOKEN_EXTRA, None)
             return
         event.set_extra(SYS001_FINAL_AGENT_OBSERVATION_EXTRA, None)
@@ -2690,8 +2733,8 @@ class ShioPlugin(Star):
         event.set_extra(_SHIO_AGENT_REQUEST_EXTRA, None)
 
     @filter.on_decorating_result(priority=100000)
-    async def layout_text_components(self, event: AstrMessageEvent) -> None:
-        """Lay out text components while leaving standard delivery to AstrBot."""
+    async def guard_agent_result(self, event: AstrMessageEvent) -> None:
+        """Suppress drafts/errors before other decorators can act on them."""
         fence = getattr(self, "_active_event_fence", None)
         if (
             isinstance(fence, ActiveEventFence)
@@ -2763,6 +2806,35 @@ class ShioPlugin(Star):
         if result is None or not getattr(result, "chain", None):
             if isinstance(fence, ActiveEventFence):
                 fence.discard(event)
+            return
+        # Suppress drafts only while this exact Shio request has a live Agent
+        # run. Missing review metadata alone does not prove a draft: other
+        # hooks may have failed or retired their own observations. Clear the
+        # result, not the event, so the tool loop can produce its final reply.
+        if (
+            getattr(result, "result_content_type", None)
+            is ResultContentType.LLM_RESULT
+            and active_token is not None
+            and shio_request is not None
+            and event.get_extra("provider_request") is shio_request
+            and isinstance(lifecycle, TurnLifecycle)
+            and lifecycle.state == "requesting"
+            and not lifecycle.terminal_reason
+            and not isinstance(observation, FinalAgentObservation)
+            and not event.get_extra("shio.sys001.final_review_stale", False)
+        ):
+            event.clear_result()
+            event.set_extra("shio.sys001.intermediate_draft_suppressed", True)
+            return
+
+    @filter.on_decorating_result(priority=-99998)
+    async def layout_text_components(self, event: AstrMessageEvent) -> None:
+        """Split final cleaned text after Meme, before staging extra bubbles."""
+        # Recheck after third-party decorators and when invoked directly.
+        await self.guard_agent_result(event)
+        snapshot = event.get_extra(SYS001_TURN_EXTRA)
+        result = event.get_result()
+        if not isinstance(snapshot, TurnSnapshot) or result is None or not result.chain:
             return
         presentation = self._presentation_settings()
         mode = presentation.get("text_component_mode", "single")
@@ -3108,6 +3180,13 @@ class ShioPlugin(Star):
         ):
             event.set_extra("shio.sys001.bubble_delivery_status", "unsafe_reply_or_at_order")
             return
+        # Layout runs after AstrBot/Meme's Plain cleanup. Each resulting
+        # bubble therefore needs its own edge cleanup, including the first.
+        # Preserve internal paragraph breaks and all non-text components.
+        chain[:] = [
+            Plain(component.text.strip()) if isinstance(component, Plain) else component
+            for component in chain
+        ]
         first = tuple(chain[: first_text + 1])
         if not first:
             return
@@ -3463,6 +3542,10 @@ class ShioPlugin(Star):
         if isinstance(fence, ActiveEventFence):
             fence.discard(event)
         if not is_natural_final:
+            if isinstance(observation, FinalAgentObservation):
+                event.set_extra(SYS001_FINAL_AGENT_OBSERVATION_EXTRA, None)
+                event.set_extra(_SHIO_AGENT_ERROR_TOKEN_EXTRA, None)
+                event.set_extra(_SHIO_AGENT_REQUEST_EXTRA, None)
             return
         try:
             deferred_error: BaseException | None = None
@@ -3548,7 +3631,7 @@ class ShioPlugin(Star):
         lifecycle.observe_tool(observation)
 
     async def terminate(self) -> None:
-        """Fence late hooks from this unloaded plugin instance without writing state."""
+        """Fence late hooks without rewriting AstrBot's conversation database."""
         fence = getattr(self, "_active_event_fence", None)
         if isinstance(fence, ActiveEventFence):
             fence.close()

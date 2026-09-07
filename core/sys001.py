@@ -133,12 +133,17 @@ def text_components_survive_standard_strip(pieces: Iterable[str]) -> bool:
 
     AstrBot's ResultDecorate stage and the fixed Meme Manager normal decorating
     hook both strip every Plain component.  A multi-component Shio layout is
-    therefore safe only when each individual component is already stable under
-    that public downstream behavior.  A single component is intentionally not
+    therefore safe only when each individual component is non-empty and
+    stripping it removes at most trailing paragraph newlines. Spaces at a
+    word boundary still require coalescing to avoid changing visible words.
+    A single component is intentionally not
     rejected: its ordinary AstrBot behavior remains the standard owner.
     """
     values = list(pieces)
-    return len(values) <= 1 or all(value and value.strip() == value for value in values)
+    return len(values) <= 1 or all(
+        value.strip() and value.rstrip("\r\n") == value.strip()
+        for value in values
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1047,12 +1052,19 @@ def _is_provably_simple_component_codepoint(value: str) -> bool:
     Python's standard library does not expose UAX #29 extended-grapheme
     segmentation.  Rather than approximate it and risk a cut through a newer
     emoji, Indic, or Hangul sequence, component layout only refines plain
-    printable ASCII and common CJK/punctuation code points.  Everything else
-    remains one reversible ``Plain`` component.
+    printable ASCII and common CJK/punctuation code points.  Newline and
+    horizontal ellipsis are admitted because they are the natural paragraph
+    and trailing-off boundaries of everyday chat; the standard library can
+    still prove a cut there is outside every extended grapheme cluster.
+    Other code points may remain inside a component; only the two code points
+    touching a proposed cut need to belong to this domain.
     """
     point = ord(value)
     return (
-        0x20 <= point <= 0x7E
+        point in (0x09, 0x0A, 0x0D, 0x2026)
+        or 0x2010 <= point <= 0x2015
+        or 0x2018 <= point <= 0x201F
+        or 0x20 <= point <= 0x7E
         or 0x3000 <= point <= 0x303F
         or 0x3400 <= point <= 0x4DBF
         or 0x4E00 <= point <= 0x9FFF
@@ -1062,22 +1074,62 @@ def _is_provably_simple_component_codepoint(value: str) -> bool:
     )
 
 
-def _text_is_provably_simple_for_component_splitting(text: str) -> bool:
-    """Return whether every code point is in the conservative split domain."""
-    return bool(text) and all(
-        _is_provably_simple_component_codepoint(value) for value in text
-    )
+_SENTENCE_ENDING_CODEPOINTS = frozenset("。！？!?…~")
+_NEWLINE_BOUNDARY_CODEPOINTS = frozenset("\r\n")
+_TRAILING_WHITESPACE_CODEPOINTS = frozenset(" \t\r\n")
+
+
+def _iter_component_segments(text: str) -> list[str]:
+    """Split on sentence-ending or newline boundaries without losing bytes.
+
+    Each candidate boundary sits after a run of sentence-ending punctuation
+    (。！？!?…~) or after a run of newlines.  Immediately following spaces,
+    tabs and newlines are absorbed into the tail of the previous component,
+    so joining the pieces reproduces ``text`` exactly; the downstream
+    standard ``strip`` removes only that layout whitespace.  A trailing run
+    that is only whitespace is kept with the final piece rather than emitted
+    as an empty component.
+    """
+    segments: list[str] = []
+    length = len(text)
+    start = 0
+    index = 0
+    while index < length:
+        ch = text[index]
+        if ch in _SENTENCE_ENDING_CODEPOINTS:
+            index += 1
+            while index < length and text[index] in _SENTENCE_ENDING_CODEPOINTS:
+                index += 1
+        elif ch in _NEWLINE_BOUNDARY_CODEPOINTS:
+            while index < length and text[index] in _NEWLINE_BOUNDARY_CODEPOINTS:
+                index += 1
+        else:
+            index += 1
+            continue
+        cursor = index
+        while cursor < length and text[cursor] in _TRAILING_WHITESPACE_CODEPOINTS:
+            cursor += 1
+        if cursor >= length:
+            break
+        if _safe_plain_boundary(text, cursor):
+            segments.append(text[start:cursor])
+            start = cursor
+        index = cursor
+    segments.append(text[start:])
+    return [seg for seg in segments if seg != ""]
 
 
 def _safe_plain_boundary(text: str, index: int) -> bool:
     """Return whether a conservative cut survives downstream ``strip``."""
     if not 0 < index < len(text):
         return False
-    if not _text_is_provably_simple_for_component_splitting(text):
-        return False
     left = text[index - 1]
     right = text[index]
-    if left.isspace() or right.isspace():
+    if not all(_is_provably_simple_component_codepoint(ch) for ch in (left, right)):
+        return False
+    if right.isspace():
+        return False
+    if left.isspace() and left not in _NEWLINE_BOUNDARY_CODEPOINTS:
         return False
     if (
         unicodedata.combining(left)
@@ -1133,7 +1185,7 @@ def _safe_minimum_text_components(text: str, minimum: int, maximum: int) -> list
     upper = max(lower, maximum)
     if lower <= 1:
         return []
-    sentence_parts = [part for part in re.split(r"(?<=。)", text) if part != ""]
+    sentence_parts = _iter_component_segments(text)
     if not text_components_survive_standard_strip(sentence_parts):
         sentence_parts = [text]
     if len(sentence_parts) > upper:
@@ -1166,12 +1218,9 @@ def split_text_components(text: str, *, minimum: int = 1, maximum: int) -> list[
     """Split text into MessageChain components without claiming send behavior."""
     if text == "":
         return []
-    # The standard library cannot prove UAX #29 boundaries for complex text.
-    # A single Plain keeps every code point reversible and makes the explicit
-    # layout hook report ``degraded_single`` when a requested minimum is unmet.
-    if not _text_is_provably_simple_for_component_splitting(text):
-        return [text]
-    segments = [part for part in re.split(r"(?<=。)", text) if part != ""]
+    # Keep complex clusters intact, but do not let one elsewhere in the reply
+    # disable ordinary sentence/newline boundaries throughout the entire text.
+    segments = _iter_component_segments(text)
     limit = max(1, maximum)
     lower = max(1, minimum)
     if lower > 1:

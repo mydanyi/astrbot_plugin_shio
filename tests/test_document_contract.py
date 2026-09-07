@@ -1,8 +1,9 @@
-"""Checks that public documentation matches the Shio 0.5 source snapshot."""
+"""Checks that public documentation matches the current Shio candidate."""
 
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -30,7 +31,7 @@ class DocumentationContractTests(unittest.TestCase):
     def test_readme_describes_current_product_and_known_limit(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         for phrase in (
-            "0.5 源码预览版",
+            "修复候选",
             "4.27.4",
             "aiocqhttp",
             "event.request_llm()",
@@ -39,7 +40,7 @@ class DocumentationContractTests(unittest.TestCase):
             "NO_ACTION",
             "ProviderRequest.contexts",
             "群聊消息记录注入上下文",
-            "不应直接当作稳定生产版",
+            "尚未作为稳定版发布",
             "从 AstrBot 已有模型中下拉选择",
         ):
             with self.subTest(phrase=phrase):
@@ -75,8 +76,8 @@ class DocumentationContractTests(unittest.TestCase):
                 self.assertIn(description, guide)
 
         self.assertIn("不要手写 Provider ID", guide)
-        self.assertIn("旧文档要求开启", guide)
-        self.assertIn("这项建议已经撤销", guide)
+        self.assertIn("群聊消息记录注入上下文", guide)
+        self.assertIn("Shio 不自动改变这两项设置", guide)
 
     def test_provider_fields_use_astrbot_selectors(self) -> None:
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
@@ -102,12 +103,15 @@ class DocumentationContractTests(unittest.TestCase):
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         self.assertIn("sys001", schema)
         metadata = (ROOT / "metadata.yaml").read_text(encoding="utf-8")
-        self.assertIn('version: "0.5"', metadata)
+        version = re.search(r'^version: "([^"]+)"$', metadata, re.MULTILINE)
+        self.assertIsNotNone(version)
+        self.assertIn(version.group(1), (ROOT / "README.md").read_text(encoding="utf-8"))
         self.assertIn('astrbot_version: "==4.27.4"', metadata)
         self.assertIn("- aiocqhttp", metadata)
 
         compatibility = (DOCS / "COMPATIBILITY.md").read_text(encoding="utf-8")
-        self.assertIn("源码预览版", compatibility)
+        self.assertIn(version.group(1), compatibility)
+        self.assertIn("修复候选", compatibility)
         self.assertIn("4.27.4", compatibility)
         self.assertIn("aiocqhttp", compatibility)
 

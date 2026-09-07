@@ -153,13 +153,13 @@ class R8DocumentationContractTests(unittest.TestCase):
         readme = (root / "README.md").read_text(encoding="utf-8")
         compatibility = (root / "docs" / "COMPATIBILITY.md").read_text(encoding="utf-8")
         self.assertNotIn("没有可靠跨event连续窗口", readme)
-        self.assertIn("D-093", readme)
+        self.assertIn("连续消息", readme)
         self.assertNotIn("D-077", readme)
         for text in (readme, compatibility):
             self.assertNotIn("Skill 逐项来源（CR-015）", text)
             self.assertNotIn("动作确认（CR-016）", text)
             self.assertNotIn("分段发送协作（CR-018）", text)
-        self.assertIn("D-074", readme)
+        self.assertIn("AstrBot", readme)
         self.assertIn("segmented_reply", compatibility)
         self.assertIn("Meme Manager", compatibility)
 

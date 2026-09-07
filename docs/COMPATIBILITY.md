@@ -4,11 +4,11 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| Shio | `0.5` 源码预览版 |
+| Shio | `0.5.1` 主线，包含此前 `0.5.5` 修复候选的修复 |
 | AstrBot | 仅 `4.27.4` |
 | 平台 | QQ `aiocqhttp` |
 | Python | 跟随 AstrBot 4.27.4 运行环境 |
-| Meme Manager | 可选；当前链路按 4.15.4 的公开 Hook 检查 |
+| Meme Manager | 可选；0.5.1 合并前 Docker 组合验证加载的真实插件为 5.0.2；下文保留此前按 5.0.0 核对的协作说明 |
 | LivingMemory | 可选；由其自身和 AstrBot 管理 |
 
 `metadata.yaml` 使用 `astrbot_version: "==4.27.4"`。这不是保守的展示文字，而是当前实现依赖固定 Hook、配置形状、PluginKV 和发送顺序的真实边界。
@@ -45,12 +45,16 @@ Shio 的辅助模型仅用于：
 
 Shio 不直接选择或发送表情包。当前协作目标是：
 
-1. Shio 先观察最终审核文本并完成文字布局；
+1. Shio 先处理最终审核文本；Meme 识别标记并清理文本后，Shio 再做文字布局（Meme 5.0.0 会合并相邻文本组件，不能在它之前分段）；
 2. AstrBot 发送标准文字；
 3. Shio 在安全条件下发送余下文字气泡；
 4. Meme Manager 再根据自身设置单独发图。
 
+0.5.4 还对接 Meme 5.0.0 的辅助选图事件上下文：Meme 的请求 Hook 先生成 `meme_manager_emotion_context_lines`，Shio 在自己的后置请求 Hook 中补充当前 `ProviderRequest.prompt`，避免只读旧历史而遗漏本轮“不要图片”等要求。该列表仅存于当前事件，不追加到 `req.contexts` 或 conversation。Meme 未建立此列表时不处理，主模型工具选图模式不受影响。此事件键属于已核对的 Meme 版本协作点，并非 AstrBot 通用 API；升级 Meme 必须重测。
+
 如果后续文字取消、过期或发送失败，Shio 会停止事件的后续 Hook，避免只剩一张脱离文字的表情包。
+
+0.5.5 在 Meme 的 `llm` 语义模式下，先移除主聊天模型产生的历史图片 ID 标记，再交给 Meme 原生辅助选择。`tool` 模式不做这项清理，仍允许主模型选择本轮候选。模式键同样是 Meme 5.0.0 的版本协作点。该版本的语义选图不使用分类模式的概率开关；频率由选图提示决定，不能把概率 100 当作每轮必发图的保证。
 
 其它 Meme Manager 版本或不同 Hook 优先级需要重新验证。
 
@@ -72,16 +76,17 @@ LivingMemory 是独立的长期记忆来源。Shio 不读取、迁移或过滤�
 
 如果记忆内容已经进入 AstrBot 请求，Shio 只能保持该官方/插件链的既有对象，不能保证第三方记忆本身带有可验证的发送者身份。
 
-## 群聊上下文：当前不兼容点
+## 群聊上下文
 
-当前 0.5 仍要求 `group_message_history_enable=true` 且 `group_icl_enable=false` 后读取 `message_history_manager`，再改写 `ProviderRequest.contexts`。这项实现已经确认需要纠正：
+0.5.1 不读取 `message_history_manager`，不改写 `ProviderRequest.contexts`：
 
 - 持久化群聊记录的官方用途是保存记录和提供查询工具；
 - `group_icl_enable` 才是当前请求的官方群聊上下文注入；
-- 写入 `req.contexts` 可能污染长期 conversation；
-- 当前做法也无法正确利用官方群聊媒体转述。
+- 官方 `GroupChatContext` 注入的 `TextPart` 由 Shio 请求 Hook 标记为 `mark_as_temp()`，避免随 conversation 保存；
+- 关闭官方注入时只补当前连续批次的更早真实消息，同样使用临时标记；
+- 图片转述仍完全按 AstrBot 官方配置工作，本次纯文本回归不代表真实 QQ 图片下载已验证。
 
-所以旧版“开启持久化记录、关闭官方群聊注入”的搭配不再是推荐配置。修复前只建议在隔离测试会话中使用 0.5。
+需要群聊上下文时开启官方注入。持久化记录开关仅影响 AstrBot 官方记录/查询工具，Shio 不以它作为自动上下文来源。插件不替用户更改这两项生产设置，也不清理旧 conversation。
 
 ## 平台媒体
 

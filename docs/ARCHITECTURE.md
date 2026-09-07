@@ -1,4 +1,4 @@
-# 星汐 0.5 架构
+# 星汐 0.5.1 架构
 
 本文描述当前源码，而不是旧版公开 README 中的 Planner/Replyer 架构。
 
@@ -20,7 +20,7 @@
 | Persona 与正式 conversation | AstrBot | 不创建第二份 |
 | 正式模型和 fallback | AstrBot | 不接管 |
 | 工具注册、确认、执行和沙箱 | AstrBot / 工具插件 | 仅删减普通群友当前可见工具 |
-| 群聊上下文注入 | 应由 AstrBot 官方链负责 | 当前实现仍待纠偏 |
+| 群聊上下文注入 | AstrBot 官方 GroupChatContext | 标记临时内容，不复制持久化历史 |
 | 当前回合身份与时间事实 | 提供事件字段 | 捕获一次并注入当前请求 |
 | 未点名群聊是否参与 | 提供真实事件 | 无工具辅助判断 |
 | 连续文本等待 | 提供逐条事件 | 按真实会话维护短期内存批次 |
@@ -34,7 +34,7 @@
 
 ### `main.py`
 
-当前 3,646 行，是插件入口和运行时编排层，包含：
+插件入口和运行时编排层，包含：
 
 - 初始化、PluginKV 读取和插件卸载隔离；
 - 聊天范围判断；
@@ -50,13 +50,13 @@
 
 ### `core/sys001.py`
 
-当前 1,183 行，主要保存可独立验证的领域对象和纯规则：
+主要保存可独立验证的领域对象和纯规则：
 
 - `TurnSnapshot`：当前真实事件的身份、会话、时间、@ 和 Reply 事实；
 - 入口允许/拒绝与直接/自然来源判断；
 - `REPLY / WAIT / NO_ACTION` 解析；
 - 自然参与冷却、频率和退避；
-- 官方群历史行投影；
+- 历史群消息投影纯函数（保留旧测试，运行入口不再调用）；
 - 群聊 ToolSet 单向删减；
 - 最终结果与工具结果分类；
 - 文本分段和 Unicode 边界保护；
@@ -94,6 +94,8 @@
 - 只有 watermark 继续一次 `event.request_llm()`；
 - 早期文本以批次事实提供，不合成新的 AstrBot 事件。
 
+所有进入文本批次的事件都提前设置官方 `should_call_llm(True)`，包括最后退出的旧事件。此标记阻止 ProcessStage 在插件处理之后再启动默认 Agent；不是只给最后实际请求的事件设置。
+
 批次只保存在内存中。插件重载时清空，不持久化聊天正文或媒体。
 
 ### 3. 自然参与前置判断
@@ -124,7 +126,7 @@ AstrBot 因此继续负责 Persona、conversation、正式 Provider、fallback �
 - 把 `TurnSnapshot` 追加到 system prompt；
 - 只对 AstrBot 已确认的 Master 附加可选表达规则；
 - 对普通群友当前 `ToolSet` 做单向删减；
-- 当前还会调用官方群历史投影并改写 `req.contexts`，这是待修问题。
+- 不改写 `req.contexts`、不读取持久化群历史；官方 ICL 文本通过 `mark_as_temp()` 标记，或仅补入当前批次更早的真实消息。
 
 ### 6. Agent 与最终文本
 
@@ -139,13 +141,15 @@ AstrBot 完成正式 Agent 和工具链。Shio 只观察工具结果，不把 po
 
 辅助审核使用总 deadline；不会另起一次主回复。
 
+非流式 QQ 的顺序是最终响应 Hook → Agent 结束 Hook → 结果装饰 → 发送。最终观察必须保留到发送结束，不能在 Agent 结束时清空。中间草稿拦截必须同时确认“当前仍有活动 Agent”与“同一个 ProviderRequest”；缺少观察记录本身不代表草稿。
+
 ### 7. 文本布局与发送
 
-`layout_text_components()` 在 decorating 阶段选择单段、按句或模型分段。布局必须满足：
+`guard_agent_result()` 先拦截确知的工具前草稿和最终错误。Meme 完成标记清理之后，`layout_text_components()` 再选择单段、按句或模型分段，最后 `stage_remaining_bubbles()` 暂存后续文字。布局必须满足：
 
 - 所有分段拼回后与原文完全一致；
 - 不破坏 Unicode 组合字符；
-- 不依赖会被 AstrBot 或 Meme Manager 删除的首尾空白；
+- 不丢失词间空格；段尾换行可以作为气泡边界；
 - 段数在配置范围内。
 
 AstrBot 继续执行结果装饰和第一条标准发送。关闭 AstrBot 内置分段时，`send_remaining_bubbles()` 才可能通过公开 `event.send()` 发送余下文字。TTS、文本转图片、QQ forward、取消、重载、过期或发送异常会让 Shio 保留标准单链或停止后续气泡。
@@ -158,20 +162,16 @@ Meme Manager 的 after-send Hook 位于后面；只有余下文字成功完成�
 
 PluginKV 写入有 8 秒上限，失败时保持关闭。插件不会据此重试或补发聊天消息。
 
-## 当前上下文缺陷
+## 上下文与持久化边界
 
-`_apply_official_group_history()` 当前会先清空群聊 `req.contexts`，再写入持久化群聊历史投影和当前批次。这会带来两个问题：
+`_apply_official_group_history()` 保留方法名，但不再执行历史查询：
 
-1. 临时群聊历史可能随 AstrBot Agent 结果保存进长期 conversation；
-2. 代码绕开了 AstrBot 的 `group_icl_enable` 当前请求注入链路。
+1. 开启官方 `group_icl_enable`：只把官方注入的 `GROUP_HISTORY_HEADER` 文本部分标记为临时内容，不重复追加批次。
+2. 关闭官方注入：只向 `extra_user_content_parts` 追加当前批次中更早的真实消息，群聊和私聊相同；当前消息由官方请求自身提供。
+3. 使用 AstrBot 的 `TextPart.mark_as_temp()`，由官方 `dump_messages_with_checkpoints` 排除临时部分；不自建序列化类。
+4. `req.contexts` 和其它插件的内容列表保持不被替换。卸载或重载不扫描、不删除 conversation。
 
-后续修复必须从 AstrBot 4.27.4 官方源码确认：
-
-- `extra_user_content_parts` 在何处生成和消费；
-- conversation 在什么阶段保存；
-- 当前真实消息是否已包含在官方群聊注入中；
-- 图片转述和群聊媒体如何进入当前请求；
-- 连续批次怎样避免与官方群聊注入重复。
+已有污染数据不会被该修复倒推清除。历史数据处理必须单独确认；尤其不能因用户提到 `official_platform_history` 等词就删除该消息。
 
 不要为了保留 sender ID、历史行 ID 或 watermark 而再次把官方持久化历史复制到 `req.contexts`。如果官方接口不提供某个字段，应降低插件能力或只使用当前真实事件，不能建立第二套群聊上下文系统。
 

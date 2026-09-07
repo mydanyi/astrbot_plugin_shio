@@ -207,6 +207,25 @@ class R6HistoryAndStripTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("past", contexts[0]["content"])
         self.assertNotIn("current", contexts[0]["content"])
 
+    async def test_enabled_icl_without_injected_part_keeps_earlier_batch_messages(self):
+        plugin = MAIN.ShioPlugin.__new__(MAIN.ShioPlugin)
+        plugin.context = SimpleNamespace(get_config=lambda **_kw: {
+            "provider_ltm_settings": {"group_icl_enable": True},
+        })
+        event = _Event()
+        snapshot = _snapshot(origin="direct")
+        item = MAIN._BatchMessage(event, snapshot, True, (), None)
+        event.set_extra("shio.sys001.batch", (item, item))
+        memory_part = object()
+        conversation = [{"role": "assistant", "content": "existing conversation"}]
+        req = SimpleNamespace(contexts=conversation, extra_user_content_parts=[memory_part])
+        await plugin._apply_official_group_history(event, snapshot, req)
+        self.assertIs(conversation, req.contexts)
+        self.assertIs(memory_part, req.extra_user_content_parts[0])
+        self.assertEqual(2, len(req.extra_user_content_parts))
+        self.assertIn("ordinary group text", req.extra_user_content_parts[1].text)
+        self.assertEqual("real_batch", event.get_extra("shio.sys001.group_context_owner"))
+
     async def test_group_history_hook_uses_official_current_row_id_not_text_matching(self):
         now = datetime(2024, 1, 1, tzinfo=UTC)
         records = [
@@ -228,16 +247,22 @@ class R6HistoryAndStripTests(unittest.IsolatedAsyncioTestCase):
         # builtin_stars writes the real current row through the event extra;
         # equal message text is deliberately not a safe substitute for this ID.
         event.set_extra("_current_platform_message_history_id", 42)
-        req = SimpleNamespace(contexts=[{"unsafe": "must be replaced"}])
+        # The long-term conversation window must stay exactly as the official
+        # agent built it: rewriting req.contexts is the pollution path itself.
+        original_contexts = [{"role": "user", "content": "official conversation row"}]
+        req = SimpleNamespace(contexts=list(original_contexts), extra_user_content_parts=[])
         await plugin._apply_official_group_history(event, _snapshot(origin="direct"), req)
-        self.assertEqual(1, len(req.contexts))
-        self.assertIn('"history_row_id":41', req.contexts[0]["content"])
-        self.assertNotIn('"history_row_id":42', req.contexts[0]["content"])
+        # req.contexts is AstrBot's persisted conversation: untouched.
+        self.assertEqual(original_contexts, req.contexts)
+        # Persisted history must not become a second source of group context.
+        self.assertEqual([], req.extra_user_content_parts)
+        self.assertEqual("none", event.get_extra("shio.sys001.group_context_owner"))
 
     def test_multi_plain_layout_downgrades_when_fixed_downstream_strip_would_change_a_piece(self):
         self.assertFalse(SYS001.text_components_survive_standard_strip(["hello ", "world"]))
         self.assertFalse(SYS001.text_components_survive_standard_strip(["\n  hello", "world"]))
         self.assertTrue(SYS001.text_components_survive_standard_strip(["hello", "world"]))
+        self.assertTrue(SYS001.text_components_survive_standard_strip(["hello\n", "world"]))
 
     async def test_plugin_layout_keeps_one_plain_when_fixed_result_decorate_strip_would_lose_boundary_space(self):
         plugin = MAIN.ShioPlugin.__new__(MAIN.ShioPlugin)

@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 from astrbot.api.event import filter as _FIXED_FILTER
+from astrbot.builtin_stars.astrbot import group_chat_context as _FIXED_GROUP_CONTEXT
 import astrbot.core.star as _FIXED_STAR_PACKAGE
 from astrbot.core.star import base as _FIXED_STAR_BASE
 from astrbot.core.star import star as _FIXED_STAR
@@ -110,7 +111,7 @@ def _install_astrbot_public_api_stub() -> None:
     api.AstrBotConfig = dict
     api.FunctionTool = FunctionTool
     api.ToolSet = ToolSet
-    api.logger = SimpleNamespace(warning=lambda *_args, **_kwargs: None)
+    api.logger = SimpleNamespace(warning=lambda *_args, **_kwargs: None, info=lambda *_args, **_kwargs: None)
     event.AstrMessageEvent = object
     event.MessageChain = MessageChain
     event.ResultContentType = ResultContentType
@@ -2175,6 +2176,9 @@ class NaturalCadencePluginTests(unittest.IsolatedAsyncioTestCase):
             def set_extra(self, key, value):
                 self.extras[key] = value
 
+            def should_call_llm(self, value):
+                self.call_llm = value
+
         plugin, _store = self.plugin()
         plugin.config["sys001"]["ingress"] = {
             "group_allowed_scopes": [self.scope],
@@ -2339,19 +2343,30 @@ class OfficialGroupHistoryProjectionTests(unittest.IsolatedAsyncioTestCase):
 
         await plugin.attach_turn_and_project_capabilities(event, request)
 
-        self.assertEqual(1, plugin.context.history_calls)
-        self.assertEqual(["user"], [item["role"] for item in request.contexts])
+        self.assertEqual(0, plugin.context.history_calls)
+        # The official conversation window (req.contexts) is never rewritten;
+        # rewriting it is exactly the pollution path Shio must not take.
+        self.assertEqual([{"role": "user", "content": "unprovenanced conversation"}], request.contexts)
+        # A persistent history setting must not revive Shio's second reader.
+        # Other plugins' request parts remain untouched.
         self.assertIs(memory, request.extra_user_content_parts)
+        self.assertEqual(["LivingMemory-owned object"], memory)
+        self.assertEqual("none", event.get_extra("shio.sys001.group_context_owner"))
         self.assertEqual("Persona", request.system_prompt.split("\n\n")[0])
 
         plugin.context.enabled = False
+        fresh_memory: list = []
         disabled = SimpleNamespace(
             prompt="current text", system_prompt="Persona", contexts=[{"role": "user", "content": "old"}],
-            func_tool=None, extra_user_content_parts=memory,
+            func_tool=None, extra_user_content_parts=fresh_memory,
         )
         await plugin.attach_turn_and_project_capabilities(event, disabled)
-        self.assertEqual([], disabled.contexts)
-        self.assertIs(memory, disabled.extra_user_content_parts)
+        # With history disabled both the conversation window and the parts
+        # list stay untouched, and no extra history fetch happens.
+        self.assertEqual([{"role": "user", "content": "old"}], disabled.contexts)
+        self.assertEqual([], fresh_memory)
+        self.assertEqual("none", event.get_extra("shio.sys001.group_context_owner"))
+        self.assertEqual(0, plugin.context.history_calls)
 
 
 class ContinuousWindowCoordinatorTests(unittest.IsolatedAsyncioTestCase):
@@ -2481,7 +2496,7 @@ class ContinuousWindowEventPathTests(unittest.IsolatedAsyncioTestCase):
         )
         await asyncio.sleep(0)
         self.assertFalse(second_task.done())
-        self.assertFalse(second.call_llm)
+        self.assertTrue(second.call_llm)
 
         await plugin.record_standard_send(first)
         second_request = await second_task
@@ -2608,7 +2623,7 @@ class MemeManager4154ActualPathTests(unittest.IsolatedAsyncioTestCase):
             [handler.handler_full_name for handler in handlers],
         )
         self.assertEqual(
-            [100000, 100000, -1000000],
+            [100000, -99998, -1000000],
             [handler.extras_configs["priority"] for handler in handlers],
         )
         self.assertGreater(100000, meme.PRIORITY)
@@ -2616,8 +2631,8 @@ class MemeManager4154ActualPathTests(unittest.IsolatedAsyncioTestCase):
         await plugin.attach_turn_and_project_capabilities(event, request)
         await plugin.observe_final_agent_response(event, response)
         await meme.on_response(event, response)
-        await plugin.layout_text_components(event)
         await meme.on_decorating(event)
+        await plugin.layout_text_components(event)
 
         # AstrBot's normal Respond stage owns all text components.  The fixed
         # Meme normal after-hook only sends its separately pending image.
