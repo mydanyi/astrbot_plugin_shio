@@ -49,7 +49,8 @@ class R16MasterAuthorityRevisionTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         lock.release()
         await asyncio.gather(first, second)
-        self.assertEqual(2, plugin._master_alert_record.consecutive_count)
+        self.assertEqual(1, plugin._master_alert_record.consecutive_count)
+        self.assertTrue(second_event.get_extra("shio.sys001.error_master_done"))
         self.assertEqual("final_error", plugin._master_alert_record.error_type)
         kv.assert_unused(self)
         await plugin.terminate()
@@ -173,6 +174,8 @@ class R16MasterAuthorityRevisionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_revision_advances_only_for_local_transitions_and_never_kv(self):
         plugin, kv = self._plugin()
+        # Make the immediate-send transitions independent of the current hour.
+        plugin.config["sys001"]["master_alert"]["master_alert_quiet_enabled"] = False
         plugin._master_alert_record = SYS001.MasterAlertRecord()
         start = plugin._master_alert_revision
         event, snapshot = self._event_snapshot()
@@ -183,7 +186,8 @@ class R16MasterAuthorityRevisionTests(unittest.IsolatedAsyncioTestCase):
         )
         after_terminal = plugin._master_alert_revision
         self.assertEqual(start + 1, after_binding)
-        self.assertEqual(after_binding + 1, after_terminal)
+        # Fault, submitting, and rejected-send transitions each hold the lock.
+        self.assertEqual(after_binding + 3, after_terminal)
         kv.assert_unused(self)
         await plugin.terminate()
         self.assertEqual(after_terminal + 1, plugin._master_alert_revision)

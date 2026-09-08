@@ -25,6 +25,20 @@ SYS001_FINAL_AGENT_OBSERVATION_EXTRA = "shio.sys001.final_agent_observation"
 SYS001_TOOL_OBSERVATIONS_EXTRA = "shio.sys001.tool_observations"
 ALL_GROUP_USERS_CAPABILITY_NAMES = frozenset({"astr_kb_search"})
 
+DEFAULT_CORE_REVIEW_RULES = (
+    "只检查这条待发送回复，有明确问题才修改，保留原意和已有事实。\n"
+    "区分当前发送者、其他群友和机器人，不把机器人的话或表情当成群友说的。\n"
+    "不凭空增加事实、身份关系或工具执行成功的结论；上下文不足时不要猜测，也不要仅因未提供工具结果就否认原回复。\n"
+    "删除无意义复读、意外泄漏的推理过程和程序包装，保留用户明确要求展示的代码或格式。\n"
+    "尊重本轮提问，不强行凑成三段，不改写成另一个答案。\n"
+    "保留原文中供表情包插件处理的配图标记，不新增、猜测或替换图片编号。"
+)
+DEFAULT_ADDITIONAL_REVIEW_RULES = (
+    "表达自然简洁，避免机械重复称呼和客服式结尾。\n"
+    "遵从用户本轮明确提出的长度、格式和纯文字要求。\n"
+    "尊重现有人格和语气；只有明显问题才修改，不为了润色而重新编写整段回复。"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class TurnSnapshot:
@@ -556,11 +570,13 @@ def master_alert_failure(
 
 
 def master_alert_success(record: MasterAlertRecord) -> MasterAlertRecord:
-    """A normal reply resets the active streak but never drops a pending report."""
+    """A normal reply marks recovery without reopening the duplicate window."""
     if not record.error_type and record.consecutive_count == 0:
         return record
     return MasterAlertRecord(
-        master_umo=record.master_umo, report_id=record.report_id,
+        master_umo=record.master_umo, error_type=record.error_type,
+        consecutive_count=record.consecutive_count, window_started_at=record.window_started_at,
+        report_id=record.report_id,
         report_status=record.report_status, quiet_deadline=record.quiet_deadline,
         recovered=bool(record.report_id),
     )
@@ -570,7 +586,7 @@ def master_alert_counts_failure(
     *, enabled: bool, type_enabled: bool, origin: str, terminal_reason: str
 ) -> bool:
     return (
-        enabled and type_enabled and origin not in {"natural", "pending"}
+        enabled and type_enabled and origin != "pending"
         and terminal_reason not in {"wait", "no_action", "uncertain"}
     )
 
@@ -608,6 +624,31 @@ def master_alert_quiet_deadline(
         end_day += timedelta(days=1)
     end_time = datetime(end_day.year, end_day.month, end_day.day, end_hour, end_minute, tzinfo=zone)
     return end_time.timestamp()
+
+
+def strip_auxiliary_meme_markers(text: str, user_text: str = "") -> str:
+    """Remove model-selected IDs before independent Meme selection.
+
+    Keep the existing canonical-marker boundary. Square-bracket placeholders
+    are not Meme's wire format: preserve literal user examples and Markdown
+    code, but remove invented placeholders, including their marker-only line.
+    """
+    text = re.sub(r"&&meme:[A-Za-z0-9_-]+&&", "", text)
+    square = r"\[meme:[A-Za-z0-9_-]+\]"
+    pattern = re.compile(
+        r"(?P<code>(?P<ticks>`+)[\s\S]*?(?P=ticks)|~~~[\s\S]*?~~~"
+        r"|^(?: {4}|\t)[^\r\n]*)"
+        + rf"|(?P<line>^[ \t]*{square}[ \t]*(?:\r?\n|$))|(?P<marker>{square})",
+        re.MULTILINE,
+    )
+
+    def replace_marker(match: re.Match[str]) -> str:
+        if match.group("code") is not None:
+            return match.group(0)
+        token = match.group(0).strip()
+        return match.group(0) if token in user_text else ""
+
+    return pattern.sub(replace_marker, text).strip()
 
 
 def parse_final_review_decision(value: Any, original_text: str) -> FinalReviewDecision | None:
@@ -1079,6 +1120,31 @@ _NEWLINE_BOUNDARY_CODEPOINTS = frozenset("\r\n")
 _TRAILING_WHITESPACE_CODEPOINTS = frozenset(" \t\r\n")
 
 
+def _fenced_code_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Keep Markdown fence lines and their code in one indivisible component."""
+    spans: list[tuple[int, int]] = []
+    opener: str | None = None
+    start = offset = 0
+    for line in text.splitlines(keepends=True):
+        match = re.match(r" {0,3}(`{3,}|~{3,})([^\r\n]*)(?:\r?\n|\r)?$", line)
+        if match:
+            fence, suffix = match.groups()
+            if opener is None:
+                if fence[0] != "`" or "`" not in suffix:
+                    opener, start = fence, offset
+            elif (
+                fence[0] == opener[0]
+                and len(fence) >= len(opener)
+                and not suffix.strip(" \t")
+            ):
+                spans.append((start, offset + len(line)))
+                opener = None
+        offset += len(line)
+    if opener is not None:
+        spans.append((start, len(text)))
+    return tuple(spans)
+
+
 def _iter_component_segments(text: str) -> list[str]:
     """Split on sentence-ending or newline boundaries without losing bytes.
 
@@ -1091,6 +1157,7 @@ def _iter_component_segments(text: str) -> list[str]:
     as an empty component.
     """
     segments: list[str] = []
+    protected = _fenced_code_spans(text)
     length = len(text)
     start = 0
     index = 0
@@ -1111,7 +1178,7 @@ def _iter_component_segments(text: str) -> list[str]:
             cursor += 1
         if cursor >= length:
             break
-        if _safe_plain_boundary(text, cursor):
+        if _safe_plain_boundary(text, cursor, protected):
             segments.append(text[start:cursor])
             start = cursor
         index = cursor
@@ -1119,9 +1186,13 @@ def _iter_component_segments(text: str) -> list[str]:
     return [seg for seg in segments if seg != ""]
 
 
-def _safe_plain_boundary(text: str, index: int) -> bool:
+def _safe_plain_boundary(
+    text: str, index: int, protected: tuple[tuple[int, int], ...] = (),
+) -> bool:
     """Return whether a conservative cut survives downstream ``strip``."""
     if not 0 < index < len(text):
+        return False
+    if any(start < index < end for start, end in protected):
         return False
     left = text[index - 1]
     right = text[index]
@@ -1160,17 +1231,20 @@ def text_component_boundaries_are_safe(text: str, pieces: Iterable[str]) -> bool
         return False
     if len(values) == 1:
         return True
+    protected = _fenced_code_spans(text)
     offset = 0
     for piece in values[:-1]:
         offset += len(piece)
-        if not _safe_plain_boundary(text, offset):
+        if not _safe_plain_boundary(text, offset, protected):
             return False
     return True
 
 
 def _split_one_safe_plain(piece: str) -> tuple[str, str] | None:
+    protected = _fenced_code_spans(piece)
     boundaries = [
-        index for index in range(1, len(piece)) if _safe_plain_boundary(piece, index)
+        index for index in range(1, len(piece))
+        if _safe_plain_boundary(piece, index, protected)
     ]
     if not boundaries:
         return None

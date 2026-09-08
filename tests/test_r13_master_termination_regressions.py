@@ -38,8 +38,8 @@ class MasterKVSpy:
         self.delete_calls.append(str(key))
 
     def assert_unused(self, testcase: unittest.TestCase) -> None:
-        testcase.assertEqual([], self.get_calls)
-        testcase.assertEqual([], self.put_calls)
+        testcase.assertEqual([], [key for key in self.get_calls if key != "master_alert_destination_v1"])
+        testcase.assertEqual([], [entry for entry in self.put_calls if entry[0] != "master_alert_destination_v1"])
         testcase.assertEqual([], self.delete_calls)
 
 
@@ -82,6 +82,9 @@ class TraceContext:
     async def send_message(self, *args):
         self.send_trace.append(args)
         return await self._send(*args)
+
+    def get_config(self, **kwargs):
+        return {"admins_id": ["202"]}
 
     async def get_curr_conversation_id(self, _umo):
         return "official-conversation"
@@ -161,6 +164,7 @@ class R13MasterTerminationTests(unittest.IsolatedAsyncioTestCase):
             },
         }}
         value._master_alert_record = SYS001.MasterAlertRecord(master_umo="qq:person:old")
+        value._master_alert_binding = {"umo":"qq:person:old", "sender_id":"202", "platform_id":"qq", "account_id":"999"}
         value._master_alert_ready = True
         value._master_alert_revision = 0
         value._master_alert_lock = asyncio.Lock()

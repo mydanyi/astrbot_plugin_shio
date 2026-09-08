@@ -1,109 +1,120 @@
 {
   "sys001": {
     "description": "Shio 自然聊天",
-    "hint": "所有旧版 Shio 设置均不会读取、迁移或改写。",
+    "hint": "设置聊天范围、自然参与、发送前审核和文字气泡。主聊天模型、人格、管理员和工具权限在 AstrBot 中设置。",
     "type": "object",
     "items": {
       "ingress": {
         "description": "聊天范围",
-        "hint": "Master 可绕过普通名单；普通群友仍受全局禁用名单限制。",
+        "hint": "控制普通用户能否进入 Shio 聊天。主人身份由 AstrBot 判断，可绕过本组名单；这些名单不代替 AstrBot 的权限设置。",
         "type": "object",
         "items": {
-          "private_allowed_sender_ids": {"description": "允许私聊的 QQ 号", "hint": "每项填写一个 QQ 号；留空时不接收普通私聊。", "type": "list", "default": []},
-          "blocked_sender_ids": {"description": "全局禁用的 QQ 号", "hint": "每项填写一个 QQ 号；对非 Master 优先于所有允许名单。", "type": "list", "default": []},
-          "group_allowed_scopes": {"description": "允许聊天的群号", "hint": "每项填写一个群号；留空时不接收普通群聊。已保存的旧会话值仍可使用。", "type": "list", "default": []},
-          "group_blocked_scopes": {"description": "禁用聊天的群号", "hint": "每项填写一个群号；对非 Master 优先于允许群号。已保存的旧会话值仍可使用。", "type": "list", "default": []}
+          "private_allowed_sender_ids": {"description": "允许私聊的 QQ 号", "hint": "每项一个 QQ 号；留空时普通用户私聊不进入 Shio，主人不受限制。", "type": "list", "default": []},
+          "blocked_sender_ids": {"description": "禁止聊天的 QQ 号", "hint": "每项一个 QQ 号；禁止该普通用户进入 Shio，优先于私聊和群聊允许名单，不影响主人。", "type": "list", "default": []},
+          "group_allowed_scopes": {"description": "允许聊天的群号", "hint": "每项一个群号；留空时普通群友不能进入 Shio 群聊。主人可绕过，群内自然参与还需单独开启。", "type": "list", "default": []},
+          "group_blocked_scopes": {"description": "禁止聊天的群号", "hint": "每项一个群号；对普通群友优先于允许群号，主人不受此项限制。", "type": "list", "default": []}
         }
       },
       "identity": {
-        "description": "Master 对话风格",
-        "hint": "只影响回复措辞，不改变 AstrBot 的 Master 权限。",
+        "description": "主人对话风格",
+        "hint": "在 AstrBot 现有人格上补充对主人的称呼或语气，不重新定义人格或授予权限。",
         "type": "object",
         "items": {
-          "master_relationship_enabled": {"description": "启用 Master 风格", "hint": "只对 AstrBot 已确认的 Master 生效。", "type": "bool", "default": false},
-          "master_relationship_prompt": {"description": "Master 风格说明", "hint": "留空时不追加；不能用作身份或权限依据。", "type": "text", "default": "", "condition": {"master_relationship_enabled": true}}
+          "master_relationship_enabled": {"description": "主人专属语气", "hint": "开启后，对 AstrBot 确认的主人追加下面的要求。关闭只是不追加，不会取消人格中已有的主人关系。", "type": "bool", "default": false},
+          "master_relationship_prompt": {"description": "主人语气补充", "hint": "例如：和主人说话更亲近，但不用每句话都叫主人。留空不追加；这里不是主人名单或完整人格。", "type": "text", "default": "", "condition": {"master_relationship_enabled": true}}
         }
       },
       "group": {
-        "description": "群聊回复",
-        "hint": "群号只用于是否允许进入；各群会话和回复节奏继续分别保存。",
+        "description": "群聊与连续消息",
+        "hint": "名称唤醒和自然参与用于群聊；连续消息等待同时适用于群聊和私聊。各会话分别等待和统计。",
         "type": "object",
         "items": {
-          "name_wake_mode": {"description": "名称唤醒方式", "hint": "选择识别机器人名称的方式。", "type": "string", "options": ["direct", "semantic"], "labels": ["直接识别", "智能判断"], "default": "direct"},
-          "name_semantic_prompt": {"description": "名称判断说明", "hint": "填写智能判断名称提及时使用的规则。", "type": "text", "default": "判断当前消息是直接对机器人说话还是仅提及。只输出 JSON。", "condition": {"name_wake_mode": "semantic"}},
-          "name_semantic_provider_id": {"description": "名称判断模型", "hint": "从 AstrBot 已有模型中选择，留空使用当前模型。", "type": "string", "default": "", "_special": "select_provider", "condition": {"name_wake_mode": "semantic"}},
-          "name_semantic_fallback_provider_ids": {"description": "名称判断备用模型", "hint": "按所选顺序尝试备用模型。", "type": "list", "default": [], "items": {"type": "string"}, "_special": "select_providers", "condition": {"name_wake_mode": "semantic"}},
-          "name_semantic_timeout_seconds": {"description": "名称判断等待秒数", "hint": "一次名称判断从当前模型到备用模型共用总等待时间；真正耗尽后不再尝试备用模型，异常、空结果或格式错误只会在剩余时间内继续。", "type": "int", "default": 8, "condition": {"name_wake_mode": "semantic"}},
-          "natural_participation_enabled": {"description": "允许自然参与", "hint": "开启后，未直接唤醒时也会先判断是否适合回复。", "type": "bool", "default": false},
-          "natural_group_scopes": {"description": "允许自然参与的群号", "hint": "每项填写一个群号；留空时不在普通群聊主动参与。已保存的旧会话值仍可使用。", "type": "list", "default": [], "condition": {"natural_participation_enabled": true}},
-          "natural_participation_prompt": {"description": "自然参与说明", "hint": "填写自然参与前的判断规则；输出协议固定为 JSON，不能在此改写。", "type": "text", "default": "这是群内一批没有直接叫你的真实消息。仅在确实自然、有帮助且不打断对话时回复；只输出严格 JSON：{\"decision\":\"REPLY\"}、{\"decision\":\"WAIT\"} 或 {\"decision\":\"NO_ACTION\"}。", "condition": {"natural_participation_enabled": true}},
-          "natural_decision_provider_id": {"description": "自然参与判断模型", "hint": "从 AstrBot 已有模型中选择，留空使用当前模型。", "type": "string", "default": "", "_special": "select_provider", "condition": {"natural_participation_enabled": true}},
-          "natural_decision_fallback_provider_ids": {"description": "自然参与备用模型", "hint": "按所选顺序尝试备用模型。", "type": "list", "default": [], "items": {"type": "string"}, "_special": "select_providers", "condition": {"natural_participation_enabled": true}},
-          "natural_decision_timeout_seconds": {"description": "自然参与等待秒数", "hint": "一次自然参与判断从当前模型到备用模型共用总等待时间；真正耗尽后不再尝试备用模型，异常、空结果或格式错误只会在剩余时间内继续并保持安静。", "type": "int", "default": 8, "condition": {"natural_participation_enabled": true}},
-          "natural_reply_cooldown_seconds": {"description": "回复冷却秒数", "hint": "同一群完成回复后的最短等待时间，范围 1-3600。", "type": "int", "default": 45, "condition": {"natural_participation_enabled": true}},
-          "natural_frequency_window_minutes": {"description": "回复统计分钟数", "hint": "同一群统计回复次数的时间范围，范围 1-1440。", "type": "int", "default": 5, "condition": {"natural_participation_enabled": true}},
-            "natural_max_replies_per_window": {"description": "统计期最大回复数", "hint": "同一群在统计期内最多完成的回复数，范围 1-20。", "type": "int", "default": 2, "condition": {"natural_participation_enabled": true}},
-            "natural_no_action_backoff_base_seconds": {"description": "不参与起始退避秒数", "hint": "判定为 NO_ACTION 后，同一会话再次自然判定前的起始等待时间，范围 1-300。不会计入回复次数或回复冷却。", "type": "int", "default": 2, "condition": {"natural_participation_enabled": true}},
-            "natural_no_action_backoff_max_seconds": {"description": "不参与最长退避秒数", "hint": "连续 NO_ACTION 的等待上限，范围 1-3600；小于起始退避时按起始退避生效。不会计入回复次数或回复冷却。", "type": "int", "default": 30, "condition": {"natural_participation_enabled": true}},
-            "continuous_window_enabled": {"description": "连续消息等待", "hint": "开启后同一会话的第一条也等待安静窗口；批次保留每条真实消息的来源。", "type": "bool", "default": true},
-          "continuous_window_seconds": {"description": "连续消息等待秒数", "hint": "每条新消息重置同一会话的安静窗口，范围 1-60；窗口结束后仅最后真实事件发起一次官方请求。", "type": "int", "default": 3, "condition": {"continuous_window_enabled": true}},
-          "continuous_window_max_scopes": {"description": "同时等待的群数", "hint": "同时等待后续消息的群数量上限，范围 1-256。", "type": "int", "default": 128, "condition": {"continuous_window_enabled": true}}
+          "name_wake_mode": {"description": "名称唤醒方式", "hint": "识别 AstrBot 已配置的唤醒词，不自动读取人格名称。直接匹配更快；模型判断会区分叫机器人和只提到同名的人。", "type": "string", "options": ["direct", "semantic"], "labels": ["直接匹配", "模型判断"], "default": "direct"},
+          "name_semantic_prompt": {"description": "名称判断规则", "hint": "只编辑判断标准，返回格式由插件固定。仅匹配到唤醒词后才调用，不影响 @ 或引用机器人的直接触发。", "type": "text", "default": "判断这条消息是在直接叫机器人，还是仅提到同名的人、角色或作品。对机器人提问、请求或打招呼时视为直接呼叫；讨论别人的名字不算。证据不足时不要推测有人在叫你。", "condition": {"name_wake_mode": "semantic"}},
+          "name_semantic_provider_id": {"description": "名称判断模型", "hint": "从 AstrBot 已有模型中选择；留空使用当前聊天模型。只判断是否在叫机器人，不生成正式回复。", "type": "string", "default": "", "_special": "select_provider", "condition": {"name_wake_mode": "semantic"}},
+          "name_semantic_fallback_provider_ids": {"description": "名称判断备用模型", "hint": "主选模型异常或结果无效时按所选顺序尝试，共用名称判断总时限。", "type": "list", "default": [], "items": {"type": "string"}, "_special": "select_providers", "condition": {"name_wake_mode": "semantic"}},
+          "name_semantic_timeout_seconds": {"description": "名称判断时限（秒）", "hint": "大于 0，默认 8 秒；主选和备用模型共用总时间。超时不按名称唤醒，不会在群里发送判断错误。", "type": "int", "default": 8, "condition": {"name_wake_mode": "semantic"}},
+          "natural_participation_enabled": {"description": "允许自然参与", "hint": "未被点名时判断是否适合加入，包括主人未点名的普通发言。@、引用机器人、官方唤醒等直接触发不受此开关控制。", "type": "bool", "default": false},
+          "natural_group_scopes": {"description": "自然参与的群号", "hint": "每项一个群号；留空不自然参与。普通群友还须通过聊天范围名单，主人也须在本项指定的群才能自然参与。", "type": "list", "default": [], "condition": {"natural_participation_enabled": true}},
+          "natural_participation_prompt": {"description": "自然参与规则", "hint": "只编辑什么时候加入或保持安静，返回格式由插件固定。愿意聊不等于每句话都回复；等待不会自动定时发起新话题。", "type": "text", "default": "这是一批没有直接叫你的群消息。仅在确实自然、有帮助且不打断他人时加入；不要因为发送者是主人就每句都接。消息尚未说完或需看后续时等待；别人在互相聊天、无需你补充或你刚表达过相同意思时不参与。", "condition": {"natural_participation_enabled": true}},
+          "natural_decision_provider_id": {"description": "自然参与判断模型", "hint": "从 AstrBot 已有模型中选择；留空使用当前聊天模型。仅判断是否参与，正式回复仍用 AstrBot 当前聊天模型。", "type": "string", "default": "", "_special": "select_provider", "condition": {"natural_participation_enabled": true}},
+          "natural_decision_fallback_provider_ids": {"description": "自然参与备用模型", "hint": "主选模型异常或结果无效时按所选顺序尝试，仅使用判断总时限的剩余时间。", "type": "list", "default": [], "items": {"type": "string"}, "_special": "select_providers", "condition": {"natural_participation_enabled": true}},
+          "natural_decision_timeout_seconds": {"description": "参与判断时限（秒）", "hint": "大于 0，默认 8 秒；主选和备用共用。超时或没有有效判断就保持安静，不向群里发送超时报错。", "type": "int", "default": 8, "condition": {"natural_participation_enabled": true}},
+          "natural_reply_cooldown_seconds": {"description": "自然回复冷却（秒）", "hint": "范围 1–3600，默认 45 秒；完成一轮自然回复后开始计时。只限制自然参与，不限制 @、引用或直接唤醒。", "type": "int", "default": 45, "condition": {"natural_participation_enabled": true}},
+          "natural_frequency_window_minutes": {"description": "自然回复统计（分钟）", "hint": "范围 1–1440，默认 5 分钟；统计同一群在最近这段时间内完成的自然回复轮数。", "type": "int", "default": 5, "condition": {"natural_participation_enabled": true}},
+          "natural_max_replies_per_window": {"description": "统计期最多自然回复", "hint": "范围 1–20，默认 2 轮；与上面的统计时间配合。一轮发多个文字气泡仍只计一次。", "type": "int", "default": 2, "condition": {"natural_participation_enabled": true}},
+          "natural_no_action_backoff_base_seconds": {"description": "不参与后等待（秒）", "hint": "范围 1–300，默认 2 秒；决定不参与后，至少等多久再判断新消息。不同于回复冷却，不计回复次数。", "type": "int", "default": 2, "condition": {"natural_participation_enabled": true}},
+          "natural_no_action_backoff_max_seconds": {"description": "不参与最长等待（秒）", "hint": "范围 1–3600，默认 30 秒；连续不参与时逐渐延长至此上限。小于起始等待时按起始值生效。", "type": "int", "default": 30, "condition": {"natural_participation_enabled": true}},
+          "continuous_window_enabled": {"description": "合并连续消息", "hint": "第一条也等待。同人的直接提问和补充可合并；不同人直接 @ 则分别排队回复。群聊自然交流可多人合并，私聊合并当前对方的连续文本。", "type": "bool", "default": true},
+          "continuous_window_seconds": {"description": "连续消息等待（秒）", "hint": "范围 1–60，默认 3 秒；自然交流每来一条文本重新等待。直接提问只由该提问者的补充延长，他人闲聊不延长。数值越大，首条回复等待越久。", "type": "int", "default": 3, "condition": {"continuous_window_enabled": true}},
+          "continuous_window_max_scopes": {"description": "同时等待的会话数", "hint": "范围 1–256，默认 128；包括等待连续消息的群聊和私聊，不是群人数或单轮消息数。", "type": "int", "default": 128, "condition": {"continuous_window_enabled": true}}
+        }
+      },
+      "character_dialogue": {
+        "description": "角色化自然表达",
+        "hint": "独立的拟人聊天模块：保留 AstrBot 现有人格，结合本轮语境组织回应，不学习群友话术。关闭后不添加这些指导；不改自然参与、主人语气、工具权限、分段或配图设置。",
+        "type": "object",
+        "items": {
+          "enabled": {"description": "启用角色化自然表达", "hint": "默认关闭。开启后在现有正式回复请求中添加指导，群聊和私聊均适用，不额外调用一次模型。表达效果仍取决于当前人格、上下文和聊天模型。", "type": "bool", "default": false},
+          "situation_prompt": {"description": "情境理解指导", "hint": "帮助模型理解这次是在提问、接梗还是倾诉。默认规则可直接查看和编辑；留空不添加本项，可用恢复默认按钮找回。不会改变参与判断或消息合并。", "type": "text", "default": "先根据当前真实消息和已有上下文，理解对方这一刻是在认真提问、开玩笑、倾诉、分享、接话还是补充信息；这些只是理解角度，不是固定分类模板，不要把判断过程写出来。\n分清这句话在对谁说、接的是哪一句；不把其他人的经历当成当前发送者的，也不把自己发的文字或表情当成群友的。\n先回应这次发言真正需要的内容：求助时解决问题，倾诉时回应具体感受，玩笑时在角色允许的范围内接梗。不确定时可以简短确认，不编造对方情绪、动机或亲密关系。", "condition": {"enabled": true}},
+          "expression_prompt": {"description": "角色表达指导", "hint": "指导怎样按既有人格自然回应，不是新的人格设定。默认规则可直接查看和编辑；留空不添加本项，可用恢复默认按钮找回。长短随内容，不在这里指定气泡数量。", "type": "text", "default": "以 AstrBot 当前人格为准决定态度、措辞和亲疏距离；保持角色自己的性格，不学习或模仿群友口癖，不因为群里流行某种说法就改写人格。\n让性格体现在具体回应里，不只靠称呼、口头禅、波浪号或固定动作描写。人格允许时可以调侃、嘴硬、关心或简短回应，但不强制每句话都这样，也不把这些示例当作新的人设。\n只说本轮值得说的内容，简单互动可以很短，需要解释时讲清楚；不逐条总结所有聊天、不复述上一轮同样的意思，不固定以追问、邀功或客服式客套收尾。\n保持话题连续，但不用已经表达过的内容凑字数。遵守用户本轮明确的格式要求；不为了拟人故意写错、降低事实准确性或假装执行过工具。只输出正式回复，不输出情境分析、角色决策或内部标签。", "condition": {"enabled": true}},
+          "preserve_character_in_review": {"description": "审核时参考角色表达", "hint": "仅在本模块和“发送前审核”都开启时生效。向审核提供当前人格和表达指导，避免无理由抹平角色语气；不会放宽审核规则或自动开启审核。可能增加审核输入长度，但不增加调用次数。", "type": "bool", "default": true, "condition": {"enabled": true}}
         }
       },
       "capability_visibility": {
-        "description": "普通群友可用工具",
-        "hint": "只影响模型在当前群聊可见的工具，不改变 AstrBot 执行权限。",
+        "description": "普通群友工具范围",
+        "hint": "仅收窄普通群友聊天时模型可见的工具。主人和私聊不受这层过滤影响；实际执行权限继续由 AstrBot 和工具插件决定。",
         "type": "object",
         "items": {
-          "friendly_sender_ids": {"description": "友好群友 QQ 号", "hint": "每项填写一个 QQ 号；这些用户仍不是 Master。", "type": "list", "default": []},
-          "ordinary_capability_names": {"description": "普通成员可用工具", "hint": "填写当前 AstrBot 公开工具名称；知识库搜索始终保留。", "type": "list", "default": []}
+          "friendly_sender_ids": {"description": "工具过滤豁免 QQ", "hint": "每项一个 QQ 号；跳过 Shio 的群聊工具过滤，但不会因此变成主人，也不能绕过 AstrBot 权限。", "type": "list", "default": []},
+          "ordinary_capability_names": {"description": "普通群友可见工具名", "hint": "每项填一个已加载工具的精确名称，不是插件名。例如 recall_long_term_memory、memorize_long_term_memory、search_memes；联网搜索请从 AstrBot 工具列表复制实际名称。留空只保留知识库搜索 astr_kb_search；其它插件已提供的工具才可能保留。", "type": "list", "default": []}
         }
       },
       "final_review": {
-        "description": "发送前检查",
-        "hint": "只审核同一条 AstrBot 最终回复，不会另发消息。",
+        "description": "发送前审核",
+        "hint": "检查正式回复后再交给分段和表情包处理，会增加等待时间。规则可在下面查看、编辑或恢复默认；审核不另发一份聊天回复。",
         "type": "object",
         "items": {
-          "mode": {"description": "审核方式", "hint": "选择是否启用基础规则、附加规则或两者。", "type": "string", "options": ["off", "core", "additional", "combined"], "labels": ["关闭", "基础规则", "附加规则", "基础加附加"], "default": "off"},
-          "additional_prompt": {"description": "附加审核说明", "hint": "填写附加审核规则；不用于身份、权限或工具执行。", "type": "text", "default": ""},
-          "provider_id": {"description": "审核模型", "hint": "从 AstrBot 已有模型中选择，留空使用当前模型。", "type": "string", "default": "", "_special": "select_provider"},
-          "fallback_provider_ids": {"description": "审核备用模型", "hint": "按所选顺序尝试备用模型。", "type": "list", "default": [], "items": {"type": "string"}, "_special": "select_providers"},
-          "timeout_seconds": {"description": "审核等待秒数", "hint": "一次审核和修改从当前模型到备用模型共用总等待时间；真正耗尽后不再尝试备用模型，异常、空结果或格式错误只会在剩余时间内继续。", "type": "int", "default": 8},
-          "repair_enabled": {"description": "允许修改回复", "hint": "开启后，审核模型可以修改同一条最终回复。", "type": "bool", "default": false},
-          "max_repair_attempts": {"description": "最多修改次数", "hint": "每条最终回复最多修改次数，范围 0-3；每次修改后都会再次审核。", "type": "int", "default": 1, "condition": {"repair_enabled": true}},
-          "use_repaired_text": {"description": "采用修改后的回复", "hint": "关闭时只观察修改建议；开启时才采用审核通过的版本。", "type": "bool", "default": false, "condition": {"repair_enabled": true}},
-          "send_last_reply_on_review_exhausted": {"description": "审核未通过时仍回复", "hint": "默认关闭；开启后最后一次未通过的回复仍交给 AstrBot 发送。", "type": "bool", "default": false, "condition": {"repair_enabled": true}}
+          "mode": {"description": "审核方式", "hint": "关闭：不调用审核模型。基础/附加：只读对应规则；基础加附加：两组一起使用。下面未选中的规则不生效。", "type": "string", "options": ["off", "core", "additional", "combined"], "labels": ["关闭", "仅基础规则", "仅附加规则", "基础加附加"], "default": "off"},
+          "core_prompt": {"description": "基础审核规则", "hint": "选择基础规则或基础加附加时生效。可直接编辑；留空使用默认基础规则，可用字段的恢复默认按钮查看全文。", "type": "text", "default": "只检查这条待发送回复，有明确问题才修改，保留原意和已有事实。\n区分当前发送者、其他群友和机器人，不把机器人的话或表情当成群友说的。\n不凭空增加事实、身份关系或工具执行成功的结论；上下文不足时不要猜测，也不要仅因未提供工具结果就否认原回复。\n删除无意义复读、意外泄漏的推理过程和程序包装，保留用户明确要求展示的代码或格式。\n尊重本轮提问，不强行凑成三段，不改写成另一个答案。\n保留原文中供表情包插件处理的配图标记，不新增、猜测或替换图片编号。"},
+          "additional_prompt": {"description": "附加审核规则", "hint": "选择附加规则或基础加附加时生效。留空表示不加要求；已有自定义内容保留，可用恢复默认按钮载入建议模板。", "type": "text", "default": "表达自然简洁，避免机械重复称呼和客服式结尾。\n遵从用户本轮明确提出的长度、格式和纯文字要求。\n尊重现有人格和语气；只有明显问题才修改，不为了润色而重新编写整段回复。"},
+          "provider_id": {"description": "审核模型", "hint": "从 AstrBot 已有模型中选择；留空使用当前聊天模型。每轮多一次检查，允许改写后还需复审，会增加回复等待。", "type": "string", "default": "", "_special": "select_provider"},
+          "fallback_provider_ids": {"description": "审核备用模型", "hint": "主选模型异常或结果无效时按所选顺序尝试，共用审核总时限，不会各自重新计时。", "type": "list", "default": [], "items": {"type": "string"}, "_special": "select_providers"},
+          "timeout_seconds": {"description": "审核总时限（秒）", "hint": "大于 0，默认 20 秒；审核、改写、复审及备用模型共用。完成就立即继续，不会固定等满；超时按下面的审核失败开关处理。已有自定义值不会自动覆盖。", "type": "int", "default": 20},
+          "repair_enabled": {"description": "允许审核后改写", "hint": "和“采用改写后的回复”同时开启才允许替换文本。关闭时若审核要求修改，会走审核失败处理，并非只看建议。", "type": "bool", "default": false},
+          "max_repair_attempts": {"description": "最多改写次数", "hint": "范围 0–3，默认 1；0 表示不允许改写。每次改写后还需复审；次数或总时限耗尽则走审核失败处理。", "type": "int", "default": 1, "condition": {"repair_enabled": true}},
+          "use_repaired_text": {"description": "采用改写后的回复", "hint": "开启后采用审核通过的改写。关闭后若原文需要修改，也会走审核失败处理，不是旁观模式。", "type": "bool", "default": false, "condition": {"repair_enabled": true}},
+          "send_last_reply_on_review_exhausted": {"description": "审核失败仍发送", "hint": "关闭：拦住这条回复；开启：发送最后保留的版本，可能未经审核通过。超时、结果无效、不允许改写或改写次数耗尽都适用；审核关闭时不生效。", "type": "bool", "default": false}
         }
       },
       "master_alert": {
         "description": "故障通知",
-        "hint": "默认关闭；只向已由 AstrBot 确认的 Master 私聊发送摘要。",
+        "hint": "正式回复或审核首次失败时私聊通知主人，同类故障在去重期内不重复通知。自然参与决定不说话不算故障；已开始回复却失败也会通知。不保存历史告警档案。",
         "type": "object",
         "items": {
-          "master_alert_enabled": {"description": "启用 Master 通知", "hint": "默认关闭。", "type": "bool", "default": false},
-          "main_reply_exhausted_enabled": {"description": "回复失败时计入提醒", "hint": "普通聊天回复最终失败时计入。", "type": "bool", "default": false, "condition": {"master_alert_enabled": true}},
-          "review_repair_exhausted_enabled": {"description": "审核失败时计入提醒", "hint": "审核或修改耗尽时计入。", "type": "bool", "default": false, "condition": {"master_alert_enabled": true}},
-          "consecutive_threshold": {"description": "连续失败次数", "hint": "达到此次数时提醒，最小 1。", "type": "int", "default": 3, "condition": {"master_alert_enabled": true}},
-          "window_minutes": {"description": "连续失败统计分钟数", "hint": "统计连续失败的时间范围，最小 1。", "type": "int", "default": 10, "condition": {"master_alert_enabled": true}},
-          "master_alert_quiet_enabled": {"description": "启用勿扰时段", "hint": "勿扰期间保存待提交摘要。", "type": "bool", "default": false, "condition": {"master_alert_enabled": true}},
-          "quiet_start": {"description": "勿扰开始时间", "hint": "按 HH:MM 填写。", "type": "string", "default": "23:00", "condition": {"master_alert_enabled": true}},
-          "quiet_end": {"description": "勿扰结束时间", "hint": "按 HH:MM 填写，可跨午夜。", "type": "string", "default": "08:00", "condition": {"master_alert_enabled": true}},
-          "display_timezone": {"description": "显示时区", "hint": "固定 UTC 偏移，仅用于提醒时间，默认 UTC+8。", "type": "string", "default": "+08:00", "condition": {"master_alert_enabled": true}}
+          "master_alert_enabled": {"description": "私聊通知主人", "hint": "首次开启后，主人给机器人发一条私聊来建立通知地址。地址会保留到重载之后；发送前仍检查 AstrBot 管理员名单。还需选择下面至少一种故障。", "type": "bool", "default": false},
+          "main_reply_exhausted_enabled": {"description": "通知正式回复失败", "hint": "正式回复最终失败时首次即通知，包括已开始生成的自然回复；主模型由备用模型成功接续的不算失败。", "type": "bool", "default": false, "condition": {"master_alert_enabled": true}},
+          "review_repair_exhausted_enabled": {"description": "通知审核拦截回复", "hint": "审核超时、返回格式错误、模型不可用或修改后仍未通过，并拦住回复时通知。若开启审核失败仍发送且继续回复，则不按审核拦截通知。", "type": "bool", "default": false, "condition": {"master_alert_enabled": true}},
+          "window_minutes": {"description": "同类故障去重（分钟）", "hint": "最小 1，默认 10 分钟；首次通知后，这段时间内同类故障不重复通知。中间正常回复不会清空去重；不同类型故障可分别通知。", "type": "int", "default": 10, "condition": {"master_alert_enabled": true}},
+          "master_alert_quiet_enabled": {"description": "启用通知勿扰", "hint": "勿扰期间暂存待通知摘要，到结束时间后再尝试提交；不是将聊天回复推迟到勿扰结束。", "type": "bool", "default": false, "condition": {"master_alert_enabled": true}},
+          "quiet_start": {"description": "勿扰开始时间", "hint": "使用下面的勿扰时区，按 HH:MM 填写，例如 23:00。", "type": "string", "default": "23:00", "condition": {"master_alert_enabled": true, "master_alert_quiet_enabled": true}},
+          "quiet_end": {"description": "勿扰结束时间", "hint": "按 HH:MM 填写，例如 08:00；23:00 到 08:00 表示跨午夜。", "type": "string", "default": "08:00", "condition": {"master_alert_enabled": true, "master_alert_quiet_enabled": true}},
+          "display_timezone": {"description": "勿扰时区", "hint": "固定 UTC 偏移，例如中国时间 +08:00；实际决定勿扰的起止时间，不只是显示时区。", "type": "string", "default": "+08:00", "condition": {"master_alert_enabled": true, "master_alert_quiet_enabled": true}}
         }
       },
       "presentation": {
-        "description": "消息气泡",
-        "hint": "使用多气泡时请关闭 AstrBot 内置分段；单气泡不受影响，Meme 图片另发且不计数。",
+        "description": "文字气泡",
+        "hint": "需要 Shio 控制气泡数量时，关闭 AstrBot 内置分段，避免再次拆分。表情包由 Meme 选择并单独发送，不计入文字气泡数。",
         "type": "object",
         "items": {
-          "text_component_mode": {"description": "文本布局方式", "hint": "选择文本组件的布局方式。", "type": "string", "options": ["model", "plugin", "single"], "labels": ["模型分段", "按句分段", "合并为一段"], "default": "single"},
-          "text_component_max_segments": {"description": "最多文本段数", "hint": "超过时会合并且不丢失内容。", "type": "int", "default": 3},
-          "text_component_min_segments": {"description": "最少文本段数", "hint": "无法安全分段时保留完整的一段文本。", "type": "int", "default": 1},
-          "bubble_send_min_wait_seconds": {"description": "气泡间最短等待秒数", "hint": "每个后续文字气泡发送前等待一次；可填 0。", "type": "float", "default": 0},
-          "bubble_send_max_wait_seconds": {"description": "气泡间最长等待秒数", "hint": "不得小于最短等待秒数；可填 0。", "type": "float", "default": 0},
-          "model_segment_provider_id": {"description": "模型分段模型", "hint": "从 AstrBot 已有模型中选择，留空使用当前模型。", "type": "string", "default": "", "_special": "select_provider", "condition": {"text_component_mode": "model"}},
-          "model_segment_fallback_provider_ids": {"description": "模型分段备用模型", "hint": "按所选顺序尝试备用模型。", "type": "list", "default": [], "items": {"type": "string"}, "_special": "select_providers", "condition": {"text_component_mode": "model"}},
-          "model_segment_timeout_seconds": {"description": "模型分段等待秒数", "hint": "失败时保留完整的一段文本。", "type": "int", "default": 8, "condition": {"text_component_mode": "model"}}
+          "text_component_mode": {"description": "文字分段方式", "hint": "模型分段会额外调用辅助模型；按句分段按文字边界拆分，不额外调用模型；单条发送不拆分。", "type": "string", "options": ["model", "plugin", "single"], "labels": ["模型分段", "按句分段", "单条发送"], "default": "single"},
+          "text_component_max_segments": {"description": "最多文字气泡数", "hint": "默认 3；这是上限，不强制每次三段，超出会合并且不丢正文。单条发送时不生效，图片另计。", "type": "int", "default": 3},
+          "text_component_min_segments": {"description": "期望最少文字气泡数", "hint": "默认 1；文字很短或无法合理拆分时仍可只有一段。不要大于最多气泡数，否则上限也会随之升高；单条发送时不生效。", "type": "int", "default": 1},
+          "bubble_send_min_wait_seconds": {"description": "气泡最短间隔（秒）", "hint": "后续文字气泡发送前，在最短和最长间隔之间随机等待。可填 0，不影响第一条的模型生成时间；单条发送时不生效。", "type": "float", "default": 0},
+          "bubble_send_max_wait_seconds": {"description": "气泡最长间隔（秒）", "hint": "不得小于最短间隔；两项都为 0 表示不额外等待。非法区间会保留单条回复，不会采用负数或倒置区间。", "type": "float", "default": 0},
+          "model_segment_provider_id": {"description": "分段辅助模型", "hint": "从 AstrBot 已有模型中选择；留空使用当前聊天模型。只决定文字边界，不能改写正式回复。", "type": "string", "default": "", "_special": "select_provider", "condition": {"text_component_mode": "model"}},
+          "model_segment_fallback_provider_ids": {"description": "分段备用模型", "hint": "主选模型异常或结果无效时按所选顺序尝试，共用分段总时限。", "type": "list", "default": [], "items": {"type": "string"}, "_special": "select_providers", "condition": {"text_component_mode": "model"}},
+          "model_segment_timeout_seconds": {"description": "分段总时限（秒）", "hint": "大于 0，默认 8 秒；主选和备用模型共用。失败、超时、改字或丢字时保留完整单条回复，不让整条消息消失。", "type": "int", "default": 8, "condition": {"text_component_mode": "model"}}
         }
       }
     }

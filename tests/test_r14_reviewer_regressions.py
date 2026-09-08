@@ -355,8 +355,8 @@ class R14LifecycleAndPresentationTests(unittest.IsolatedAsyncioTestCase):
         field = schema["sys001"]["items"]["presentation"]["items"][
             "text_component_min_segments"
         ]
-        self.assertEqual("最少文本段数", field["description"])
-        self.assertIn("完整的一段文本", field["hint"])
+        self.assertEqual("期望最少文字气泡数", field["description"])
+        self.assertIn("仍可只有一段", field["hint"])
 
     async def test_terminated_instance_initialize_cannot_republish_late_ready(self):
         kv = R13.MasterKVSpy()
@@ -487,6 +487,8 @@ class R14LifecycleAndPresentationTests(unittest.IsolatedAsyncioTestCase):
         """A binding queued second updates contact without rolling back failure."""
         kv = R13.MasterKVSpy()
         plugin = R13.R13MasterTerminationTests().plugin(kv)
+        # This test covers an immediate send, not the wall-clock quiet window.
+        plugin.config["sys001"]["master_alert"]["master_alert_quiet_enabled"] = False
         plugin.config["sys001"]["master_alert"]["consecutive_threshold"] = 3
         terminal_event = R13.RequestEvent()
         terminal_snapshot = R13.R13MasterTerminationTests()._private_snapshot(terminal_event)
@@ -512,7 +514,8 @@ class R14LifecycleAndPresentationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("qq:person:new-master", record.master_umo)
         self.assertEqual("final_error", record.error_type)
         self.assertEqual(1, record.consecutive_count)
-        self.assertEqual("none", record.report_status)
+        # The first fault now attempts notification (this fixture rejects it).
+        self.assertEqual("failed", record.report_status)
         kv.assert_unused(self)
         await plugin.terminate()
 

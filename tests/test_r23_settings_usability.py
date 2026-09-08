@@ -78,7 +78,7 @@ class R23GroupNumberContractTests(unittest.TestCase):
 
 
 class R23SettingsSchemaTests(unittest.TestCase):
-    def test_keys_types_defaults_and_option_values_are_unchanged(self):
+    def test_stored_keys_types_numeric_defaults_and_option_values_are_unchanged(self):
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         actual = {}
 
@@ -101,6 +101,31 @@ class R23SettingsSchemaTests(unittest.TestCase):
             "sys001.master_alert.master_alert_enabled": ("bool", False, None), "sys001.master_alert.main_reply_exhausted_enabled": ("bool", False, None), "sys001.master_alert.review_repair_exhausted_enabled": ("bool", False, None), "sys001.master_alert.consecutive_threshold": ("int", 3, None), "sys001.master_alert.window_minutes": ("int", 10, None), "sys001.master_alert.master_alert_quiet_enabled": ("bool", False, None), "sys001.master_alert.quiet_start": ("string", "23:00", None), "sys001.master_alert.quiet_end": ("string", "08:00", None), "sys001.master_alert.display_timezone": ("string", "+08:00", None),
             "sys001.presentation.text_component_mode": ("string", "single", ["model", "plugin", "single"]), "sys001.presentation.text_component_max_segments": ("int", 3, None), "sys001.presentation.text_component_min_segments": ("int", 1, None), "sys001.presentation.bubble_send_min_wait_seconds": ("float", 0, None), "sys001.presentation.bubble_send_max_wait_seconds": ("float", 0, None), "sys001.presentation.model_segment_provider_id": ("string", "", None), "sys001.presentation.model_segment_fallback_provider_ids": ("list", [], None), "sys001.presentation.model_segment_timeout_seconds": ("int", 8, None),
         }
+        # These editable defaults were intentionally rewritten in 0.5.1.1.
+        # Their actual Provider payload is covered by test_settings_review;
+        # prose wording is not a compatibility contract.
+        for path in (
+            "sys001.group.name_semantic_prompt",
+            "sys001.group.natural_participation_prompt",
+            "sys001.final_review.additional_prompt",
+            "sys001.final_review.core_prompt",
+            "sys001.character_dialogue.situation_prompt",
+            "sys001.character_dialogue.expression_prompt",
+        ):
+            field_type, default, options = actual.pop(path)
+            self.assertEqual("text", field_type)
+            self.assertIsInstance(default, str)
+            self.assertTrue(default.strip())
+            self.assertIsNone(options)
+            expected.pop(path, None)
+        # 0.5.1.2 notifies the first terminal failure; the old threshold is no
+        # longer an editable setting. Other stored fields remain unchanged.
+        expected.pop("sys001.master_alert.consecutive_threshold")
+        # 0.5.1.4 explicitly increases the review-wide default; persisted user
+        # values are still preserved by AstrBotConfig (Pipeline regression).
+        expected["sys001.final_review.timeout_seconds"] = ("int", 20, None)
+        expected["sys001.character_dialogue.enabled"] = ("bool", False, None)
+        expected["sys001.character_dialogue.preserve_character_in_review"] = ("bool", True, None)
         self.assertEqual(expected, actual)
 
     def test_titles_are_short_chinese_and_options_keep_plain_labels(self):

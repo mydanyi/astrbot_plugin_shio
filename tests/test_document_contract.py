@@ -31,7 +31,7 @@ class DocumentationContractTests(unittest.TestCase):
     def test_readme_describes_current_product_and_known_limit(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         for phrase in (
-            "修复候选",
+            "开发候选",
             "4.27.4",
             "aiocqhttp",
             "event.request_llm()",
@@ -70,7 +70,7 @@ class DocumentationContractTests(unittest.TestCase):
             return result
 
         descriptions = visible_descriptions(schema["sys001"])
-        self.assertEqual(53, len(descriptions))
+        self.assertEqual(57, len(descriptions))
         for description in descriptions:
             with self.subTest(description=description):
                 self.assertIn(description, guide)
@@ -124,10 +124,8 @@ class DocumentationContractTests(unittest.TestCase):
             groups["final_review"]["items"]["timeout_seconds"]["hint"],
         )
         for hint in hints:
-            self.assertIn("共用总等待时间", hint)
-            self.assertIn("当前模型", hint)
-            self.assertIn("剩余时间", hint)
-            self.assertIn("真正耗尽", hint)
+            self.assertIn("共用", hint)
+            self.assertIn("秒", hint)
 
     def test_documents_keep_astrbot_owner_boundary(self) -> None:
         architecture = (DOCS / "ARCHITECTURE.md").read_text(encoding="utf-8")

@@ -1291,9 +1291,9 @@ class FinalAgentObservationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_review_modes_recheck_repair_limit_and_explicit_last_reply_switch(self) -> None:
         for mode, expected_rule in (
-            ("core", "core safety and consistency rules"),
+            ("core", "custom core rule"),
             ("additional", "extra rule"),
-            ("combined", "core safety and consistency rules; extra rule"),
+            ("combined", "custom core rule\n\nextra rule"),
         ):
             with self.subTest(mode=mode):
                 provider = FakeProvider('{"action":"keep"}')
@@ -1301,7 +1301,7 @@ class FinalAgentObservationTests(unittest.IsolatedAsyncioTestCase):
                 plugin = MAIN.ShioPlugin.__new__(MAIN.ShioPlugin)
                 plugin.context = FakeContext(current=provider)
                 plugin.config = {"sys001": {"final_review": {
-                    "mode": mode, "additional_prompt": "extra rule",
+                    "mode": mode, "core_prompt": "custom core rule", "additional_prompt": "extra rule",
                     "repair_enabled": True, "use_repaired_text": True,
                     "timeout_seconds": 1, "max_repair_attempts": 0,
                 }}}
@@ -1370,6 +1370,8 @@ class FinalAgentObservationTests(unittest.IsolatedAsyncioTestCase):
                 plugin._master_alert_record = SYS001.MasterAlertRecord(
                     master_umo="qq:person:bound"
                 )
+                plugin._master_alert_binding = {"umo":"qq:person:bound", "sender_id":"202", "platform_id":"qq", "account_id":"999"}
+                context.get_config = lambda **kwargs: {"admins_id":["202"]}
                 plugin._master_alert_ready = True
                 plugin._master_alert_terminated = False
                 response = self.response(completion_text="original")
@@ -1394,12 +1396,12 @@ class MasterAlertExternalContractTests(unittest.IsolatedAsyncioTestCase):
             self.fail_put_calls = set()
 
         async def get_kv_data(self, key, default):
-            self.get_calls += 1
+            self.get_calls += int(key != "master_alert_destination_v1")
             return self.kv.get(key, default)
 
         async def put_kv_data(self, key, value):
-            self.put_calls += 1
-            if self.put_calls in self.fail_put_calls:
+            self.put_calls += int(key != "master_alert_destination_v1")
+            if key != "master_alert_destination_v1" and self.put_calls in self.fail_put_calls:
                 raise RuntimeError("KV write unavailable")
             self.kv[key] = value
 
@@ -1410,6 +1412,9 @@ class MasterAlertExternalContractTests(unittest.IsolatedAsyncioTestCase):
         async def send_message(self, session, message_chain):
             self.sent.append((session, message_chain))
             return True
+
+        def get_config(self, **kwargs):
+            return {"admins_id": ["202"]}
 
     async def test_only_a_real_private_official_master_event_binds_its_existing_umo(self):
         plugin = MAIN.ShioPlugin.__new__(MAIN.ShioPlugin)
@@ -1436,6 +1441,7 @@ class MasterAlertExternalContractTests(unittest.IsolatedAsyncioTestCase):
         plugin.put_kv_data = context.put_kv_data
         plugin.delete_kv_data = context.delete_kv_data
         plugin._master_alert_record = SYS001.MasterAlertRecord(master_umo="qq:person:bound")
+        plugin._master_alert_binding = {"umo":"qq:person:bound", "sender_id":"202", "platform_id":"qq", "account_id":"999"}
         plugin._master_alert_ready = True
         plugin._master_alert_terminated = False
         plugin.config = {"sys001": {"master_alert": {
@@ -1458,14 +1464,14 @@ class MasterAlertExternalContractTests(unittest.IsolatedAsyncioTestCase):
         event = ToolObservationTests.Event()
 
         await plugin._record_master_alert_terminal(event, snapshot, success=False, terminal_reason="final_error")
-        self.assertEqual([], context.sent)
+        self.assertEqual(1, len(context.sent))
         await plugin._record_master_alert_terminal(event, snapshot, success=False, terminal_reason="final_error")
         await plugin._record_master_alert_terminal(event, snapshot, success=False, terminal_reason="final_error")
 
         self.assertEqual(1, len(context.sent))
         session, chain = context.sent[0]
         self.assertEqual("qq:person:bound", session)
-        self.assertEqual("Shio 系统告警：连续回复失败，请检查 AstrBot 配置。", chain.chain[0].text)
+        self.assertIn("主回复模型调用失败", chain.chain[0].text)
         self.assertEqual("submitted", plugin._master_alert_record.report_status)
 
     async def test_missing_binding_stays_pending_and_send_exception_marks_failed_once(self):
@@ -1647,10 +1653,11 @@ class MasterAlertStateTests(unittest.TestCase):
     def test_success_keeps_pending_summary_and_exclusions_do_not_count(self):
         pending = SYS001.MasterAlertRecord(master_umo="qq:person:bound", error_type="final_error", consecutive_count=3, window_started_at=1, report_id="r", report_status="pending")
         recovered = SYS001.master_alert_success(pending)
-        self.assertEqual(("r", "pending", True, 0), (recovered.report_id, recovered.report_status, recovered.recovered, recovered.consecutive_count))
+        self.assertEqual(("r", "pending", True, 3), (recovered.report_id, recovered.report_status, recovered.recovered, recovered.consecutive_count))
         self.assertFalse(SYS001.master_alert_counts_failure(enabled=False, type_enabled=True, origin="direct", terminal_reason="final_error"))
         self.assertFalse(SYS001.master_alert_counts_failure(enabled=True, type_enabled=False, origin="direct", terminal_reason="final_error"))
-        for origin, reason in (("natural", "final_error"), ("direct", "wait"), ("direct", "no_action"), ("pending", "final_error")):
+        self.assertTrue(SYS001.master_alert_counts_failure(enabled=True, type_enabled=True, origin="natural", terminal_reason="final_error"))
+        for origin, reason in (("direct", "wait"), ("direct", "no_action"), ("pending", "final_error")):
             self.assertFalse(SYS001.master_alert_counts_failure(enabled=True, type_enabled=True, origin=origin, terminal_reason=reason))
 
 

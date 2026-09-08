@@ -2,8 +2,8 @@ name: astrbot_plugin_shio
 display_name: 星汐
 desc: 在 AstrBot 标准事件链上增强自然聊天：当前回合事实、群聊自然参与、群聊模型可见能力收窄与文本组件布局。
 short_desc: 只增强 AstrBot 标准自然聊天链。
-help: SYS-001 候选不兼容旧 Shio 设置。先配置 AstrBot 的 Persona、管理员、工具权限、内置指令、沙箱和 fallback；Shio 只增强真实入站事件，不接管工具执行或发送。
-version: "0.5.1"
+help: 在插件设置中调整聊天范围、自然参与、发送前审核和文字气泡；主模型、人格、管理员及工具权限继续在 AstrBot 中配置。审核规则可直接编辑或恢复默认。
+version: "0.5.1.6"
 author: "Danyi"
 repo: "https://github.com/mydanyi/astrbot_plugin_shio"
 astrbot_version: "==4.27.4"

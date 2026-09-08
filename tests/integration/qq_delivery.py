@@ -40,6 +40,7 @@ from astrbot.core.platform.sources.webchat.webchat_adapter import WebChatAdapter
 from astrbot.core.platform.sources.webchat.webchat_queue_mgr import webchat_queue_mgr
 from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
 from astrbot.core.star.context import Context
+from astrbot.core.persona_mgr import DEFAULT_PERSONALITY, PersonaManager
 from astrbot.core.star.star import star_registry
 from astrbot.core.star.star_manager import PluginManager
 
@@ -104,12 +105,18 @@ class Endpoint:
     def __init__(self):
         self.responses = []
         self.requests = []
+        self.before_response = None
 
     async def handle(self, request):
         payload = await request.json()
         self.requests.append(payload)
+        if self.before_response is not None:
+            self.before_response()
         assert self.responses, "unexpected provider request"
         message = self.responses.pop(0)
+        delay = message.pop("_fixture_delay", 0)
+        if delay:
+            await asyncio.sleep(delay)
         response = {
             "id": "fixture", "object": "chat.completion", "created": 0,
             "model": "fixture", "choices": [{"index": 0, "message": message,
@@ -206,7 +213,7 @@ async def main():
     plugin_config = {"sys001": {
         "ingress": {"group_allowed_scopes": ["10001"], "private_allowed_sender_ids": ["101"]},
         "group": {"continuous_window_enabled": False, "natural_participation_enabled": False, "name_wake_mode": "direct"},
-        "final_review": {"mode": "off"},
+        "final_review": {"mode": "off", "additional_prompt": ""},
         "presentation": {"text_component_mode": "plugin", "text_component_min_segments": 1, "text_component_max_segments": 3, "bubble_send_min_wait_seconds": 0, "bubble_send_max_wait_seconds": 0},
     }}
     Path("data/config").mkdir(parents=True, exist_ok=True)
@@ -295,6 +302,90 @@ async def main():
                     if len(media_sends) != 1 or captures[-1] is not media_sends[0]:
                         failures.append(name + "_meme")
 
+            # PluginManager loads the real AstrBotConfig, which must fill new
+            # fields without overwriting saved blanks, models or account lists.
+            loaded_settings = shio.config["sys001"]
+            schema = json.loads(Path("data/plugins/astrbot_plugin_shio/_conf_schema.json").read_text())
+            core_default = schema["sys001"]["items"]["final_review"]["items"]["core_prompt"]["default"]
+            config_ok = loaded_settings["final_review"].get("core_prompt") == core_default
+            for group, values in plugin_config["sys001"].items():
+                config_ok = config_ok and all(loaded_settings[group].get(k) == v for k, v in values.items())
+            print("CASE " + json.dumps({"scenario": "settings_preserve_saved_values", "ok": config_ok}), flush=True)
+            if not config_ok:
+                failures.append("settings_preserve_saved_values")
+
+            # Review must finish before bubble layout and the real Meme hook.
+            saved_review = copy.deepcopy(loaded_settings["final_review"])
+            try:
+                # Real AstrBotConfig default and HTTP Provider: a healthy review
+                # beyond the retired eight-second limit must still reach QQ.
+                captures.clear()
+                endpoint.requests.clear()
+                loaded_settings["final_review"]["mode"] = "core"
+                endpoint.responses = [
+                    {"role": "assistant", "content": "审核完成后正常发送。"},
+                    {"role": "assistant", "content": '{"action":"keep"}', "_fixture_delay": 8.2},
+                ]
+                event = await event_from_qq(adapter, private=True, number=119, text="请正常回复")
+                await asyncio.wait_for(scheduler.execute(event), timeout=25)
+                ok = (text_bubbles(captures) == ["审核完成后正常发送。"]
+                      and len(endpoint.requests) == 2 and not endpoint.responses
+                      and event.get_extra("shio.sys001.review_reason") == "keep")
+                print("CASE " + json.dumps({"scenario": "review_default_budget_after_eight_seconds", "ok": ok}), flush=True)
+                if not ok:
+                    failures.append("review_default_budget_after_eight_seconds")
+
+                for count in (1, 2, 3):
+                    captures.clear()
+                    endpoint.requests.clear()
+                    loaded_settings["final_review"].update({
+                        "mode": "combined", "core_prompt": "审核测试基础规则",
+                        "additional_prompt": "审核测试附加规则", "timeout_seconds": 15,
+                        "repair_enabled": True, "use_repaired_text": True, "max_repair_attempts": 1,
+                        "send_last_reply_on_review_exhausted": False,
+                    })
+                    want = ["好呀。", "已经听清了。", "接着聊吧。"][:count]
+                    repaired = "\n".join(want) + ("\n&&happy&&" if with_meme else "")
+                    endpoint.responses = [
+                        {"role": "assistant", "content": "重复。重复。"},
+                        {"role": "assistant", "content": json.dumps({"action": "replace", "text": repaired})},
+                        {"role": "assistant", "content": '{"action":"keep"}'},
+                    ]
+                    event = await event_from_qq(adapter, private=count == 2, number=120 + count,
+                                              text="请按本轮要求自然回复")
+                    await asyncio.wait_for(scheduler.execute(event), timeout=25)
+                    wire = json.dumps(endpoint.requests[1:], ensure_ascii=False)
+                    images = [p for p in captures if any(c.get("type") == "image" for c in p.get("params", {}).get("message", []))]
+                    ok = (text_bubbles(captures) == want and len(endpoint.requests) == 3
+                          and not endpoint.responses and len(images) == int(with_meme)
+                          and "请按本轮要求自然回复" in wire
+                          and "审核测试基础规则" in wire and "审核测试附加规则" in wire
+                          and (not images or captures[-1] is images[0]))
+                    name = f"review_then_{count}_bubbles_and_meme"
+                    print("CASE " + json.dumps({"scenario": name, "ok": ok, "bubbles": text_bubbles(captures), "images": len(images)}, ensure_ascii=False), flush=True)
+                    if not ok:
+                        failures.append(name)
+
+                for send_last in (False, True):
+                    captures.clear()
+                    endpoint.requests.clear()
+                    loaded_settings["final_review"].update({"repair_enabled": False,
+                        "send_last_reply_on_review_exhausted": send_last})
+                    endpoint.responses = [
+                        {"role": "assistant", "content": "保留原回复。"},
+                        {"role": "assistant", "content": '{"action":"replace","text":"不应被采用。"}'},
+                    ]
+                    event = await event_from_qq(adapter, private=True, number=130 + int(send_last))
+                    await asyncio.wait_for(scheduler.execute(event), timeout=25)
+                    ok = (text_bubbles(captures) == (["保留原回复。"] if send_last else [])
+                          and len(endpoint.requests) == 2 and not endpoint.responses)
+                    name = f"review_no_repair_send_last_{send_last}"
+                    print("CASE " + json.dumps({"scenario": name, "ok": ok}), flush=True)
+                    if not ok:
+                        failures.append(name)
+            finally:
+                loaded_settings["final_review"] = saved_review
+
             if with_meme:
                 meme = next(item.star_cls for item in star_registry if item.root_dir_name == 'meme_manager')
                 meme.emotion_llm_enabled = True
@@ -325,6 +416,39 @@ async def main():
                     failures.append('meme_auxiliary_current_user')
                 meme.emotion_llm_enabled = False
 
+            # Replay the recorded Meme mode at the external LLM boundary. This
+            # tests Shio's real response hook/order/OneBot sends, not semantic
+            # index readiness. Actual Meme category image delivery stays real.
+            for repaired in (False, True):
+                captures.clear()
+                endpoint.requests.clear()
+                clean = "第一句。\n第二句。"
+                marked = clean + "\n[meme:1]" + ("\n&&happy&&" if with_meme else "")
+                shio.config["sys001"]["final_review"].update({
+                    "mode": "core" if repaired else "off", "provider_id": "fixture",
+                    "timeout_seconds": 8, "repair_enabled": True,
+                    "use_repaired_text": True, "max_repair_attempts": 1,
+                })
+                endpoint.responses = ([
+                    {"role": "assistant", "content": "重复。重复。"},
+                    {"role": "assistant", "content": json.dumps({"action": "replace", "text": marked}, ensure_ascii=False)},
+                    {"role": "assistant", "content": '{"action":"keep"}'},
+                ] if repaired else [{"role": "assistant", "content": marked}])
+                event = await event_from_qq(adapter, private=False, number=70 + int(repaired), text="请用两句短话回复。")
+                endpoint.before_response = lambda: event.set_extra("meme_manager_semantic_mode", "llm")
+                try:
+                    await asyncio.wait_for(scheduler.execute(event), timeout=25)
+                finally:
+                    endpoint.before_response = None
+                    shio.config["sys001"]["final_review"]["mode"] = "off"
+                images = [part for payload in captures for part in payload.get("params", {}).get("message", []) if part.get("type") == "image"]
+                ok = (text_bubbles(captures) == ["第一句。", "第二句。"]
+                      and len(images) == int(with_meme) and not endpoint.responses)
+                name = "reviewed_square_meme_marker" if repaired else "generated_square_meme_marker"
+                print("CASE " + json.dumps({"scenario": name, "ok": ok, "bubbles": text_bubbles(captures), "images": len(images)}, ensure_ascii=False), flush=True)
+                if not ok:
+                    failures.append(name)
+
             # A private batch must keep both messages just like a group batch;
             # a group's later speaker may differ from the first one.
             config["provider_settings"]["buffer_intermediate_messages"] = False
@@ -333,7 +457,7 @@ async def main():
             for private in (False, True):
                 endpoint.requests.clear()
                 endpoint.responses = [{"role": "assistant", "content": "收到两句话。"}]
-                first = await event_from_qq(adapter, private=private, number=30 + int(private) * 2, sender="101" if private else "100", text="批次第一句")
+                first = await event_from_qq(adapter, private=private, number=30 + int(private) * 2, sender="101", text="批次第一句")
                 second = await event_from_qq(adapter, private=private, number=31 + int(private) * 2, sender="101", text="批次第二句", mention=False)
                 first_task = asyncio.create_task(scheduler.execute(first))
                 await asyncio.sleep(0.15)
@@ -399,9 +523,9 @@ async def main():
             endpoint.responses = [{"role": "assistant", "content": "收到大家的早餐安排。"}]
             captures.clear()
             breakfast = [
-                await event_from_qq(adapter, private=False, number=50, sender="100", text="我想喝豆浆", mention=True),
+                await event_from_qq(adapter, private=False, number=50, sender="100", text="我想喝豆浆", mention=False),
                 await event_from_qq(adapter, private=False, number=51, sender="101", text="我想吃油条", mention=False),
-                await event_from_qq(adapter, private=False, number=52, sender="101", text="还要煎饼", mention=False),
+                await event_from_qq(adapter, private=False, number=52, sender="101", text="还要煎饼", mention=True),
             ]
             tasks = []
             for item in breakfast:
@@ -418,6 +542,23 @@ async def main():
                   "provider_requests": len(endpoint.requests), "earlier_seen": "豆浆" in delivered and "油条" in delivered}), flush=True)
             if not batch_ok:
                 failures.append("official_icl_cross_sender_batch")
+
+            # Two different people directly address the bot in one window.
+            captures.clear()
+            endpoint.requests.clear()
+            endpoint.responses = [{"role": "assistant", "content": text} for text in ("先回答烤肉。", "再回答亲亲。")]
+            direct_a = await event_from_qq(adapter, private=False, number=53, sender="100", text="独立问题甲烤肉")
+            direct_b = await event_from_qq(adapter, private=False, number=54, sender="101", text="独立问题乙亲亲")
+            task_a = asyncio.create_task(scheduler.execute(direct_a))
+            await asyncio.sleep(0.15)
+            task_b = asyncio.create_task(scheduler.execute(direct_b))
+            await asyncio.wait_for(asyncio.gather(task_a, task_b), 15)
+            direct_ok = (len(endpoint.requests) == 2 and not endpoint.responses
+                         and text_bubbles(captures) == ["先回答烤肉。", "再回答亲亲。"]
+                         and "独立问题乙亲亲" not in json.dumps(endpoint.requests[0], ensure_ascii=False))
+            print("CASE " + json.dumps({"scenario": "two_direct_senders_no_future_input", "ok": direct_ok}), flush=True)
+            if not direct_ok:
+                failures.append("two_direct_senders_no_future_input")
             shio.config["sys001"]["group"]["continuous_window_enabled"] = False
 
             # QQ friend/typing notices can become empty private events. They
@@ -472,6 +613,148 @@ async def main():
             print("CASE " + json.dumps({"scenario": "reload_preserves_conversation", "unchanged": unchanged}), flush=True)
             if not unchanged:
                 failures.append("reload_preserves_conversation")
+
+            # Bind via a real private QQ event, reload, then verify the actual
+            # OneBot destination on terminal review faults. No injected UMO.
+            config["provider_settings"]["streaming_response"] = False
+            await scheduler.stages[1].initialize(pipeline_context)
+            shio = next(item.star_cls for item in star_registry if item.root_dir_name == "astrbot_plugin_shio")
+            shio.config["sys001"]["master_alert"].update({"master_alert_enabled": True,
+                "review_repair_exhausted_enabled": True, "main_reply_exhausted_enabled": True,
+                "master_alert_quiet_enabled": False, "window_minutes": 10})
+            endpoint.responses = [{"role": "assistant", "content": "主人私聊已收到。"}]
+            bind = await event_from_qq(adapter, private=True, number=200, sender="100", text="建立通知私聊")
+            await asyncio.wait_for(scheduler.execute(bind), 10)
+            loaded, error = await manager.reload("astrbot_plugin_shio")
+            assert loaded, error
+            shio = next(item.star_cls for item in star_registry if item.root_dir_name == "astrbot_plugin_shio")
+            restored = shio._master_alert_record.master_umo == bind.unified_msg_origin
+            print("CASE " + json.dumps({"scenario": "reload_verified_master_destination", "ok": restored}), flush=True)
+            if not restored:
+                failures.append("reload_verified_master_destination")
+            shio.config["sys001"]["master_alert"].update({"master_alert_enabled": True,
+                "review_repair_exhausted_enabled": True, "main_reply_exhausted_enabled": True,
+                "master_alert_quiet_enabled": False, "window_minutes": 10})
+            shio.config["sys001"]["final_review"].update({"mode": "core", "provider_id": "fixture",
+                "timeout_seconds": 2, "max_repair_attempts": 0, "repair_enabled": False,
+                "send_last_reply_on_review_exhausted": False})
+            cases = [("review_invalid_first_notifies", "bad JSON", "invalid", True),
+                     ("review_success_between_failures", '{"action":"keep"}', "keep", False),
+                     ("review_same_failure_deduped", "bad JSON", "invalid", False),
+                     ("review_rejected_notifies", '{"action":"replace","text":"改写"}', "rejected", True),
+                     ("review_timeout_notifies", None, "timeout", True),
+                     ("review_revoked_master_not_sent", "bad JSON", "invalid", False)]
+            for number, (name, review_output, reason, notify) in enumerate(cases, 201):
+                if name == "review_revoked_master_not_sent":
+                    config["admins_id"] = []
+                    shio._master_alert_recent.clear()  # New fault window, not a dedupe test.
+                    shio._master_alert_record = type(shio._master_alert_record)(master_umo=bind.unified_msg_origin)
+                captures.clear()
+                endpoint.requests.clear()
+                endpoint.responses = [{"role": "assistant", "content": "不含技术细节的正常候选。"},
+                                      {"role": "assistant", "content": review_output or '{"action":"keep"}',
+                                       "_fixture_delay": 0.15 if reason == "timeout" else 0}]
+                shio.config["sys001"]["final_review"]["timeout_seconds"] = 0.03 if reason == "timeout" else 2
+                item = await event_from_qq(adapter, private=False, number=number, sender="101", text="故障通知测试")
+                await asyncio.wait_for(scheduler.execute(item), 10)
+                private_sends = [p for p in captures if str(p.get("params", {}).get("user_id")) == "100"]
+                group_sends = [p for p in captures if p.get("action") in {"send_group_msg", "send_msg"} and p.get("params", {}).get("group_id")]
+                ok = (len(private_sends) == int(notify) and len(group_sends) == int(reason == "keep")
+                      and len(endpoint.requests) == 2 and not endpoint.responses
+                      and item.get_extra("shio.sys001.review_reason") == reason)
+                print("CASE " + json.dumps({"scenario": name, "ok": ok, "private_notices": len(private_sends), "group_sends": len(group_sends)}), flush=True)
+                if not ok:
+                    failures.append(name)
+            config["admins_id"] = ["100"]
+            shio._master_alert_recent.clear()
+            shio._master_alert_record = type(shio._master_alert_record)(master_umo=bind.unified_msg_origin)
+            shio.config["sys001"]["group"].update({"natural_participation_enabled": True,
+                "natural_group_scopes": ["10001"], "natural_reply_cooldown_seconds": 1,
+                "natural_max_replies_per_window": 20})
+            captures.clear()
+            endpoint.requests.clear()
+            endpoint.responses = [{"role": "assistant", "content": text} for text in
+                ('{"decision":"REPLY"}', '自然回复候选。', 'invalid JSON')]
+            item = await event_from_qq(adapter, private=False, number=208, sender="101", text="自然参与故障场景", mention=False)
+            await asyncio.wait_for(scheduler.execute(item), 10)
+            sends = [p for p in captures if p.get("action") in {"send_private_msg", "send_group_msg", "send_msg"}]
+            ok = len(sends) == 1 and str(sends[0]["params"].get("user_id")) == "100" and len(endpoint.requests) == 3
+            print("CASE " + json.dumps({"scenario": "natural_reply_failure_notifies_master", "ok": ok,
+                "provider_requests": len(endpoint.requests), "sends": len(sends)}), flush=True)
+            if not ok:
+                failures.append("natural_reply_failure_notifies_master")
+
+            # Opt-in expression guidance with the official persona resolver,
+            # official QQ delivery, real reviewer HTTP payloads and Meme hook.
+            real_personas = PersonaManager(db_helper, SimpleNamespace(default_conf=config))
+            persona = copy.deepcopy(DEFAULT_PERSONALITY)
+            persona.update({"name": "character-fixture", "prompt": "CHARACTER_PERSONA: 嘴硬心软，回答技术问题要准确。"})
+            real_personas.personas_v3 = [persona]
+            context.persona_manager = real_personas
+            shio.config["sys001"]["group"].update({"continuous_window_enabled": False, "natural_participation_enabled": False})
+            shio.config["sys001"]["identity"].update({"master_relationship_enabled": True, "master_relationship_prompt": "CHARACTER_MASTER_ONLY"})
+            character_cases = [
+                ("character_group_member", True, False, "101", True, True, 1),
+                ("character_private_master", True, True, "100", True, True, 2),
+                ("character_group_master", True, False, "100", True, True, 3),
+                ("character_private_member_review_off", True, True, "101", False, True, 1),
+                ("character_review_reference_off", True, False, "101", True, False, 2),
+                ("character_module_disabled", False, True, "100", True, True, 1),
+            ]
+            for number, (name, enabled, private, sender, review, protect, count) in enumerate(character_cases, 301):
+                captures.clear()
+                endpoint.requests.clear()
+                shio.config["sys001"]["character_dialogue"].update({"enabled": enabled, "preserve_character_in_review": protect})
+                shio.config["sys001"]["final_review"].update({"mode": "core" if review else "off", "timeout_seconds": 10})
+                shio.config["sys001"]["presentation"].update({"text_component_mode": "plugin", "text_component_min_segments": 1, "text_component_max_segments": count})
+                want = ["哼，也不是不能帮你。", "先说说哪里卡住了。", "我看看。"][:count]
+                final = "\n".join(want) + ("\n&&happy&&" if with_meme else "")
+                endpoint.responses = [{"role": "assistant", "content": final}]
+                if review:
+                    endpoint.responses.append({"role": "assistant", "content": '{"action":"keep"}'})
+                item = await event_from_qq(adapter, private=private, number=number, sender=sender, text="今天有点累，代码也没跑通。")
+                await context.conversation_manager.new_conversation(item.unified_msg_origin, persona_id="character-fixture")
+                await asyncio.wait_for(scheduler.execute(item), 25)
+                main_wire = json.dumps(endpoint.requests[0], ensure_ascii=False)
+                review_wire = json.dumps(endpoint.requests[1:], ensure_ascii=False)
+                images = [p for p in captures if any(c.get("type") == "image" for c in p.get("params", {}).get("message", []))]
+                reference_expected = enabled and review and protect
+                ok = (len(endpoint.requests) == 1 + int(review) and not endpoint.responses
+                      and text_bubbles(captures) == want and len(images) == int(with_meme)
+                      and "CHARACTER_PERSONA" in main_wire
+                      and ("[Shio 角色化自然表达]" in main_wire) == enabled
+                      and ("CHARACTER_MASTER_ONLY" in main_wire) == (sender == "100")
+                      and ("CHARACTER_EXPRESSION_REFERENCE:" in review_wire) == reference_expected
+                      and ("CHARACTER_PERSONA" in review_wire) == reference_expected
+                      and ("CHARACTER_MASTER_ONLY" in review_wire) == (reference_expected and sender == "100"))
+                print("CASE " + json.dumps({"scenario": name, "ok": ok, "provider_requests": len(endpoint.requests),
+                    "bubble_count": len(text_bubbles(captures)), "images": len(images)}), flush=True)
+                if not ok:
+                    failures.append(name)
+            # Real official QQ delivery must keep fences intact, including when
+            # the configured minimum cannot be reached without breaking code.
+            shio.config["sys001"]["character_dialogue"]["enabled"] = False
+            shio.config["sys001"]["final_review"]["mode"] = "off"
+            code = '```python\nnums = [3, 1, 2, 3, 1]\nprint(list(dict.fromkeys(nums)))\n```'
+            for number, (name, minimum, answer, expected) in enumerate([
+                ("code_fence_with_prose", 1, "可以这样：\n\n" + code + "\n\n保留原顺序。",
+                 ["可以这样：", code, "保留原顺序。"]),
+                ("code_fence_minimum_preserves_block", 3, code, [code]),
+            ], 401):
+                captures.clear()
+                endpoint.requests.clear()
+                shio.config["sys001"]["presentation"].update({"text_component_mode": "plugin",
+                    "text_component_min_segments": minimum, "text_component_max_segments": 3})
+                endpoint.responses = [{"role": "assistant", "content": answer}]
+                item = await event_from_qq(adapter, private=True, number=number, sender="101",
+                                           text="Python 列表如何去重并保留顺序？")
+                await asyncio.wait_for(scheduler.execute(item), 15)
+                ok = (text_bubbles(captures) == expected and len(endpoint.requests) == 1
+                      and not endpoint.responses)
+                print("CASE " + json.dumps({"scenario": name, "ok": ok,
+                    "bubble_count": len(text_bubbles(captures))}), flush=True)
+                if not ok:
+                    failures.append(name)
             capture_task.cancel()
             await asyncio.gather(capture_task, return_exceptions=True)
     finally:
