@@ -70,7 +70,7 @@ class DocumentationContractTests(unittest.TestCase):
             return result
 
         descriptions = visible_descriptions(schema["sys001"])
-        self.assertEqual(57, len(descriptions))
+        self.assertEqual(70, len(descriptions))
         for description in descriptions:
             with self.subTest(description=description):
                 self.assertIn(description, guide)
@@ -87,6 +87,7 @@ class DocumentationContractTests(unittest.TestCase):
             groups["group"]["items"]["natural_decision_provider_id"],
             groups["final_review"]["items"]["provider_id"],
             groups["presentation"]["items"]["model_segment_provider_id"],
+            groups["character_dialogue"]["items"]["preparation"]["items"]["provider_id"],
         )
         fallback_fields = (
             groups["group"]["items"]["name_semantic_fallback_provider_ids"],

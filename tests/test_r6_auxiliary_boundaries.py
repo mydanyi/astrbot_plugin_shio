@@ -11,6 +11,7 @@ import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 import unittest
+from unittest.mock import AsyncMock
 
 try:  # unittest discovery imports this file as a top-level module.
     from test_name_semantic_provider_routing import (
@@ -71,6 +72,11 @@ class R6AuxiliaryProviderTests(unittest.IsolatedAsyncioTestCase):
     async def test_natural_gate_uses_tool_free_strict_provider_decision(self):
         provider = FakeProvider('{"decision":"REPLY"}')
         plugin = self.plugin(provider)
+        manager = SimpleNamespace(
+            get_curr_conversation_id=AsyncMock(return_value=None),
+            new_conversation=AsyncMock(), update_conversation=AsyncMock(),
+        )
+        plugin.context.conversation_manager = manager
         event = _Event()
         event.set_extra("shio.sys001.generation", 1)
 
@@ -79,7 +85,12 @@ class R6AuxiliaryProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("REPLY", decision)
         self.assertEqual(1, len(provider.calls))
         self.assertIsNone(provider.calls[0]["func_tool"])
-        self.assertNotIn("conversation", provider.calls[0]["prompt"])
+        # Read-only official context is allowed; creating/updating a formal
+        # conversation and sending are still forbidden for the decision call.
+        manager.get_curr_conversation_id.assert_awaited_once()
+        manager.new_conversation.assert_not_awaited()
+        manager.update_conversation.assert_not_awaited()
+        self.assertEqual([], event.requests)
 
     async def test_natural_malformed_or_late_result_is_fail_closed(self):
         provider = FakeProvider("not-json")

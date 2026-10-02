@@ -11,6 +11,7 @@ import traceback
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+import zipfile
 
 try:
     import test_r14_recorded_official_replay as R14
@@ -44,10 +45,17 @@ class R29DisabledBubbleSingleEventTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.astr_sources = R14._read_archives()
         self.meme_sources = R15._archive_sources()
-        self.official_root = Path(os.environ["SYS001_OFFICIAL_ASTRBOT_REPO"].split("::")[-1])
-        dispatcher_blob = (
-            self.official_root / "astrbot/core/pipeline/context_utils.py"
-        ).read_bytes()
+        portable_archive = os.environ.get("SYS001_OFFICIAL_ASTRBOT_ARCHIVE")
+        if portable_archive:
+            with zipfile.ZipFile(portable_archive) as archive:
+                dispatcher_blob = archive.read("astrbot/core/pipeline/context_utils.py")
+                self.assertIn("astrbot/__init__.py", archive.namelist())
+        else:
+            self.official_root = Path(os.environ["SYS001_OFFICIAL_ASTRBOT_REPO"].split("::")[-1])
+            dispatcher_blob = (
+                self.official_root / "astrbot/core/pipeline/context_utils.py"
+            ).read_bytes()
+            self.assertTrue((self.official_root / "astrbot/__init__.py").is_file())
         self.dispatcher_source = dispatcher_blob.decode("utf-8")
         # The fixed v4.27.4 dispatcher is a text source.  Pin its canonical
         # LF representation so the same official body is accepted from the
@@ -56,7 +64,6 @@ class R29DisabledBubbleSingleEventTests(unittest.IsolatedAsyncioTestCase):
         canonical_dispatcher = dispatcher_blob.replace(b"\r\n", b"\n")
         self.assertNotIn(b"\r", canonical_dispatcher)
         self.dispatcher_sha = hashlib.sha256(canonical_dispatcher).hexdigest()
-        self.assertTrue((self.official_root / "astrbot/__init__.py").is_file())
         self.assertEqual(
             "9700cd79ea963411701936bf0ab1dc87436bd074671bfd261ad0b02793ec2b7c",
             self.dispatcher_sha,

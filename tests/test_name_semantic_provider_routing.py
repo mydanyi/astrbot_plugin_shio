@@ -1807,6 +1807,7 @@ class TextComponentLayoutTests(unittest.IsolatedAsyncioTestCase):
                 "text_component_mode", "text_component_max_segments",
                 "text_component_min_segments", "model_segment_provider_id",
                 "model_segment_fallback_provider_ids", "model_segment_timeout_seconds",
+                "model_segment_streaming",
                 "bubble_send_min_wait_seconds", "bubble_send_max_wait_seconds",
             }, set(presentation)
         )

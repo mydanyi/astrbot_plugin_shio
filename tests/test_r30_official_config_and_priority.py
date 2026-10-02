@@ -164,7 +164,7 @@ class R30OfficialConfigAndPriorityTests(unittest.IsolatedAsyncioTestCase):
                 for item in node.body:
                     if isinstance(item, ast.AsyncFunctionDef) and item.name in {"layout_text_components", "stage_remaining_bubbles"}:
                         priorities[item.name] = ast.unparse(item.decorator_list[0])
-        self.assertIn("100000", priorities["layout_text_components"])
+        self.assertIn("-99998", priorities["layout_text_components"])
         self.assertIn("-100000", priorities["stage_remaining_bubbles"])
 
     async def test_fresh_t2i_projection_shape_matrix_keeps_or_stages_exactly(self):

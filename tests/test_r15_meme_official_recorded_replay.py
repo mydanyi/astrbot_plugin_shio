@@ -12,6 +12,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import os
 import random
 import re
 import sys
@@ -45,6 +46,7 @@ except ModuleNotFoundError:  # pragma: no cover - package discovery path
 MEME_ARCHIVE = Path(
     r"C:\Temp\sys001-r14-meme-official-8ecd36e03fb545b5bcb7024f4ae34b23\meme-fixed.zip"
 )
+MEME_ARCHIVE = Path(os.environ.get("SYS001_OFFICIAL_MEME_ARCHIVE", str(MEME_ARCHIVE)))
 MEME_ARCHIVE_SHA = "7ce485ba7aadf5b516c60b86c64457384b71c67b21c4905b37c01bd8568bd2f4"
 MEME_ENTRY_SHA = {
     "main.py": "70c22358b05ea4e90cdb43060536fd8d401dc5a838299a3e60771ab52b117373",
@@ -470,7 +472,7 @@ class R15MemeOfficialRecordedReplayTests(unittest.IsolatedAsyncioTestCase):
             [handler.handler_full_name for handler in handlers],
         )
         self.assertEqual(
-            [100000, 100000, -1000000],
+            [100000, -99998, -1000000],
             [handler.extras_configs["priority"] for handler in handlers],
         )
         tree = ast.parse(self.sources["main.py"])

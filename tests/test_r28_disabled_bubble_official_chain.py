@@ -204,11 +204,20 @@ class R28DisabledBubbleOfficialChainTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fixed_dispatcher_stops_fixed_meme_after_on_success_cancel_and_send_failure(self):
         """Run fixed call_event_hook and fixed Meme after body on one disabled event."""
-        official_root = Path(os.environ["SYS001_OFFICIAL_ASTRBOT_REPO"].split("::")[-1])
-        dispatcher_path = official_root / "astrbot/core/pipeline/context_utils.py"
-        dispatcher_source = dispatcher_path.read_text(encoding="utf-8")
-        self.assertTrue((official_root / "astrbot/__init__.py").is_file())
-        self.assertEqual(R14.ASTR_ARCHIVE_SHA, hashlib.sha256(R14.ASTR_ARCHIVE.read_bytes()).hexdigest())
+        portable_archive = os.environ.get("SYS001_OFFICIAL_ASTRBOT_ARCHIVE")
+        if portable_archive:
+            with zipfile.ZipFile(portable_archive) as archive:
+                dispatcher_source = archive.read("astrbot/core/pipeline/context_utils.py").decode("utf-8").replace("\r\n", "\n")
+                self.assertIn("astrbot/__init__.py", archive.namelist())
+            encoded = dispatcher_source.encode("utf-8")
+            self.assertEqual("5497bbf9746266913ce55ef696ee203ae94c37ab",
+                             hashlib.sha1(f"blob {len(encoded)}\0".encode()+encoded).hexdigest())
+        else:
+            official_root = Path(os.environ["SYS001_OFFICIAL_ASTRBOT_REPO"].split("::")[-1])
+            dispatcher_path = official_root / "astrbot/core/pipeline/context_utils.py"
+            dispatcher_source = dispatcher_path.read_text(encoding="utf-8")
+            self.assertTrue((official_root / "astrbot/__init__.py").is_file())
+            self.assertEqual(R14.ASTR_ARCHIVE_SHA, hashlib.sha256(R14.ASTR_ARCHIVE.read_bytes()).hexdigest())
         meme_after = R14._method(self.sources["mixins/event_handlers.py"], "EventHandlerMixin", "_after_message_sent_impl", {"logger": _Log(), "os": __import__("os")})
         trace = []
         class MemeReceiver:

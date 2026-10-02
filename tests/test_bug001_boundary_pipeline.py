@@ -9,6 +9,7 @@ helpers, wakeups, ``record_standard_send`` or ``terminate`` directly.
 from __future__ import annotations
 
 import asyncio
+import sys
 import zoneinfo
 from contextlib import asynccontextmanager, suppress
 from types import SimpleNamespace
@@ -400,15 +401,43 @@ async def test_respond_stage_duplicate_after_send_is_idempotent():
             await _cancel_fixture_task(follower_task)
 
 
+
+
 @pytest.mark.asyncio
-async def test_no_public_terminal_fails_closed_until_official_reload():
-    """Matrix 4: only PluginManager.reload releases a terminal-less chain."""
+async def test_no_public_terminal_fails_closed_until_official_reload(monkeypatch):
+    """Matrix 4: reload gives a terminal-less chain a grace, then cancels it.
+
+    The boundary must be a genuine, still-running Pipeline Task -- not a Task
+    that already completed and only pretends to still own the merge slot.  It is
+    parked in the controlled external Agent gate, so the reload really has to
+    cancel running boundary work (and the queued follower) on timeout.
+    """
+    entered: asyncio.Event = asyncio.Event()
+    gate: asyncio.Event = asyncio.Event()  # never released: the owner stays real
+
+    class _GatedAgentSubStage:
+        async def process(self, event):
+            entered.set()
+            await gate.wait()
+            if False:  # keeps this an async generator without Provider I/O
+                yield event
+
+    monkeypatch.setattr(
+        sys.modules[__name__], "_NoOpAgentSubStage", _GatedAgentSubStage
+    )
     async with _official_fixture() as (_plugin_instance, pipeline_context, metadata):
+        _plugin_instance.config["sys001"]["lifecycle"] = {"shutdown_grace_seconds": 1}
         boundary = _master_media("reload-boundary")
-        await _run_official_pipeline(boundary, pipeline_context, preprocess=True)
+        # Match EventBus: each event owns a task, not the entire test/reload caller.
+        boundary_task = asyncio.create_task(
+            _run_official_pipeline(boundary, pipeline_context, preprocess=True)
+        )
         follower = _master_text("reload-follower")
         follower_task = asyncio.create_task(_run_official_pipeline(follower, pipeline_context))
         try:
+            # Hold a real running boundary before the follower queues behind it.
+            await asyncio.wait_for(entered.wait(), timeout=3)
+            assert not boundary_task.done()
             await _expect_waiting(follower_task)
             # Invoke the fixed public reload entry.  Stub only its subsequent
             # discovery/load step: reload itself performs the official
@@ -420,12 +449,21 @@ async def test_no_public_terminal_fails_closed_until_official_reload():
                 return True, None
 
             manager.load = _reload_fixture_load
-            result = await manager.reload(metadata.name)
+            reloading = asyncio.create_task(manager.reload(metadata.name))
+            await asyncio.sleep(.05)
+            assert not reloading.done()
+            assert not follower_task.done()
+            assert not boundary_task.done()
+            result = await asyncio.wait_for(reloading, timeout=3)
             assert result == (True, None)
-            await asyncio.wait_for(follower_task, timeout=1)
+            with pytest.raises(asyncio.CancelledError):
+                await boundary_task
+            with pytest.raises(asyncio.CancelledError):
+                await follower_task
             assert follower.get_extra("provider_request") is None
             assert boundary.sent == []
         finally:
+            await _cancel_fixture_task(boundary_task)
             await _cancel_fixture_task(follower_task)
 
 

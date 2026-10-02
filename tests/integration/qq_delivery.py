@@ -308,6 +308,10 @@ async def main():
             schema = json.loads(Path("data/plugins/astrbot_plugin_shio/_conf_schema.json").read_text())
             core_default = schema["sys001"]["items"]["final_review"]["items"]["core_prompt"]["default"]
             config_ok = loaded_settings["final_review"].get("core_prompt") == core_default
+            config_ok = config_ok and all(
+                loaded_settings['group'].get(key) == schema['sys001']['items']['group']['items'][key]['default']
+                for key in ('natural_participation_probability', 'natural_context_max_messages', 'natural_context_max_chars')
+            )
             for group, values in plugin_config["sys001"].items():
                 config_ok = config_ok and all(loaded_settings[group].get(k) == v for k, v in values.items())
             print("CASE " + json.dumps({"scenario": "settings_preserve_saved_values", "ok": config_ok}), flush=True)
@@ -731,6 +735,63 @@ async def main():
                     "bubble_count": len(text_bubbles(captures)), "images": len(images)}), flush=True)
                 if not ok:
                     failures.append(name)
+            # Natural decision uses the real ICL collector and official persona
+            # manager even with character expression disabled. Its read must
+            # not consume the ICL that the following formal request needs.
+            shio.config['sys001']['character_dialogue']['enabled'] = False
+            shio.config['sys001']['final_review']['mode'] = 'off'
+            config['provider_ltm_settings']['group_icl_enable'] = True
+            shio.config['sys001']['group'].update({
+                'natural_participation_enabled': False,
+                'natural_participation_probability': 100,
+                'natural_max_replies_per_window': 20,
+                'natural_reply_cooldown_seconds': 1,
+            })
+            collector = context.get_registered_star('astrbot').star_cls.group_chat_context
+            ambient = await event_from_qq(adapter, private=False, number=390, sender='101', text='NATURAL_PAST: 刚给猫买了玩具', mention=False)
+            await collector.remove_session(ambient)
+            await context.conversation_manager.new_conversation(ambient.unified_msg_origin,
+                persona_id='character-fixture', content=[
+                    {'role':'user', 'content':'NATURAL_PRIOR_USER: 想养猫'},
+                    {'role':'assistant', 'content':'NATURAL_PRIOR_BOT: 我也喜欢猫'},
+                ])
+            await scheduler.execute(ambient)
+            await asyncio.sleep(1.1)  # Conversation V1 timestamps have one-second precision.
+            captures.clear()
+            endpoint.requests.clear()
+            shio.config['sys001']['group']['natural_participation_enabled'] = True
+            endpoint.responses = [
+                {'role':'assistant', 'content':'{"decision":"REPLY"}'},
+                {'role':'assistant', 'content':'她喜欢就好。'},
+            ]
+            natural = await event_from_qq(adapter, private=False, number=391, sender='101', text='她特别喜欢呢', mention=False)
+            await asyncio.wait_for(scheduler.execute(natural), 20)
+            decision_wire = json.dumps(endpoint.requests[:1], ensure_ascii=False)
+            reply_wire = json.dumps(endpoint.requests[1:], ensure_ascii=False)
+            ok = (len(endpoint.requests) == 2 and not endpoint.responses
+                  and all(value in decision_wire for value in ('NATURAL_PAST', 'NATURAL_PRIOR_BOT', 'CHARACTER_PERSONA'))
+                  and 'NATURAL_PAST' in reply_wire
+                  and '[Shio 角色化自然表达]' not in reply_wire
+                  and text_bubbles(captures) == ['她喜欢就好。'])
+            print('CASE ' + json.dumps({'scenario':'natural_official_context_persona_no_consumption', 'ok':ok}), flush=True)
+            if not ok:
+                failures.append('natural_official_context_persona_no_consumption')
+            await asyncio.sleep(1.1)
+            shio.config['sys001']['group']['natural_participation_probability'] = 0
+            for number, directed in ((392, False), (393, True)):
+                captures.clear()
+                endpoint.requests.clear()
+                endpoint.responses = [{'role':'assistant', 'content':'直接叫我就回答。' if directed else '{"decision":"REPLY"}'}]
+                item = await event_from_qq(adapter, private=False, number=number, sender='101', text='还想聊聊猫', mention=directed)
+                await asyncio.wait_for(scheduler.execute(item), 20)
+                ok = (len(endpoint.requests) == 1 and not endpoint.responses
+                      and text_bubbles(captures) == (['直接叫我就回答。'] if directed else []))
+                name = 'natural_probability_zero_direct_bypass' if directed else 'natural_probability_zero_no_send'
+                print('CASE ' + json.dumps({'scenario':name, 'ok':ok}), flush=True)
+                if not ok:
+                    failures.append(name)
+            shio.config['sys001']['group'].update(natural_participation_enabled=False, natural_participation_probability=100)
+
             # Real official QQ delivery must keep fences intact, including when
             # the configured minimum cannot be reached without breaking code.
             shio.config["sys001"]["character_dialogue"]["enabled"] = False

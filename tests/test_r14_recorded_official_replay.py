@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import inspect
 import math
+import os
 from pathlib import Path
 import random
 import re
@@ -40,6 +41,8 @@ except ModuleNotFoundError:  # pragma: no cover
 
 ASTR_ARCHIVE = Path(r"C:\Users\45928\AppData\Local\Temp\shio-r14-official-c12e8d08d495465e8c10d21f96f80b76\astrbot-fixed.zip")
 MEME_ARCHIVE = Path(r"C:\Temp\sys001-r14-meme-official-8ecd36e03fb545b5bcb7024f4ae34b23\meme-fixed.zip")
+PORTABLE_ASTR_ARCHIVE = os.environ.get("SYS001_OFFICIAL_ASTRBOT_ARCHIVE")
+MEME_ARCHIVE = Path(os.environ.get("SYS001_OFFICIAL_MEME_ARCHIVE", str(MEME_ARCHIVE)))
 ASTR_ARCHIVE_SHA = "c284bdc18cd8c862631125db1ec052921f94350b57f34fb3a746b43fd45c4149"
 MEME_ARCHIVE_SHA = "7ce485ba7aadf5b516c60b86c64457384b71c67b21c4905b37c01bd8568bd2f4"
 SOURCES = {
@@ -156,10 +159,14 @@ class _ReplayEvent:
 
 
 def _read_archives():
-    assert hashlib.sha256(ASTR_ARCHIVE.read_bytes()).hexdigest() == ASTR_ARCHIVE_SHA
+    astr_archive = Path(PORTABLE_ASTR_ARCHIVE) if PORTABLE_ASTR_ARCHIVE else ASTR_ARCHIVE
+    if not PORTABLE_ASTR_ARCHIVE:
+        assert hashlib.sha256(astr_archive.read_bytes()).hexdigest() == ASTR_ARCHIVE_SHA
     assert hashlib.sha256(MEME_ARCHIVE.read_bytes()).hexdigest() == MEME_ARCHIVE_SHA
     sources = {}
-    with zipfile.ZipFile(ASTR_ARCHIVE) as archive:
+    # A portable archive exported from the pinned tag is checked against the
+    # same immutable per-file hashes below, not the obsolete ZIP container.
+    with zipfile.ZipFile(astr_archive) as archive:
         for path in SOURCES:
             if path.startswith("astrbot/"):
                 sources[path] = archive.read(path)
@@ -205,7 +212,7 @@ class RecordedOfficialReplayTests(unittest.IsolatedAsyncioTestCase):
         self.sources = _read_archives()
 
     def test_fixed_sources_and_real_hook_priorities(self):
-        """Request projection is last; final review/layout precede Meme hooks."""
+        """Request projection is last; review precedes Meme, layout follows it."""
         handlers = _official_registry_order(
             "attach_turn_and_project_capabilities",
             "observe_final_agent_response",
@@ -220,7 +227,7 @@ class RecordedOfficialReplayTests(unittest.IsolatedAsyncioTestCase):
             [handler.handler_full_name for handler in handlers],
         )
         self.assertEqual(
-            [100000, 100000, -1000000],
+            [100000, -99998, -1000000],
             [handler.extras_configs["priority"] for handler in handlers],
         )
         tree = ast.parse(self.sources["main.py"])
@@ -236,7 +243,7 @@ class RecordedOfficialReplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all("99999" in value for value in decorators))
         self.assertGreater(99999, handlers[-1].extras_configs["priority"])
         self.assertGreater(handlers[0].extras_configs["priority"], 99999)
-        self.assertGreater(handlers[1].extras_configs["priority"], 99999)
+        self.assertLess(handlers[1].extras_configs["priority"], 99999)
 
     async def test_meme_limited_wrapper_replay_is_not_selection_evidence(self):
         """Historical wrapper smoke test; R15 owns selection-path evidence."""

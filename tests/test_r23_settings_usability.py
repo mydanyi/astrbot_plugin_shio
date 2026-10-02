@@ -12,6 +12,7 @@ import subprocess
 import sys
 import types
 import unittest
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -111,6 +112,7 @@ class R23SettingsSchemaTests(unittest.TestCase):
             "sys001.final_review.core_prompt",
             "sys001.character_dialogue.situation_prompt",
             "sys001.character_dialogue.expression_prompt",
+            "sys001.character_dialogue.preparation.prompt",
         ):
             field_type, default, options = actual.pop(path)
             self.assertEqual("text", field_type)
@@ -126,6 +128,16 @@ class R23SettingsSchemaTests(unittest.TestCase):
         expected["sys001.final_review.timeout_seconds"] = ("int", 20, None)
         expected["sys001.character_dialogue.enabled"] = ("bool", False, None)
         expected["sys001.character_dialogue.preserve_character_in_review"] = ("bool", True, None)
+        expected["sys001.character_dialogue.preparation.enabled"] = ("bool", False, None)
+        expected["sys001.character_dialogue.preparation.provider_id"] = ("string", "", None)
+        expected["sys001.character_dialogue.preparation.streaming"] = ("bool", False, None)
+        expected["sys001.character_dialogue.preparation.timeout_seconds"] = ("int", 30, None)
+        expected["sys001.group.natural_participation_probability"] = ("float", 100, None)
+        expected["sys001.group.natural_context_max_messages"] = ("int", 50, None)
+        expected["sys001.group.natural_context_max_chars"] = ("int", 12000, None)
+        expected["sys001.lifecycle.shutdown_grace_seconds"] = ("int", 60, None)
+        for path in ("group.name_semantic_streaming", "group.natural_decision_streaming", "final_review.streaming", "presentation.model_segment_streaming"):
+            expected["sys001." + path] = ("bool", False, None)
         self.assertEqual(expected, actual)
 
     def test_titles_are_short_chinese_and_options_keep_plain_labels(self):
@@ -234,15 +246,20 @@ class R23SettingsSchemaTests(unittest.TestCase):
                 stderr=subprocess.PIPE, text=True, encoding="utf-8",
             ).stdout
 
-        self.assertEqual(
-            "4fe29759758255a35ad01ea6177a91c2293bfcd3",
-            git("rev-parse", "v4.27.4^{commit}").strip(),
-        )
-        self.assertEqual(
-            "2b87573107419ec4d36a59bdaaaf88cbd8c625ca",
-            git("rev-parse", "v4.27.4:astrbot/dashboard/services/config_service.py").strip(),
-        )
-        source = git("show", "v4.27.4:astrbot/dashboard/services/config_service.py")
+        portable_archive = os.environ.get("SYS001_OFFICIAL_ASTRBOT_ARCHIVE")
+        if portable_archive:
+            with zipfile.ZipFile(portable_archive) as archive:
+                source = archive.read("astrbot/dashboard/services/config_service.py").decode("utf-8").replace("\r\n", "\n")
+        else:
+            self.assertEqual(
+                "4fe29759758255a35ad01ea6177a91c2293bfcd3",
+                git("rev-parse", "v4.27.4^{commit}").strip(),
+            )
+            self.assertEqual(
+                "2b87573107419ec4d36a59bdaaaf88cbd8c625ca",
+                git("rev-parse", "v4.27.4:astrbot/dashboard/services/config_service.py").strip(),
+            )
+            source = git("show", "v4.27.4:astrbot/dashboard/services/config_service.py")
         self.assertIn("async def save_plugin_configs", source)
         self.assertEqual(
             hashlib.sha1(
