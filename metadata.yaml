@@ -1,11 +1,12 @@
 name: astrbot_plugin_shio
 display_name: 星汐
-desc: 在 AstrBot 标准事件链上增强自然聊天：当前回合事实、群聊自然参与、群聊模型可见能力收窄与文本组件布局。
-short_desc: 只增强 AstrBot 标准自然聊天链。
-help: 在插件设置中调整聊天范围、自然参与、发送前审核和文字气泡；主模型、人格、管理员及工具权限继续在 AstrBot 中配置。审核规则可直接编辑或恢复默认。
-version: "0.5.1.13"
+desc: 给你的机器人完整的一生。保留角色性格，让它听懂语境、自然参与群聊，并用合适的节奏回应你；可与记忆、搜索和表情包插件搭配，让每一次相遇延续成日常。
+short_desc: 给你的机器人完整的一生：有性格、懂语境、会相处。
+help: 在 AstrBot 设置人格和聊天模型，再到星汐配置聊天范围、自然参与、角色化自然表达与文字气泡。完整说明见仓库 README 和设置指南。
+version: "0.5.1.15"
 author: "Danyi"
 repo: "https://github.com/mydanyi/astrbot_plugin_shio"
-astrbot_version: "==4.27.4"
+astrbot_version: ">=4.27.4,<=4.28.2"
 support_platforms:
   - aiocqhttp
+tags: [自然聊天, 角色扮演, 群聊, 陪伴]

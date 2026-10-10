@@ -214,7 +214,8 @@ async def _official_fixture():
     """Install the same bound handler shapes that AstrBot's loader registers."""
     plugin = _plugin()
     pipeline_context = SimpleNamespace(
-        astrbot_config=_core_config(), plugin_manager=SimpleNamespace()
+        astrbot_config=_core_config(), plugin_manager=SimpleNamespace(),
+        db_helper=None, astrbot_config_id="isolated-test",
     )
     module_path = ShioPlugin.__module__
     metadata = star_map[module_path]

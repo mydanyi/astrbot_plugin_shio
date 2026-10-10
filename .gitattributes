@@ -1,0 +1,7 @@
+# 从 git archive / GitHub 源码 ZIP 中排除开发与测试资料。
+# 保留运行代码、metadata、schema、logo、LICENSE、README，
+# 以及安装、设置、常见问题和兼容性文档；不改动文本换行策略。
+tests/ export-ignore
+.github/ export-ignore
+.gitignore export-ignore
+.gitattributes export-ignore

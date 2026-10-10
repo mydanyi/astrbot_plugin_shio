@@ -1,4 +1,4 @@
-"""Checks that public documentation matches the current Shio candidate."""
+"""Checks that public documentation matches the current Shio release."""
 
 from __future__ import annotations
 
@@ -21,33 +21,26 @@ class DocumentationContractTests(unittest.TestCase):
             DOCS / "COMPATIBILITY.md",
             DOCS / "INSTALLATION_AND_ROLLBACK.md",
             DOCS / "TROUBLESHOOTING.md",
-            DOCS / "PITFALL_LEDGER.md",
-            DOCS / "REVIEW_PLAYBOOK.md",
         ):
             with self.subTest(path=path.name):
                 self.assertTrue(path.is_file(), path)
                 self.assertTrue(path.read_text(encoding="utf-8").strip(), path)
 
-    def test_readme_describes_current_product_and_known_limit(self) -> None:
+    def test_readme_is_user_facing_without_internal_pipeline_leak(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        for phrase in (
-            "开发候选",
-            "4.27.4",
-            "aiocqhttp",
+
+        # 面向使用者的产品介绍不暴露内部实现符号，也不宣传已退休的能力。
+        for internal in (
             "event.request_llm()",
+            "ProviderRequest.contexts",
             "REPLY",
             "WAIT",
             "NO_ACTION",
-            "ProviderRequest.contexts",
-            "群聊消息记录注入上下文",
-            "尚未作为稳定版发布",
-            "从 AstrBot 已有模型中下拉选择",
         ):
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, readme)
+            with self.subTest(internal=internal):
+                self.assertNotIn(internal, readme)
 
         for retired_claim in (
-            "当前版本：",
             "AstrBot：>=4.26.7,<5",
             "启用主动发起话题",
             "待补答队列容量",
@@ -107,12 +100,11 @@ class DocumentationContractTests(unittest.TestCase):
         version = re.search(r'^version: "([^"]+)"$', metadata, re.MULTILINE)
         self.assertIsNotNone(version)
         self.assertIn(version.group(1), (ROOT / "README.md").read_text(encoding="utf-8"))
-        self.assertIn('astrbot_version: "==4.27.4"', metadata)
+        self.assertIn('astrbot_version: ">=4.27.4,<=4.28.2"', metadata)
         self.assertIn("- aiocqhttp", metadata)
 
         compatibility = (DOCS / "COMPATIBILITY.md").read_text(encoding="utf-8")
         self.assertIn(version.group(1), compatibility)
-        self.assertIn("修复候选", compatibility)
         self.assertIn("4.27.4", compatibility)
         self.assertIn("aiocqhttp", compatibility)
 
@@ -128,10 +120,8 @@ class DocumentationContractTests(unittest.TestCase):
             self.assertIn("共用", hint)
             self.assertIn("秒", hint)
 
-    def test_documents_keep_astrbot_owner_boundary(self) -> None:
+    def test_architecture_keeps_astrbot_owner_boundary(self) -> None:
         architecture = (DOCS / "ARCHITECTURE.md").read_text(encoding="utf-8")
-        pitfall = (DOCS / "PITFALL_LEDGER.md").read_text(encoding="utf-8")
-        review = (DOCS / "REVIEW_PLAYBOOK.md").read_text(encoding="utf-8")
 
         for phrase in (
             "正式回复始终通过",
@@ -139,12 +129,8 @@ class DocumentationContractTests(unittest.TestCase):
             "AstrBot 继续执行结果装饰和第一条标准发送",
             "不是 QQ 网络送达回执",
         ):
-            self.assertIn(phrase, architecture)
-
-        self.assertIn("不要用错误的官方功能补另一个功能", pitfall)
-        self.assertIn("工具可见性不是工具权限", pitfall)
-        self.assertIn("临时群聊上下文不会保存进长期 conversation", review)
-        self.assertIn("没有整批复制持久化群聊历史到", review)
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, architecture)
 
     def test_retired_delivery_owners_are_absent_from_runtime(self) -> None:
         source = (ROOT / "main.py").read_text(encoding="utf-8")

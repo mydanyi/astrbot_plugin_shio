@@ -18,6 +18,17 @@ _BOUNDARY = (
     "实际文字气泡数量和配图遵循已有分段设置与表情包插件，不在这里指定数量。"
 )
 
+_TASK_BOUNDARY = (
+    "[Shio 任务与表达边界]\n"
+    "角色的自主、嘴硬和不奉承只是语气，不能凭空成为拒绝正常请求的条件；"
+    "依据当前已公开的工具、真实限制和本轮明确要求处理，不猜测对方动机。"
+    "目标或信息不足时问最少必要的问题，不凭空补上 QQ 号，"
+    "也不要用纯文字 @ 昵称冒充实际平台艾特。"
+    "用户澄清或纠错后重新理解本轮，不把旧助手的拒绝、借口、错误或自述当作限制或设定；"
+    "该接住时认真接住。这不让“更有性格”变成一律服从，"
+    "也不改变 Master 与群友的关系边界、安全规则或工具权限。"
+)
+
 
 def _prompt(settings: dict, name: str, default: str) -> str:
     value = settings.get(name, default)
@@ -40,6 +51,7 @@ async def prepare_character_dialogue(
     expression = _prompt(settings, "expression_prompt", DEFAULT_EXPRESSION_PROMPT)
     guidance = "\n\n".join(part for part in (
         _BOUNDARY,
+        _TASK_BOUNDARY,
         "本轮情境理解：\n" + situation if situation else "",
         "角色表达指导：\n" + expression if expression else "",
     ) if part)

@@ -2607,6 +2607,9 @@ class ShioPlugin(Star):
             event.set_extra(REVIEW_REFERENCE_EXTRA, review_reference)
             if guidance:
                 req.system_prompt += "\n\n" + guidance
+            # Project the effective ToolSet before preparation so both the
+            # preparation judgment and the main reply read the same real set.
+            self._project_group_visible_tools(snapshot, req)
             prepared_guidance = await self._prepare_dialogue_context(
                 event, snapshot, req, master_style, guidance
             )
@@ -2618,7 +2621,6 @@ class ShioPlugin(Star):
                         review_reference + "\n[Shio 本轮准备场景说明]\n"
                         + prepared_guidance,
                     )
-            self._project_group_visible_tools(snapshot, req)
             self._complete_meme_selection_context(event, req)
         except BaseException:
             if isinstance(fence, ActiveEventFence):

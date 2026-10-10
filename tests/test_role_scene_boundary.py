@@ -22,10 +22,15 @@ async def test_only_valid_role_scene_gets_provider_facing_boundary(scene):
     history_before = copy.deepcopy(original_history)
     await plugin.attach_turn_and_project_capabilities(turn(), request)
     new_parts = [p for p in request.extra_user_content_parts if p is not memory and p is not other]
-    assert len(new_parts) == (1 if scene in ('role_action','roleplay','daily') else 0)
+    assert len(new_parts) == (1 if scene in ('role_action','roleplay','daily','real_execution') else 0)
     assert request.contexts is original_history and request.contexts == history_before
     if scene in ('role_action','roleplay','daily'):
         assert new_parts[0]._no_save is True
+        assert new_parts[0].text.startswith('[Shio 本轮角色场景]')
+    if scene == 'real_execution':
+        assert new_parts[0]._no_save is True
+        assert new_parts[0].text.startswith('[Shio 本轮现实任务]')
+    if scene in ('role_action','roleplay','daily','real_execution'):
         assembled = await request.assemble_context()
         assert any(p.get('text') == new_parts[0].text for p in assembled['content'])
         runtime = bind_checkpoint_messages([*request.contexts, assembled])
@@ -78,6 +83,9 @@ async def test_real_execution_is_prepared_without_role_world_or_changed_tools():
     retained = '\n'.join(p.text for p in request.extra_user_content_parts)
     assert 'UNRELATED_BIOS_INJECTION' not in retained and 'MASTER_LIKES_CRAB' in retained
     assert not any(p.text.startswith('[Shio 本轮角色场景]') for p in request.extra_user_content_parts)
+    bracketed = [p.text for p in request.extra_user_content_parts
+                 if isinstance(getattr(p, 'text', None), str) and p.text.startswith('[Shio 本轮')]
+    assert len(bracketed) == 1 and bracketed[0].startswith('[Shio 本轮现实任务]')
     assert '本轮是现实执行任务' in request.system_prompt
     assert request.func_tool is None
 
