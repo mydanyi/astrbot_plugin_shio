@@ -9,9 +9,9 @@
         "hint": "控制普通用户能否进入 Shio 聊天。主人身份由 AstrBot 判断，可绕过本组名单；这些名单不代替 AstrBot 的权限设置。",
         "type": "object",
         "items": {
-          "private_allowed_sender_ids": {"description": "允许私聊的 QQ 号", "hint": "每项一个 QQ 号；留空时普通用户私聊不进入 Shio，主人不受限制。", "type": "list", "default": []},
+          "private_allowed_sender_ids": {"description": "允许私聊的 QQ 号", "hint": "每项一个 QQ 号；留空时 Shio 不限制私聊范围，填写后只允许名单内的 QQ。禁止聊天名单仍生效；主人例外不变，AstrBot 官方限制仍有效。", "type": "list", "default": []},
           "blocked_sender_ids": {"description": "禁止聊天的 QQ 号", "hint": "每项一个 QQ 号；禁止该普通用户进入 Shio，优先于私聊和群聊允许名单，不影响主人。", "type": "list", "default": []},
-          "group_allowed_scopes": {"description": "允许聊天的群号", "hint": "每项一个群号；留空时普通群友不能进入 Shio 群聊。主人可绕过，群内自然参与还需单独开启。", "type": "list", "default": []},
+          "group_allowed_scopes": {"description": "允许聊天的群号", "hint": "每项一个群号；留空时 Shio 不限制群聊范围，填写后只允许名单内的群。禁止群聊名单仍生效；主人例外不变，自然参与需单独配置，AstrBot 官方限制仍有效。", "type": "list", "default": []},
           "group_blocked_scopes": {"description": "禁止聊天的群号", "hint": "每项一个群号；对普通群友优先于允许群号，主人不受此项限制。", "type": "list", "default": []}
         }
       },

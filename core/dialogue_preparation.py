@@ -8,13 +8,11 @@ whether a knowledge-base lookup is warranted. Results are committed only while
 from __future__ import annotations
 
 import json
-import logging
 import re
 import time
 
+from astrbot.api import logger
 from astrbot.core.agent.message import TextPart
-
-logger = logging.getLogger(__name__)
 
 _MEMORY_MARKER = re.compile(r"<RAG-Faiss-Memory>(.*?)</RAG-Faiss-Memory>", re.DOTALL)
 _HEADING = re.compile(

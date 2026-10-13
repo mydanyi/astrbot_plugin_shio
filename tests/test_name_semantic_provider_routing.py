@@ -811,9 +811,12 @@ class IngressAdmissionTests(unittest.IsolatedAsyncioTestCase):
         group = self.snapshot()
         cases = [
             (private, {"private": ["202"]}, True, "private_sender_allowed"),
-            (private, {}, False, "private_sender_not_allowed"),
+            (private, {}, True, "private_sender_allowed"),
+            (private, {"private": ["999"]}, False, "private_sender_not_allowed"),
+            (private, {"blocked": ["202"]}, False, "blocked_sender"),
             (group, {"group": ["qq:group:202"]}, True, "group_scope_allowed"),
-            (group, {}, False, "group_scope_not_allowed"),
+            (group, {}, True, "group_scope_allowed"),
+            (group, {"group": ["other:scope"]}, False, "group_scope_not_allowed"),
             (private, {"private": ["202"], "blocked": ["202"]}, False, "blocked_sender"),
             (group, {"group": ["qq:group:202"], "group_blocked": ["qq:group:202"]}, False, "group_scope_blocked"),
             (self.snapshot(is_master=True), {"private": ["other"], "blocked": ["202"], "group": ["other:scope"], "group_blocked": ["qq:group:202"]}, True, "master_bypass"),
@@ -828,7 +831,7 @@ class IngressAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.decide(self.snapshot(sender_id=""), group=["qq:group:202"]).allowed)
         self.assertFalse(self.decide(self.snapshot(self_id=""), group=["qq:group:202"]).allowed)
         self.assertFalse(self.decide(self.snapshot(sender_id="999"), group=["qq:group:202"]).allowed)
-        self.assertFalse(self.decide(self.snapshot(), group=[]).allowed)
+        self.assertFalse(self.decide(self.snapshot(), group=["other:scope"]).allowed)
 
     async def test_rejected_event_does_not_create_live_turn_or_call_conversation_provider_or_send(self) -> None:
         class RejectedEvent(FakeEvent):
@@ -855,7 +858,7 @@ class IngressAdmissionTests(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError("rejected event must not send")
 
         plugin = MAIN.ShioPlugin.__new__(MAIN.ShioPlugin)
-        plugin.config = {"sys001": {"ingress": {"group_allowed_scopes": []}}}
+        plugin.config = {"sys001": {"ingress": {"group_allowed_scopes": ["other:scope"]}}}
         plugin.context = SimpleNamespace(
             conversation_manager=SimpleNamespace(
                 get_curr_conversation_id=lambda *_args: (_ for _ in ()).throw(

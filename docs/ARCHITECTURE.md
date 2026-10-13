@@ -1,6 +1,6 @@
 # 开发架构
 
-本页面向维护者，描述 Shio 0.5.1.15 的职责和接口。使用说明见 [README](../README.md) 与[设置指南](SETTINGS_GUIDE.md)。
+本页面向维护者，描述 Shio 0.5.1.18 的职责和接口。使用说明见 [README](../README.md) 与[设置指南](SETTINGS_GUIDE.md)。
 
 ## 责任划分
 

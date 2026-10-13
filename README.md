@@ -8,7 +8,7 @@
 
 从第一次打招呼，到熟悉彼此的日常。
 
-[![版本](https://img.shields.io/badge/Shio-0.5.1.15-6d7fe8)](https://github.com/mydanyi/astrbot_plugin_shio/releases/latest)
+[![版本](https://img.shields.io/badge/Shio-0.5.1.18-6d7fe8)](https://github.com/mydanyi/astrbot_plugin_shio/releases/latest)
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.27.4–4.28.2-52b9b2)](https://github.com/AstrBotDevs/AstrBot)
 [![许可](https://img.shields.io/badge/License-MIT-f0bc68)](LICENSE)
 
@@ -66,11 +66,11 @@
 
 ## 开始使用
 
-当前版本 **0.5.1.15**，支持 **QQ / OneBot v11（aiocqhttp）**，AstrBot 版本范围为 **4.27.4–4.28.2**。
+当前版本 **0.5.1.18**，支持 **QQ / OneBot v11（aiocqhttp）**，AstrBot 版本范围为 **4.27.4–4.28.2**。
 
 1. 在 AstrBot 中接好 QQ、聊天模型与人格，确认基础对话正常。
 2. 打开插件管理，通过仓库地址安装：`https://github.com/mydanyi/astrbot_plugin_shio`。也可以从 [Releases](https://github.com/mydanyi/astrbot_plugin_shio/releases/latest) 下载 ZIP 安装包。
-3. 在星汐的“聊天范围”中填写允许聊天的群号和普通私聊用户 QQ 号。
+3. 在星汐的“聊天范围”中配置聊天范围：私聊 QQ 名单与群号名单留空时，Shio 不限制对应的聊天范围；填写后，普通用户只允许进入名单内的私聊或群。主人身份沿用 AstrBot 官方设置。
 4. 想让它参与群聊，开启“允许自然参与”并设置参与群号；想加强角色表达，开启“角色化自然表达”。
 5. 选择喜欢的文字气泡方式。**由星汐控制分段时，请关闭 AstrBot 自带分段**，避免同一条回复被拆两次。
 

@@ -376,12 +376,15 @@ def admit_ingress(
     if snapshot.sender_id in blocked_sender_ids:
         return IngressDecision(False, "blocked_sender")
     if snapshot.is_private:
-        if snapshot.sender_id in private_allowed_sender_ids:
+        if (
+            not private_allowed_sender_ids
+            or snapshot.sender_id in private_allowed_sender_ids
+        ):
             return IngressDecision(True, "private_sender_allowed")
         return IngressDecision(False, "private_sender_not_allowed")
     if configured_group_matches(snapshot, group_blocked_scopes):
         return IngressDecision(False, "group_scope_blocked")
-    if configured_group_matches(snapshot, group_allowed_scopes):
+    if not group_allowed_scopes or configured_group_matches(snapshot, group_allowed_scopes):
         return IngressDecision(True, "group_scope_allowed")
     return IngressDecision(False, "group_scope_not_allowed")
 

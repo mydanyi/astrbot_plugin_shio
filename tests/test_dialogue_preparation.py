@@ -1,11 +1,12 @@
 """NAS-only sys001 dialogue-preparation contract tests. Feature absent -> assertions fail, not imports."""
 from __future__ import annotations
-import asyncio, json
+import asyncio, json, logging
 from types import SimpleNamespace
 from dataclasses import replace
 from datetime import datetime, timezone
 import pytest, pytest_asyncio
 from test_bug001_boundary_pipeline import _event, _official_fixture, _run_official_pipeline
+from astrbot.api import logger as official_logger
 from astrbot.core.agent.message import TextPart
 from astrbot.core.message.components import Plain, At  # noqa: F401
 from astrbot.core.provider.entities import ProviderRequest, LLMResponse
@@ -173,6 +174,45 @@ async def test_roleplay_drops_memories_keeps_persona():
     assert FOCUS in r.system_prompt
     assert prov.calls and PERSONA in prov.calls[0]['prompt'] and TXT in prov.calls[0]['prompt']
     assert ev.sent == []
+
+
+class _DialoguePrepareRecorder(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+@pytest.mark.parametrize(
+    'provider_response, expected_status',
+    [(FORMAL, 'valid'), ('NOT_A_VALID_DIALOGUE_PREPARATION_RESPONSE', 'invalid')],
+)
+async def test_dialogue_prepare_status_reaches_official_logger(provider_response, expected_status):
+    prov = FakeProvider(provider_response)
+    plug = mk(provider=prov)
+    ev = turn()
+    r, rp, op = req()
+    recorder = _DialoguePrepareRecorder()
+    previous_level = official_logger.level
+    official_logger.setLevel(logging.INFO)
+    official_logger.addHandler(recorder)
+    try:
+        await plug.attach_turn_and_project_capabilities(ev, r)
+    finally:
+        official_logger.removeHandler(recorder)
+        official_logger.setLevel(previous_level)
+    messages = [record.getMessage() for record in recorder.records]
+    matches = [message for message in messages if message.startswith('dialogue_prepare status=')]
+    assert len(matches) == 1
+    message = matches[0]
+    assert f'status={expected_status}' in message
+    assert 'elapsed=' in message and 'candidates=' in message
+    assert '%s' not in message and '%.2f' not in message and '%d' not in message
+    assert TXT not in message
+    assert ev.sent == []
+    assert r.prompt == TXT and BASE in r.system_prompt
 
 
 async def test_personal_recall_keeps_only_requested():

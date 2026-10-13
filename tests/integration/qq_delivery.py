@@ -183,7 +183,7 @@ async def capture_sends(ws, captures):
         pass
 
 
-async def event_from_qq(adapter, *, private, number, sender="100", text="醒醒", mention=True, reply=False):
+async def event_from_qq(adapter, *, private, number, sender="100", text="醒醒", mention=True, reply=False, group_id=10001):
     segments = [{"type": "text", "data": {"text": text}}]
     if not private and mention:
         segments.insert(0, {"type": "at", "data": {"qq": "42"}})
@@ -194,7 +194,7 @@ async def event_from_qq(adapter, *, private, number, sender="100", text="醒醒"
            "message_id": number, "user_id": int(sender), "message": segments,
            "raw_message": text, "font": 0, "sender": {"user_id": int(sender), "nickname": "tester", "role": "member"}}
     if not private:
-        raw["group_id"] = 10001
+        raw["group_id"] = int(group_id)
     message = await adapter.convert_message(Event(raw))
     assert message is not None
     return adapter.create_event(message)
@@ -257,6 +257,74 @@ async def main():
         async with await peer_connect() as ws:
             captures = []
             capture_task = asyncio.create_task(capture_sends(ws, captures))
+            group_scopes_backup = copy.deepcopy(shio.config['sys001']['ingress'].get('group_allowed_scopes'))
+            text_mode_backup = shio.config['sys001']['presentation'].get('text_component_mode')
+            shio.config['sys001']['ingress']['group_allowed_scopes'] = []
+            shio.config['sys001']['presentation']['text_component_mode'] = 'merge'
+            try:
+                for case_name, group_id, number, answer in (
+                    ('empty_group_allowlist_first', 20002, 450, '收到第一群的消息。'),
+                    ('empty_group_allowlist_second', 30003, 451, '收到第二群的消息。'),
+                ):
+                    captures.clear()
+                    endpoint.requests.clear()
+                    endpoint.responses = [{'role': 'assistant', 'content': answer}]
+                    item = await event_from_qq(adapter, private=False, number=number, sender='101', text='你好', mention=True, group_id=group_id)
+                    await asyncio.wait_for(scheduler.execute(item), timeout=25)
+                    snapshot = item.get_extra('shio.sys001.turn')
+                    ok = (
+                        snapshot is not None
+                        and snapshot.origin == 'direct'
+                        and snapshot.sender_id == '101'
+                        and snapshot.is_master is False
+                        and snapshot.group_id == str(group_id)
+                        and text_bubbles(captures) == [answer]
+                        and len(endpoint.requests) == 1
+                        and not endpoint.responses
+                    )
+                    print(json.dumps({'scenario': case_name, 'ok': ok, 'shio_owned': snapshot is not None}, ensure_ascii=False))
+                    if not ok:
+                        failures.append(case_name)
+            finally:
+                shio.config['sys001']['ingress']['group_allowed_scopes'] = group_scopes_backup
+                shio.config['sys001']['presentation']['text_component_mode'] = text_mode_backup
+            private_senders_backup = copy.deepcopy(shio.config['sys001']['ingress'].get('private_allowed_sender_ids'))
+            private_text_mode_backup = shio.config['sys001']['presentation'].get('text_component_mode')
+            shio.config['sys001']['ingress']['private_allowed_sender_ids'] = []
+            shio.config['sys001']['presentation']['text_component_mode'] = 'merge'
+            try:
+                for case_name, sender_id, number, answer in (
+                    ('empty_private_allowlist_first', '101', 452, '收到第一位私聊的消息。'),
+                    ('empty_private_allowlist_second', '102', 453, '收到第二位私聊的消息。'),
+                ):
+                    captures.clear()
+                    endpoint.requests.clear()
+                    endpoint.responses = [{'role': 'assistant', 'content': answer}]
+                    item = await event_from_qq(adapter, private=True, number=number, sender=sender_id, text='你好')
+                    await asyncio.wait_for(scheduler.execute(item), timeout=25)
+                    snapshot = item.get_extra('shio.sys001.turn')
+                    private_sends = [
+                        action for action in captures
+                        if action.get('action') in ('send_private_msg', 'send_msg')
+                        and str(action.get('params', {}).get('user_id')) == sender_id
+                    ]
+                    ok = (
+                        snapshot is not None
+                        and snapshot.origin == 'private'
+                        and snapshot.is_private is True
+                        and snapshot.sender_id == sender_id
+                        and snapshot.is_master is False
+                        and text_bubbles(captures) == [answer]
+                        and len(endpoint.requests) == 1
+                        and not endpoint.responses
+                        and bool(private_sends)
+                    )
+                    print(json.dumps({'scenario': case_name, 'ok': ok, 'shio_owned': snapshot is not None}, ensure_ascii=False))
+                    if not ok:
+                        failures.append(case_name)
+            finally:
+                shio.config['sys001']['ingress']['private_allowed_sender_ids'] = private_senders_backup
+                shio.config['sys001']['presentation']['text_component_mode'] = private_text_mode_backup
             scenarios = [("group_at", False, False), ("private", True, False), ("group_tool", False, True), ("private_tool", True, True), ("production_stream_setting", False, True), ("buffered_tool", False, True), ("reply_missing_tool", False, True), ("reply_valid_tool", False, True), ("four_lines", False, False)]
             if with_meme:
                 scenarios.append(("unresolved_meme_marker", False, False))
