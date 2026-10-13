@@ -8,7 +8,7 @@
 
 从第一次打招呼，到熟悉彼此的日常。
 
-[![版本](https://img.shields.io/badge/Shio-0.5.1.18-6d7fe8)](https://github.com/mydanyi/astrbot_plugin_shio/releases/latest)
+[![版本](https://img.shields.io/badge/Shio-0.5.18-6d7fe8)](https://github.com/mydanyi/astrbot_plugin_shio/releases/latest)
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.27.4–4.28.2-52b9b2)](https://github.com/AstrBotDevs/AstrBot)
 [![许可](https://img.shields.io/badge/License-MIT-f0bc68)](LICENSE)
 
@@ -66,7 +66,7 @@
 
 ## 开始使用
 
-当前版本 **0.5.1.18**，支持 **QQ / OneBot v11（aiocqhttp）**，AstrBot 版本范围为 **4.27.4–4.28.2**。
+当前版本 **0.5.18**，支持 **QQ / OneBot v11（aiocqhttp）**，AstrBot 版本范围为 **4.27.4–4.28.2**。
 
 1. 在 AstrBot 中接好 QQ、聊天模型与人格，确认基础对话正常。
 2. 打开插件管理，通过仓库地址安装：`https://github.com/mydanyi/astrbot_plugin_shio`。也可以从 [Releases](https://github.com/mydanyi/astrbot_plugin_shio/releases/latest) 下载 ZIP 安装包。

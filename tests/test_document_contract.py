@@ -108,6 +108,15 @@ class DocumentationContractTests(unittest.TestCase):
         self.assertIn("4.27.4", compatibility)
         self.assertIn("aiocqhttp", compatibility)
 
+    def test_release_version_is_stable_semver(self) -> None:
+        metadata = (ROOT / "metadata.yaml").read_text(encoding="utf-8")
+        version = re.search(r'^version: "([^"]+)"$', metadata, re.MULTILINE)
+        self.assertIsNotNone(version)
+
+        # 商店消费的发布版本必须是三段稳定 SemVer：每段为非负整数且无前导零。
+        stable = r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
+        self.assertRegex(version.group(1), stable)
+
     def test_auxiliary_timeout_descriptions_state_one_shared_budget(self) -> None:
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         groups = schema["sys001"]["items"]
