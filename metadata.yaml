@@ -3,7 +3,7 @@ display_name: 星汐
 desc: 给你的机器人完整的一生。保留角色性格，让它听懂语境、自然参与群聊，并用合适的节奏回应你；可与记忆、搜索和表情包插件搭配，让每一次相遇延续成日常。
 short_desc: 给你的机器人完整的一生：有性格、懂语境、会相处。
 help: 在 AstrBot 设置人格和聊天模型，再到星汐配置聊天范围、自然参与、角色化自然表达与文字气泡。完整说明见仓库 README 和设置指南。
-version: "0.5.18"
+version: "0.5.19"
 author: "Danyi"
 repo: "https://github.com/mydanyi/astrbot_plugin_shio"
 astrbot_version: ">=4.27.4,<=4.28.2"
