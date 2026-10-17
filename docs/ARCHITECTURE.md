@@ -2,6 +2,15 @@
 
 本页面向维护者，描述 Shio 0.5.19 的职责和接口。使用说明见 [README](../README.md) 与[设置指南](SETTINGS_GUIDE.md)。
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/shio-architecture-dark.png">
+  <img alt="Shio、AstrBot 与协作插件的架构图" src="images/shio-architecture-light.png" width="100%">
+</picture>
+
+[浅色高清图](images/shio-architecture-light.png) · [深色高清图](images/shio-architecture-dark.png) · [下载交互版](shio-architecture.zip?raw=1) · [HTML 源文件](shio-architecture.html)
+
+下载交互版 ZIP 并解压后，用浏览器打开 `shio-architecture.html`，可缩放、切换深浅色和导出图片。
+
 ## 责任划分
 
 Shio 接收 AstrBot 提供的真实事件，正式回复始终通过 `event.request_llm()` 进入官方链路。插件不复制管理员、Persona、conversation、Provider fallback、工具执行、沙箱和平台适配器。

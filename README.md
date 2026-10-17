@@ -12,7 +12,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.27.4–4.28.2-52b9b2)](https://github.com/AstrBotDevs/AstrBot)
 [![许可](https://img.shields.io/badge/License-MIT-f0bc68)](LICENSE)
 
-[开始使用](#开始使用) · [设置指南](docs/SETTINGS_GUIDE.md) · [常见问题](docs/TROUBLESHOOTING.md) · [下载](https://github.com/mydanyi/astrbot_plugin_shio/releases/latest)
+[开始使用](#开始使用) · [设置指南](docs/SETTINGS_GUIDE.md) · [常见问题](docs/TROUBLESHOOTING.md) · [架构图](#一张图看懂星汐) · [下载](https://github.com/mydanyi/astrbot_plugin_shio/releases/latest)
 
 </div>
 
@@ -51,6 +51,19 @@
 星汐为当前对话补充谁在说话、谁被提及，以及这一轮能够使用哪些工具。角色互动可以保留角色的表达；查询信息、发送消息等实际任务，则交给 AstrBot 和已安装的工具处理。
 
 需要进一步约束回复时，可以开启发送前审核，设置自己的基础与附加规则；回复或审核失败时，还可将故障摘要私聊给主人。
+
+## 一张图看懂星汐
+
+星汐负责聊天体验，AstrBot 提供人格、模型与工具执行，长期记忆、联网搜索和表情包由独立的可选插件补全。图中的分段、审核与协作能力均按各自设置生效。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/shio-architecture-dark.png">
+  <img alt="Shio、AstrBot 与协作插件的架构图" src="docs/images/shio-architecture-light.png" width="100%">
+</picture>
+
+[浅色高清图](docs/images/shio-architecture-light.png) · [深色高清图](docs/images/shio-architecture-dark.png) · [下载交互版](docs/shio-architecture.zip?raw=1)
+
+交互版下载并解压后，用浏览器打开 `shio-architecture.html`，可以缩放、切换深浅色，也可以导出图片。
 
 ## 把日常慢慢补全
 
