@@ -5004,7 +5004,7 @@
     <!-- Main Diagram -->
     <div class="diagram-container" data-detail-level="read"
          data-preset-badge-editorial-plate="ARCHIFY / 图版 04">
-      <svg viewBox="0 0 1240 650" role="img" lang="zh-CN" aria-labelledby="archify-diagram-title archify-diagram-description" data-preset="classic" data-quality-profile="showcase">
+      <svg viewBox="0 0 1240 650" role="img" lang="zh-CN" aria-labelledby="archify-diagram-title archify-diagram-description" data-preset="classic" data-quality-profile="showcase" data-animation="trace">
         <title id="archify-diagram-title">Shio · 插件职责与协作架构</title>
         <desc id="archify-diagram-description">由 Archify 生成的架构图。</desc>
         <!-- Definitions -->
@@ -5033,16 +5033,16 @@
 
 
         <!-- Connection paths (before components for correct z-order) -->
-        <path data-edge-from="platform" data-edge-to="ingress" data-edge-key="0" data-edge-id="admit" data-composition-points="270,216;350,216" d="M 270 216 L 350 216" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="ingress" data-edge-to="agent" data-edge-key="1" data-edge-id="request" data-composition-points="580,223;660,223" d="M 580 223 L 660 223" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="agent" data-edge-to="review" data-edge-key="2" data-edge-id="generated" data-composition-points="890,216;970,216" d="M 890 216 L 970 216" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="review" data-edge-to="meme" data-edge-key="3" data-edge-id="reviewed" data-composition-points="1085,252;1085,340" d="M 1085 252 L 1085 340" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="meme" data-edge-to="presentation" data-edge-key="4" data-edge-id="cleaned" data-composition-points="1085,412;1085,510" d="M 1085 412 L 1085 510" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="presentation" data-edge-to="send" data-edge-key="5" data-edge-id="textsend" data-composition-points="970,546;890,546" d="M 970 546 L 890 546" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="memory" data-edge-to="agent" data-edge-key="6" data-edge-id="memoryhook" data-composition-points="580,56;620,56;620,209;660,209" d="M 580 56 L 612 56 Q 620 56 620 64 L 620 201 Q 620 209 628 209 L 660 209" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
-        <path data-edge-from="agent" data-edge-to="search" data-edge-key="7" data-edge-id="searchtool" data-composition-points="775,180;775,92" d="M 775 180 L 775 92" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
-        <path data-edge-from="agent" data-edge-to="model" data-edge-key="8" data-edge-id="provider" data-composition-points="775,252;775,340" d="M 775 252 L 775 340" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
-        <path data-edge-from="review" data-edge-to="alert" data-edge-key="9" data-edge-id="failure" data-composition-points="1085,180;1085,92" d="M 1085 180 L 1085 92" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="platform" data-edge-to="ingress" data-edge-key="0" data-edge-id="admit" data-composition-points="270,216;350,216" d="M 270 216 L 350 216" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)" data-animate="edge" style="--step: 0"/>
+        <path data-edge-from="ingress" data-edge-to="agent" data-edge-key="1" data-edge-id="request" data-composition-points="580,223;660,223" d="M 580 223 L 660 223" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)" data-animate="edge" style="--step: 1"/>
+        <path data-edge-from="agent" data-edge-to="review" data-edge-key="2" data-edge-id="generated" data-composition-points="890,216;970,216" d="M 890 216 L 970 216" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)" data-animate="edge" style="--step: 2"/>
+        <path data-edge-from="review" data-edge-to="meme" data-edge-key="3" data-edge-id="reviewed" data-composition-points="1085,252;1085,340" d="M 1085 252 L 1085 340" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)" data-animate="edge" style="--step: 3"/>
+        <path data-edge-from="meme" data-edge-to="presentation" data-edge-key="4" data-edge-id="cleaned" data-composition-points="1085,412;1085,510" d="M 1085 412 L 1085 510" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)" data-animate="edge" style="--step: 4"/>
+        <path data-edge-from="presentation" data-edge-to="send" data-edge-key="5" data-edge-id="textsend" data-composition-points="970,546;890,546" d="M 970 546 L 890 546" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)" data-animate="edge" style="--step: 5"/>
+        <path data-edge-from="memory" data-edge-to="agent" data-edge-key="6" data-edge-id="memoryhook" data-composition-points="580,56;620,56;620,209;660,209" d="M 580 56 L 612 56 Q 620 56 620 64 L 620 201 Q 620 209 628 209 L 660 209" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)" data-animate="edge" style="--step: 6"/>
+        <path data-edge-from="agent" data-edge-to="search" data-edge-key="7" data-edge-id="searchtool" data-composition-points="775,180;775,92" d="M 775 180 L 775 92" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)" data-animate="edge" style="--step: 7"/>
+        <path data-edge-from="agent" data-edge-to="model" data-edge-key="8" data-edge-id="provider" data-composition-points="775,252;775,340" d="M 775 252 L 775 340" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)" data-animate="edge" style="--step: 8"/>
+        <path data-edge-from="review" data-edge-to="alert" data-edge-key="9" data-edge-id="failure" data-composition-points="1085,180;1085,92" d="M 1085 180 L 1085 92" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)" data-animate="edge" style="--step: 9"/>
 
         <!-- Components -->
         <g id="node-platform" data-node-id="platform" data-node-label="AstrBot 平台接入" tabindex="0" role="button" aria-label="聚焦AstrBot 平台接入，真实群聊 / 私聊事件 · 官方媒体处理, 架构组件" aria-pressed="false" data-node-kind="backend" data-node-sublabel="真实群聊 / 私聊事件 · 官方媒体处理" data-node-context="架构组件">
@@ -7224,7 +7224,7 @@
         btn.setAttribute('aria-pressed', paused ? 'false' : 'true');
         btn.disabled = systemPaused;
         label.textContent = viewerText(paused ? 'viewer.motion.still' : 'viewer.motion.live');
-        if (paused && lastEffectivePaused !== true && Archify.guidedViews && Archify.guidedViews.isPlaying()) {
+        if (paused && lastEffectivePaused !== true && Archify.guidedViews && typeof Archify.guidedViews.isPlaying === 'function' && Archify.guidedViews.isPlaying()) {
           Archify.guidedViews.pause();
         }
         if (paused && lastEffectivePaused !== true && Archify.guidedViews && Archify.guidedViews.settleHandoff) {

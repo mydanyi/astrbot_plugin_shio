@@ -56,14 +56,14 @@
 
 星汐负责聊天体验，AstrBot 提供人格、模型与工具执行，长期记忆、联网搜索和表情包由独立的可选插件补全。图中的分段、审核与协作能力均按各自设置生效。
 
+<a href="https://mydanyi.github.io/astrbot_plugin_shio/">
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/shio-architecture-dark.png">
-  <img alt="Shio、AstrBot 与协作插件的架构图" src="docs/images/shio-architecture-light.png" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/shio-architecture-dark.gif">
+  <img alt="Shio、AstrBot 与协作插件的架构图" src="docs/images/shio-architecture-light.gif" width="100%">
 </picture>
+</a>
 
-[浅色高清图](docs/images/shio-architecture-light.png) · [深色高清图](docs/images/shio-architecture-dark.png) · [下载交互版](docs/shio-architecture.zip?raw=1)
-
-交互版下载并解压后，用浏览器打开 `shio-architecture.html`，可以缩放、切换深浅色，也可以导出图片。
+点击上图打开在线交互版，可缩放、切换深浅色和导出图片，无需下载。
 
 ## 把日常慢慢补全
 
