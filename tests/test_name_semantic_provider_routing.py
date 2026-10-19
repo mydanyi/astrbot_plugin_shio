@@ -330,6 +330,7 @@ def _assert_star_registration_state_restored(snapshot) -> None:
 
 def _official_registry_order(*handler_names: str):
     """Read fixed-4.27.4 metadata and leave every test-global unchanged."""
+    restore_shio_namespace = _snapshot_shio_namespace()
     registry = _FIXED_STAR_HANDLER.StarHandlerRegistry()
     saved_astrbot_modules = {
         name: module
@@ -404,6 +405,7 @@ def _official_registry_order(*handler_names: str):
         if core_package is not None:
             _restore_parent_attribute(core_package, "sys001", saved_core_sys001)
 
+        restore_shio_namespace()
         assert _FIXED_STAR_HANDLER.star_handlers_registry is saved_registry
         assert _FIXED_STAR_REGISTER.star_handlers_registry is saved_register_registry
         _assert_handler_registries_restored(handler_snapshot)
@@ -441,8 +443,90 @@ def _restore_parent_attribute(parent, name: str, value) -> None:
         setattr(parent, name, value)
 
 
+def _snapshot_shio_namespace():
+    """Snapshot and restore only the plugin namespace and its child attributes."""
+    prefix = "astrbot_plugin_shio"
+
+    def is_shio(name):
+        return name == prefix or name.startswith(prefix + ".")
+
+    initial_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if is_shio(name)
+    }
+    initial_attrs = {
+        module: dict(module.__dict__)
+        for module in set(initial_modules.values())
+    }
+
+    def restore():
+        current_names = [name for name in sys.modules if is_shio(name)]
+        parent_attrs = {}
+
+        def add_parent_attr(parent, attr):
+            parent_attrs.setdefault(parent, set()).add(attr)
+
+        for name in set(initial_modules) | set(current_names):
+            for parent_name, parent in initial_modules.items():
+                if name.startswith(parent_name + "."):
+                    attr = name[len(parent_name) + 1:]
+                    if attr and "." not in attr:
+                        add_parent_attr(parent, attr)
+        for parent, attrs in initial_attrs.items():
+            parent_name = getattr(parent, "__name__", "")
+            if not isinstance(parent_name, str):
+                continue
+            for attr, value in attrs.items():
+                if (
+                    isinstance(value, types.ModuleType)
+                    and getattr(value, "__name__", None) == f"{parent_name}.{attr}"
+                ):
+                    add_parent_attr(parent, attr)
+
+        for name in tuple(sys.modules):
+            if is_shio(name) and name not in initial_modules:
+                sys.modules.pop(name)
+        sys.modules.update(initial_modules)
+        for parent, attrs in parent_attrs.items():
+            initial_attr = initial_attrs[parent]
+            for attr in attrs:
+                current = getattr(parent, attr, _MISSING)
+                if attr in initial_attr:
+                    if current is not initial_attr[attr]:
+                        setattr(parent, attr, initial_attr[attr])
+                elif (
+                    isinstance(current, types.ModuleType)
+                    and is_shio(getattr(current, "__name__", ""))
+                ):
+                    delattr(parent, attr)
+
+        restored_modules = {
+            name: module
+            for name, module in sys.modules.items()
+            if is_shio(name)
+        }
+        assert set(restored_modules) == set(initial_modules)
+        for name, module in initial_modules.items():
+            assert sys.modules.get(name, _MISSING) is module
+        for parent, attrs in parent_attrs.items():
+            initial_attr = initial_attrs[parent]
+            for attr in attrs:
+                current = getattr(parent, attr, _MISSING)
+                if attr in initial_attr:
+                    assert current is initial_attr[attr]
+                else:
+                    assert not (
+                        isinstance(current, types.ModuleType)
+                        and is_shio(getattr(current, "__name__", ""))
+                    )
+
+    return restore
+
+
 def _load_module_isolated_stubbed_plugin():
     """Capture fake plugin bindings without leaking them past module collection."""
+    restore_shio_namespace = _snapshot_shio_namespace()
     saved_astrbot_modules = {
         name: module
         for name, module in sys.modules.items()
@@ -506,6 +590,7 @@ def _load_module_isolated_stubbed_plugin():
         if core_package is not None:
             _restore_parent_attribute(core_package, "sys001", saved_core_sys001)
 
+        restore_shio_namespace()
         assert _FIXED_STAR_HANDLER.star_handlers_registry is saved_registry
         assert _FIXED_STAR_REGISTER.star_handlers_registry is saved_register_registry
         _assert_handler_registries_restored(handler_snapshot)

@@ -1,6 +1,8 @@
 # 开发架构
 
-本页面向维护者，描述 Shio 0.5.19 的职责和接口。使用说明见 [README](../README.md) 与[设置指南](SETTINGS_GUIDE.md)。
+本页面向维护者，描述 Shio 0.5.20 的职责和接口。使用说明见 [README](../README.md) 与[设置指南](SETTINGS_GUIDE.md)。
+
+独立设置页由 AstrBot 官方 Plugin Pages 承载，复用 Dashboard 登录。页面只通过官方 bridge 调用 Shio 的设置接口；配置仍由注入的 AstrBotConfig 保存，模型列表来自 Context 的聊天 Provider 列表。不另建服务器、账户或配置库。齿轮入口与新页面操作同一份设置。
 
 <a href="https://mydanyi.github.io/astrbot_plugin_shio/">
 <picture>

@@ -8,7 +8,7 @@
 
 从第一次打招呼，到熟悉彼此的日常。
 
-[![版本](https://img.shields.io/badge/Shio-0.5.19-6d7fe8)](https://github.com/mydanyi/astrbot_plugin_shio/releases/latest)
+[![版本](https://img.shields.io/badge/Shio-0.5.20-6d7fe8)](https://github.com/mydanyi/astrbot_plugin_shio/releases/latest)
 [![AstrBot](https://img.shields.io/badge/AstrBot-4.27.4–4.28.2-52b9b2)](https://github.com/AstrBotDevs/AstrBot)
 [![许可](https://img.shields.io/badge/License-MIT-f0bc68)](LICENSE)
 
@@ -79,7 +79,7 @@
 
 ## 开始使用
 
-当前版本 **0.5.19**，支持 **QQ / OneBot v11（aiocqhttp）**，AstrBot 版本范围为 **4.27.4–4.28.2**。
+当前版本 **0.5.20**，支持 **QQ / OneBot v11（aiocqhttp）**，AstrBot 版本范围为 **4.27.4–4.28.2**。
 
 1. 在 AstrBot 中接好 QQ、聊天模型与人格，确认基础对话正常。
 2. 打开插件管理，通过仓库地址安装：`https://github.com/mydanyi/astrbot_plugin_shio`。也可以从 [Releases](https://github.com/mydanyi/astrbot_plugin_shio/releases/latest) 下载 ZIP 安装包。
@@ -88,6 +88,12 @@
 5. 选择喜欢的文字气泡方式。**由星汐控制分段时，请关闭 AstrBot 自带分段**，避免同一条回复被拆两次。
 
 所有辅助模型都从 AstrBot 已有模型中下拉选择。初次使用可以先选“按句分段”，它不需要额外的分段模型调用。更多配置见[设置指南](docs/SETTINGS_GUIDE.md)。
+
+### 用自己的方式调整星汐
+
+在支持插件页面的 AstrBot 中，打开星汐详情里的 **Shio 设置**，即可按七个分区调整聊天体验。页面支持搜索、完整规则编辑，以及原生清爽、星雾玻璃、深海夜航、奶油手账四个主题。
+
+修改后点击“保存”才会生效；未保存时也可以放弃修改。新页面与齿轮入口使用同一份设置，不需要重新填写。旧版 AstrBot 仍可使用齿轮入口。
 
 ## 使用前了解这几件事
 

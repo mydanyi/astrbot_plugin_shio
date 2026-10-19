@@ -9,6 +9,7 @@ bot.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from datetime import UTC, datetime, timedelta, timezone
@@ -114,13 +115,140 @@ class SegmentedReplyCompatibility:
 
 
 @dataclass(frozen=True, slots=True)
+class NaturalAttributionFact:
+    subject: str
+    action: str
+    evidence: str
+
+
+@dataclass(frozen=True, slots=True)
+class NaturalAttribution:
+    perspective: str
+    addressee: str
+    evidence: str
+    facts: tuple[NaturalAttributionFact, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class NaturalParticipationDecision:
     """A strict, auxiliary-only natural-participation classification."""
 
     decision: str
+    attribution: NaturalAttribution | None = None
 
 
-def parse_natural_participation_decision(text: Any) -> NaturalParticipationDecision | None:
+def _valid_attribution_text(value: Any, *, limit: int, empty_ok: bool) -> bool:
+    if not isinstance(value, str) or len(value) > limit:
+        return False
+    if not value:
+        return empty_ok
+    if not value.strip():
+        return False
+    return not any(unicodedata.category(char) == 'Cc' for char in value)
+
+
+def _attribution_evidence_in_sources(evidence: str, sources: tuple[str, ...]) -> bool:
+    return not evidence or any(evidence in source for source in sources)
+
+
+def _resolve_natural_attribution_evidence(
+    value: Any, source_refs: Mapping[str, Any] | None
+) -> str | None:
+    if isinstance(value, str):
+        return value
+    if (
+        not isinstance(value, dict)
+        or set(value) != {'source_id'}
+        or not isinstance(source_refs, Mapping)
+    ):
+        return None
+    source_id = value['source_id']
+    if not isinstance(source_id, str) or source_id not in source_refs:
+        return None
+    resolved = source_refs[source_id]
+    return resolved if isinstance(resolved, str) else None
+
+
+def _validate_natural_attribution(
+    value: Any,
+    sources: Iterable[str],
+    *,
+    source_refs: Mapping[str, Any] | None = None,
+) -> NaturalAttribution | None:
+    if not isinstance(value, dict) or set(value) != {
+        'perspective',
+        'addressee',
+        'evidence',
+        'facts',
+    }:
+        return None
+    perspective = value['perspective']
+    addressee = value['addressee']
+    evidence = _resolve_natural_attribution_evidence(
+        value['evidence'], source_refs
+    )
+    facts = value['facts']
+    if not isinstance(perspective, str) or perspective not in {
+        'observer',
+        'participant',
+        'uncertain',
+    }:
+        return None
+    if not _valid_attribution_text(addressee, limit=80, empty_ok=True):
+        return None
+    if not _valid_attribution_text(
+        evidence, limit=300, empty_ok=perspective == 'uncertain'
+    ):
+        return None
+    if not isinstance(facts, list) or len(facts) > 6:
+        return None
+    source_texts = tuple(source for source in sources if isinstance(source, str))
+    if not _attribution_evidence_in_sources(evidence, source_texts):
+        return None
+    typed_facts: list[NaturalAttributionFact] = []
+    for fact in facts:
+        if not isinstance(fact, dict) or set(fact) != {
+            'subject',
+            'action',
+            'evidence',
+        }:
+            return None
+        subject = fact['subject']
+        action = fact['action']
+        fact_evidence = _resolve_natural_attribution_evidence(
+            fact['evidence'], source_refs
+        )
+        if not _valid_attribution_text(subject, limit=80, empty_ok=False):
+            return None
+        if not _valid_attribution_text(action, limit=160, empty_ok=False):
+            return None
+        if not _valid_attribution_text(
+            fact_evidence, limit=300, empty_ok=False
+        ):
+            return None
+        if not _attribution_evidence_in_sources(fact_evidence, source_texts):
+            return None
+        typed_facts.append(
+            NaturalAttributionFact(
+                subject=subject,
+                action=action,
+                evidence=fact_evidence,
+            )
+        )
+    return NaturalAttribution(
+        perspective=perspective,
+        addressee=addressee,
+        evidence=evidence,
+        facts=tuple(typed_facts),
+    )
+
+
+def parse_natural_participation_decision(
+    text: Any,
+    *,
+    sources: Iterable[str] = (),
+    source_refs: Mapping[str, Any] | None = None,
+) -> NaturalParticipationDecision | None:
     """Accept only the bounded JSON decision contract used before the Agent.
 
     The caller deliberately treats every other provider result as unavailable:
@@ -132,6 +260,20 @@ def parse_natural_participation_decision(text: Any) -> NaturalParticipationDecis
         value = json.loads(text)
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
+    if isinstance(value, dict) and set(value) == {'decision', 'attribution'}:
+        decision = value.get('decision')
+        if not isinstance(decision, str) or decision not in {
+            'REPLY',
+            'WAIT',
+            'NO_ACTION',
+        }:
+            return None
+        if decision != 'REPLY':
+            return None
+        attribution = _validate_natural_attribution(
+            value.get('attribution'), sources, source_refs=source_refs
+        )
+        return NaturalParticipationDecision(decision, attribution)
     if (
         not isinstance(value, dict)
         or set(value) != {"decision"}

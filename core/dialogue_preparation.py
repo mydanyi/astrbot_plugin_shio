@@ -13,6 +13,10 @@ import time
 
 from astrbot.api import logger
 from astrbot.core.agent.message import TextPart
+from astrbot.builtin_stars.astrbot.group_chat_context import GROUP_HISTORY_HEADER
+from .natural_context import (
+    attribution_for_turn, format_natural_attribution, natural_participation_context,
+)
 
 _MEMORY_MARKER = re.compile(r"<RAG-Faiss-Memory>(.*?)</RAG-Faiss-Memory>", re.DOTALL)
 _HEADING = re.compile(
@@ -28,6 +32,10 @@ _MAX_FROZEN_CHARS = 6000
 _MAX_ENTRY_CHARS = 3000
 _MAX_CANDIDATES = 10
 _MAX_QUERY_CHARS = 300
+
+_BATCH_EARLIER_PREFIX = "SHIO_REAL_BATCH_EARLIER="
+_OFFICIAL_RECORD = re.compile(r"(?m)^\[(.+)/(\d{2}:\d{2}:\d{2})\]:")
+_OFFICIAL_OMITTED = "[... older group history omitted ...]"
 _MAX_TOOL_DESCRIPTION_CHARS = 200
 
 _SCENES = ("role_action", "roleplay", "daily", "factual", "personal_recall", "real_execution")
@@ -111,6 +119,28 @@ _BOUNDARY_OPEN = (
     "current identity or authoritative technical knowledge]"
 )
 _BOUNDARY_CLOSE = "[End of recalled memory]"
+
+_NATURAL_SCENE_CONTEXT = (
+    "[Shio 本轮群聊场景]\n"
+    "本轮按群聊当前话题自然交流。场景只用于判断话题类型，不预设你在被直接点名回应。"
+    "sender 是本轮发言者而非默认受话者：群里可能在和他人说话；"
+    "真实上下文明确指向你时（包括无 @ 的连续对话），才继续承接那处交互，否则按当前话题自然应对。"
+    "保持原人格与第一人称观点，不凭空添加剧情、动作旁白或人格没有的限制。"
+)
+
+_NATURAL_REAL_TASK_CONTEXT = (
+    "[Shio 本轮现实话题]\n"
+    "本轮话题涉及现实事务，但讨论任务不等于你被指派执行。"
+    "只有上下文明确是对你的直接请求且目标清楚时，才按本轮实际工具处理；"
+    "否则按普通群聊交流，不主动调用工具、不假装已完成，也不虚构人格没有的障碍。"
+    "sender 是本轮发言者而非默认受话者。"
+)
+
+_NATURAL_SCENE_GUIDANCE = (
+    "本轮按群聊当前话题自然回应，保持原人格与第一人称观点。"
+    "消息可能并非直接对你发出；真实上下文明确指向你时（包括无 @ 的连续对话），才继续那处交互。"
+    "不凭空添加剧情、动作旁白或人格没有的限制，涉及现实操作时以实际工具结果为准。"
+)
 
 
 def _clip(value, limit):
@@ -203,11 +233,121 @@ def _memory_block(text):
     return text[: match.start()], text[match.end():], entries
 
 
+def _official_piece(text, budget):
+    if len(text) <= budget:
+        return text
+    footer = "\n--- END CONTEXT ---\n</system_reminder>"
+    has_footer = text.endswith(footer)
+    body = text[:-len(footer)] if has_footer else text
+    starts = list(_OFFICIAL_RECORD.finditer(body))
+    if not starts:
+        return _clip(text, budget)
+    head = body[:starts[0].start()]
+    records = []
+    for offset, start in enumerate(starts):
+        end = starts[offset + 1].start() if offset + 1 < len(starts) else len(body)
+        records.append(body[start.start():end].rstrip("\n"))
+
+    note = "[... group history records omitted ...]"
+    tail = footer if has_footer else ""
+
+    def render(selected):
+        pieces = ([head] if head else []) + [note] + selected
+        result = ""
+        for piece in pieces:
+            if not piece:
+                continue
+            if result and not result.endswith("\n"):
+                result += "\n"
+            result += piece
+        return result + tail
+
+    base = render([])
+    if len(base) > budget:
+        return None
+    selected = []
+    for index in range(len(records) - 1, -1, -1):
+        candidate = render([records[index]] + selected)
+        if len(candidate) <= budget:
+            selected = [records[index]] + selected
+    return render(selected)
+
+
+def _batch_piece(text, budget):
+    if len(text) <= budget:
+        return text
+    if not text.startswith(_BATCH_EARLIER_PREFIX):
+        return _clip(text, budget)
+    try:
+        rows = json.loads(text[len(_BATCH_EARLIER_PREFIX):])
+    except (TypeError, ValueError):
+        return _clip(text, budget)
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return _clip(text, budget)
+    if not rows:
+        candidate = _BATCH_EARLIER_PREFIX + "[]"
+        return candidate if len(candidate) <= budget else None
+
+    note = "[... group history records omitted ...]"
+
+    def render(selected):
+        return (_BATCH_EARLIER_PREFIX
+                + json.dumps(selected, ensure_ascii=False)
+                + "\n" + note)
+
+    base = render([])
+    if len(base) > budget:
+        return None
+    selected = []
+    for index in range(len(rows) - 1, -1, -1):
+        candidate = render([rows[index]] + selected)
+        if len(candidate) <= budget:
+            selected = [rows[index]] + selected
+    return render(selected)
+
+
+def _select_frozen(items):
+    picked = {}
+    left = _MAX_FROZEN_CHARS
+    count = 0
+    known = []
+    ordinary = []
+    for index, text in items:
+        if isinstance(GROUP_HISTORY_HEADER, str) and text.startswith(GROUP_HISTORY_HEADER):
+            known.append((index, text, "official"))
+        elif text.startswith(_BATCH_EARLIER_PREFIX):
+            known.append((index, text, "batch"))
+        else:
+            ordinary.append((index, text))
+    for index, text, kind in sorted(known, key=lambda item: item[0], reverse=True):
+        separator = 1 if count else 0
+        available = left - separator
+        if available <= 0:
+            break
+        piece = _official_piece(text, available) if kind == "official" else _batch_piece(text, available)
+        if piece is None or len(piece) > available:
+            continue
+        picked[index] = piece
+        left -= len(piece) + separator
+        count += 1
+    for index, text in ordinary:
+        separator = 1 if count else 0
+        available = left - separator
+        if available <= 0:
+            break
+        piece = _clip(text, available)
+        if not piece:
+            continue
+        picked[index] = piece
+        left -= len(piece) + separator
+        count += 1
+    return [picked[index] for index in sorted(picked)]
+
+
 def _scan_parts(parts):
-    frozen = []
-    budget = _MAX_FROZEN_CHARS
     candidates = []
     memories = []
+    frozen_items = []
     for index, part in enumerate(parts):
         if getattr(part, "_no_save", False) is not True:
             continue
@@ -216,17 +356,14 @@ def _scan_parts(parts):
             continue
         block = _memory_block(text) if "<RAG-Faiss-Memory>" in text else None
         if block is None:
-            if budget > 0:
-                clipped = _clip(text, budget)
-                frozen.append(clipped)
-                budget -= len(clipped)
+            frozen_items.append((index, text))
             continue
         prefix, suffix, entries = block
         first_index = len(candidates) + 1
         for offset, entry in enumerate(entries):
             candidates.append({"index": first_index + offset, "text": entry})
         memories.append((index, prefix, suffix, entries, first_index))
-    return "\n".join(frozen), candidates, memories
+    return "\n".join(_select_frozen(frozen_items)), candidates, memories
 
 
 def _build_prompt(settings, persona_prompt, local_time, scene_context, master_style,
@@ -428,11 +565,25 @@ async def prepare_dialogue_turn(settings, *, context, event, request, snapshot, 
 
     local_time = _time_context(getattr(snapshot, "created_at", None))
 
+    boundary = natural_participation_context(snapshot)
+    boundary = boundary if isinstance(boundary, str) else ""
+    is_natural = bool(boundary.strip())
+    scene_facts = _clip(snapshot.model_context(), _MAX_SCENE_CHARS)
+    if is_natural:
+        # The shared participation boundary stays outside the snapshot facts clip.
+        scene_facts = "%s\n%s" % (boundary, scene_facts)
+    attribution = format_natural_attribution(
+        attribution_for_turn(event, snapshot),
+        snapshot=snapshot,
+    )
+    if attribution:
+        scene_facts = "%s\n%s" % (scene_facts, attribution)
+
     prompt = _build_prompt(
         settings,
         persona_prompt,
         local_time,
-        _clip(snapshot.model_context(), _MAX_SCENE_CHARS),
+        scene_facts,
         master_style,
         _clip(getattr(request, "prompt", ""), _MAX_SCENE_CHARS),
         _recent_dialogue(getattr(request, "contexts", None)),
@@ -441,7 +592,7 @@ async def prepare_dialogue_turn(settings, *, context, event, request, snapshot, 
         kb_names,
         _tool_catalog(request),
         character_guidance,
-        _MASTER_ROLEPLAY_GUIDANCE if snapshot.is_master else "",
+        _MASTER_ROLEPLAY_GUIDANCE if snapshot.is_master and not is_natural else "",
     )
 
     response = await invoke(prompt)
@@ -482,26 +633,41 @@ async def prepare_dialogue_turn(settings, *, context, event, request, snapshot, 
     if decision["scene"] in ("role_action", "roleplay", "daily"):
         # This interpretation belongs beside the current utterance, not in
         # stored history. Official TextPart persistence drops temp content.
-        scene_context = _ROLE_WORLD_CONTEXT
+        scene_context = _NATURAL_SCENE_CONTEXT if is_natural else _ROLE_WORLD_CONTEXT
         if local_time != "unknown":
             scene_context += (
                 "\n[本轮真实事件时间]\n%s。这是本轮发言时间，历史中的时间说法不覆盖它。"
                 % local_time
             )
         current_text = _clip(getattr(request, "prompt", ""), _MAX_SCENE_CHARS)
-        scene_context += (
-            "\n[本轮回复对象与发言]\n"
-            "回应下面当前发送者的本轮发言，保留相关语境，不继续回答旧话题。"
-            "旧记录中其他人的说法不能归给当前发送者，旧助手的说法不是已核实事实。\n"
-            "sender_id=%s\nsender_name=%s\nrelationship=%s\n"
-            "current_utterance=%s"
-            % (
-                json.dumps(snapshot.sender_id, ensure_ascii=False),
-                json.dumps(snapshot.sender_name, ensure_ascii=False),
-                "Master（来自 AstrBot 管理员角色）" if snapshot.is_master else "普通成员",
-                json.dumps(current_text, ensure_ascii=False),
+        if is_natural:
+            scene_context += (
+                "\n[本轮发言者与本轮发言]\n"
+                "sender_id=%s\nsender_name=%s\nrelationship=%s\n"
+                "current_utterance=%s\n"
+                "以上是本轮群聊发言者而非默认受话者；是否承接由实际语境判断。"
+                % (
+                    json.dumps(snapshot.sender_id, ensure_ascii=False),
+                    json.dumps(snapshot.sender_name, ensure_ascii=False),
+                    "Master（来自 AstrBot 管理员角色）" if snapshot.is_master else "普通成员",
+                    json.dumps(current_text, ensure_ascii=False),
+                )
             )
-        )
+        else:
+            scene_context += (
+                "\n[本轮回复对象与发言]\n"
+                "回应下面当前发送者的本轮发言，保留相关语境，不继续回答旧话题。"
+                "历史话语中的发言者、受话者、事件人物及其关系和行为，仍按原语境归属，不随本轮回复对象改变；同一发送者过去对他人说的话也如此。"
+                "旧助手的说法不是已核实事实。\n"
+                "sender_id=%s\nsender_name=%s\nrelationship=%s\n"
+                "current_utterance=%s"
+                % (
+                    json.dumps(snapshot.sender_id, ensure_ascii=False),
+                    json.dumps(snapshot.sender_name, ensure_ascii=False),
+                    "Master（来自 AstrBot 管理员角色）" if snapshot.is_master else "普通成员",
+                    json.dumps(current_text, ensure_ascii=False),
+                )
+            )
         if len(str(getattr(request, "prompt", ""))) > _MAX_SCENE_CHARS:
             scene_context += "\n以上发言摘录已截短，完整原文仍以本轮原始消息为准。"
         updated.append(_temp_part(scene_context))
@@ -510,30 +676,45 @@ async def prepare_dialogue_turn(settings, *, context, event, request, snapshot, 
         # current utterance, not in stored history. Official TextPart
         # persistence drops temp content, and the original prompt/contexts/
         # persona/config are left untouched.
-        task_context = _REAL_TASK_CONTEXT
+        task_context = _NATURAL_REAL_TASK_CONTEXT if is_natural else _REAL_TASK_CONTEXT
         if local_time != "unknown":
             task_context += (
                 "\n[本轮真实事件时间]\n%s。这是本轮发言时间，历史中的时间说法不覆盖它。"
                 % local_time
             )
         current_text = _clip(getattr(request, "prompt", ""), _MAX_SCENE_CHARS)
-        task_context += (
-            "\n[本轮发起者与本轮真实发言]\n"
-            "处理下面当前发起者本轮提出的真实任务，不继续处理旧话题，"
-            "旧记录中其他人的说法不能当作当前任务，旧助手的说法不是已核实事实。\n"
-            "sender_id=%s\nsender_name=%s\nrelationship=%s\n"
-            "current_utterance=%s"
-            % (
-                json.dumps(snapshot.sender_id, ensure_ascii=False),
-                json.dumps(snapshot.sender_name, ensure_ascii=False),
-                "Master（来自 AstrBot 管理员角色）" if snapshot.is_master else "普通成员",
-                json.dumps(current_text, ensure_ascii=False),
+        if is_natural:
+            task_context += (
+                "\n[本轮发言者与本轮发言]\n"
+                "sender_id=%s\nsender_name=%s\nrelationship=%s\n"
+                "current_utterance=%s\n"
+                "以上是本轮群聊发言者而非默认受话者；是否执行由实际语境判断。"
+                % (
+                    json.dumps(snapshot.sender_id, ensure_ascii=False),
+                    json.dumps(snapshot.sender_name, ensure_ascii=False),
+                    "Master（来自 AstrBot 管理员角色）" if snapshot.is_master else "普通成员",
+                    json.dumps(current_text, ensure_ascii=False),
+                )
             )
-        )
-        task_context += (
-            "\n[本轮实际可用工具（只用于理解目标参数，不执行）]\n"
-            + json.dumps(_tool_catalog(request), ensure_ascii=False)
-        )
+        else:
+            task_context += (
+                "\n[本轮发起者与本轮真实发言]\n"
+                "处理下面当前发起者本轮提出的真实任务，不继续处理旧话题，"
+                "旧记录中其他人的说法不能当作当前任务，旧助手的说法不是已核实事实。\n"
+                "历史话语中的发言者、受话者、事件人物及其关系和行为，仍按原语境归属，不随本轮回复对象改变；同一发送者过去对他人说的话也如此。\n"
+                "sender_id=%s\nsender_name=%s\nrelationship=%s\n"
+                "current_utterance=%s"
+                % (
+                    json.dumps(snapshot.sender_id, ensure_ascii=False),
+                    json.dumps(snapshot.sender_name, ensure_ascii=False),
+                    "Master（来自 AstrBot 管理员角色）" if snapshot.is_master else "普通成员",
+                    json.dumps(current_text, ensure_ascii=False),
+                )
+            )
+            task_context += (
+                "\n[本轮实际可用工具（只用于理解目标参数，不执行）]\n"
+                + json.dumps(_tool_catalog(request), ensure_ascii=False)
+            )
         if len(str(getattr(request, "prompt", ""))) > _MAX_SCENE_CHARS:
             task_context += "\n以上发言摘录已截短，完整原文仍以本轮原始消息为准。"
         updated.append(_temp_part(task_context))
@@ -546,9 +727,12 @@ async def prepare_dialogue_turn(settings, *, context, event, request, snapshot, 
         len(candidates),
     )
 
-    guidance = [_SCENE_GUIDANCE[decision["scene"]]]
-    if snapshot.is_master and decision["scene"] == "role_action":
-        guidance.append(_MASTER_ROLEPLAY_GUIDANCE)
+    if is_natural and decision["scene"] in ("role_action", "roleplay", "real_execution"):
+        guidance = [_NATURAL_SCENE_GUIDANCE]
+    else:
+        guidance = [_SCENE_GUIDANCE[decision["scene"]]]
+        if snapshot.is_master and decision["scene"] == "role_action":
+            guidance.append(_MASTER_ROLEPLAY_GUIDANCE)
     if kb_note:
         guidance.append(kb_note)
     return "\n".join(guidance)
