@@ -11,7 +11,7 @@ from astrbot.core.agent.message import TextPart
 
 from .sys001 import (
     NaturalAttribution, NaturalAttributionFact, TurnSnapshot,
-    _valid_attribution_text,
+    _valid_attribution_text, component_target_ids,
 )
 
 CONTEXT_EXTRA = "shio.natural.official_context"
@@ -316,7 +316,8 @@ def capture_group_context(context: Any, event: Any) -> None:
     4.27.4 has no public non-consuming ICL snapshot API. Obtain its built-in
     instance through the public registry, then ONLY read its buffer and stable
     record IDs. No hooks patched, no second history store, no index fallback.
-    An absent ID cannot prove a causal cutoff and therefore yields no records.
+    A recorded event requires its stable ID. An unrecorded @-only event uses
+    the buffer as it stands at ingress, before the first asynchronous wait.
     """
     result = {'status': 'unavailable', 'records': ()}
     try:
@@ -330,9 +331,21 @@ def capture_group_context(context: Any, event: Any) -> None:
         ids = tuple(collector._record_ids.get(umo, ()))
         records = tuple(collector.raw_records.get(umo, ()))
         record_id = event.get_extra('_group_context_record_id')
-        if not isinstance(record_id, str) or record_id not in ids or len(ids) != len(records):
+        if len(ids) != len(records):
             return
-        cutoff = ids.index(record_id)
+        if isinstance(record_id, str):
+            if record_id not in ids:
+                return
+            cutoff = ids.index(record_id)
+        elif (
+            not event.get_message_str().strip()
+            and component_target_ids(event.get_messages(), str(event.get_self_id()))[0]
+        ):
+            # AstrBot does not record an At-only message. The synchronous
+            # ingress snapshot is its cutoff; never revisit this live buffer.
+            cutoff = len(ids)
+        else:
+            return
         # Retain immutable string references within AstrBot's own buffer bound.
         # Shio's input limits apply AFTER the merged batch IDs are excluded;
         # otherwise current messages could consume the history allowance.

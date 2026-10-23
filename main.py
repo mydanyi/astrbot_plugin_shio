@@ -24,8 +24,10 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, ResultContentType,
 from astrbot.api.message_components import Plain
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
-from astrbot.core.agent.message import TextPart
-from astrbot.builtin_stars.astrbot.group_chat_context import GROUP_HISTORY_HEADER
+from astrbot.core.agent.message import Message, TextPart, ThinkPart
+from astrbot.builtin_stars.astrbot.group_chat_context import (
+    GROUP_HISTORY_FOOTER, GROUP_HISTORY_HEADER,
+)
 
 from .core.settings_page import register_settings_page
 from .core.active_event_fence import ActiveEventFence
@@ -34,7 +36,7 @@ from .core.reply_drain import ReplyDrain
 from .core.character_dialogue import REVIEW_REFERENCE_EXTRA, prepare_character_dialogue
 from .core.dialogue_preparation import prepare_dialogue_turn
 from .core.natural_context import (
-    DEFAULT_NATURAL_PROMPT, NATURAL_ATTRIBUTION_EXTRA, NATURAL_ATTRIBUTION_PROTOCOL,
+    CONTEXT_EXTRA, DEFAULT_NATURAL_PROMPT, NATURAL_ATTRIBUTION_EXTRA, NATURAL_ATTRIBUTION_PROTOCOL,
     _project_natural_observer_request,
     project_natural_evidence_inputs,
     NaturalAttributionBinding, attribution_for_turn, capture_group_context,
@@ -2342,7 +2344,11 @@ class ShioPlugin(Star):
         # Agent declines an empty request without final/send hooks, so such
         # events must never acquire a batch owner. Media/Reply retain their
         # existing official construction and boundary handling below.
-        if not provisional.message_text.strip() and not self._has_official_boundary_component(event):
+        if (
+            not provisional.message_text.strip()
+            and not provisional.at_self
+            and not self._has_official_boundary_component(event)
+        ):
             return
         ingress = self._ingress_settings()
         entry = admit_ingress(
@@ -2356,6 +2362,8 @@ class ShioPlugin(Star):
         )
         if not entry.allowed:
             return
+        if not provisional.is_private:
+            capture_group_context(self.context, event)
         drain = getattr(self, "_reply_drain", None)
         if isinstance(drain, ReplyDrain) and not drain.track(event):
             event.should_call_llm(True)
@@ -2375,8 +2383,6 @@ class ShioPlugin(Star):
             await self._batch_hold_official_boundary(event, boundary_snapshot)
             return
         group = self._group_settings()
-        if not provisional.is_private and group.get("natural_participation_enabled", False):
-            capture_group_context(self.context, event)
         # Private, native @, and Reply-to-self are mandatory entries.  Do not
         # await a name classifier before deciding them: its timeout/cancel is
         # unrelated to AstrBot's direct-reply contract.
@@ -2515,6 +2521,10 @@ class ShioPlugin(Star):
         # message: it must never be asked to emit WAIT/NO_ACTION after tools or
         # conversation state may already have run.
         prompt = snapshot.message_text
+        if not prompt.strip() and snapshot.at_self:
+            # Describe the real event without inventing a user utterance or
+            # altering platform history. AstrBot rejects an empty request.
+            prompt = "（本条消息仅 @ 了你，没有附加正文。请结合此前语境自然回应；话题不明时再询问。）"
         # ProcessStage would otherwise run the default AgentRequestSubStage
         # after consuming this yielded request. This public flag blocks only
         # that duplicate default call, never this plugin request.
@@ -2779,37 +2789,61 @@ class ShioPlugin(Star):
         snapshot: TurnSnapshot,
         req: ProviderRequest,
     ) -> None:
-        """Keep official group ICL and earlier batch messages request-local.
-
-        The official hook runs before this one. AstrBot 4.27.4 does not mark
-        its ICL TextPart temporary, so explicitly use ContentPart.mark_as_temp
-        before the request is assembled. Never query persisted group history
-        here and never replace the official conversation in req.contexts.
-        """
+        """Project this event's frozen official ICL and real batch, not live history."""
+        batch = event.get_extra("shio.sys001.batch", ())
+        earlier_items = (
+            batch[:-1]
+            if isinstance(batch, tuple) and all(isinstance(item, _BatchMessage) for item in batch)
+            else ()
+        )
+        earlier = self._batch_contexts(earlier_items)
+        frozen = event.get_extra(CONTEXT_EXTRA)
+        frozen_available = isinstance(frozen, dict) and frozen.get("status") == "available"
+        expired_cutoff = (
+            isinstance(frozen, dict) and frozen.get("status") == "unavailable"
+            and isinstance(event.get_extra("_group_context_record_id"), str)
+        )
         has_official_context = False
         if not snapshot.is_private and self._official_icl_enabled(event):
+            if frozen_available or expired_cutoff:
+                # The official hook consumes a shared pending window. Rebuild
+                # only its own block from ingress, even if another request has
+                # consumed it or a stale numeric index picked future records.
+                req.extra_user_content_parts = [
+                    part for part in req.extra_user_content_parts
+                    if not (isinstance(part, TextPart) and part.text.startswith(GROUP_HISTORY_HEADER))
+                ]
+                represented_ids = {
+                    item.event.get_extra("_group_context_record_id") for item in earlier_items
+                }
+                records = [text for record_id, text in frozen.get("records", ())
+                           if record_id not in represented_ids] if frozen_available else []
+                if records:
+                    req.extra_user_content_parts.append(TextPart(
+                        text=GROUP_HISTORY_HEADER + "\n".join(records) + GROUP_HISTORY_FOOTER
+                    ).mark_as_temp())
             for part in req.extra_user_content_parts:
                 if isinstance(part, TextPart) and part.text.startswith(GROUP_HISTORY_HEADER):
                     part.mark_as_temp()
                     has_official_context = True
-        if has_official_context:
+        if has_official_context and not frozen_available:
             event.set_extra("shio.sys001.group_context_owner", "official_icl")
             return
-
-        batch = event.get_extra("shio.sys001.batch", ())
-        earlier = (
-            self._batch_contexts(batch[:-1])
-            if isinstance(batch, tuple) and all(isinstance(item, _BatchMessage) for item in batch)
-            else []
-        )
         if earlier:
+            # Only replace a batch we can actually rebuild. Other hook callers
+            # may already supply a frozen part without scheduler metadata.
+            req.extra_user_content_parts = [
+                part for part in req.extra_user_content_parts
+                if not (isinstance(part, TextPart) and part.text.startswith("SHIO_REAL_BATCH_EARLIER="))
+            ]
             req.extra_user_content_parts.append(
                 TextPart(
                     text="SHIO_REAL_BATCH_EARLIER="
                     + json.dumps(earlier, ensure_ascii=False, separators=(",", ":"))
                 ).mark_as_temp()
             )
-        event.set_extra("shio.sys001.group_context_owner", "real_batch" if earlier else "none")
+        event.set_extra("shio.sys001.group_context_owner",
+                        "official_icl" if has_official_context else "real_batch" if earlier else "none")
 
     def _project_group_visible_tools(
         self,
@@ -2940,6 +2974,12 @@ class ShioPlugin(Star):
             "current_message": review_message(snapshot),
             "earlier_batch_messages": [review_message(item) for item in earlier[-32:]],
             "batch_truncated": len(earlier) > 32,
+            "earlier_group_context": decision_history(
+                event, {}, self._group_settings(), {
+                    item.event.get_extra("_group_context_record_id")
+                    for item in batch if isinstance(item, _BatchMessage)
+                } if isinstance(batch, tuple) else set(),
+            ),
         }, ensure_ascii=False)
         candidate = text
         repairs = 0
@@ -3204,6 +3244,46 @@ class ShioPlugin(Star):
             # AstrBot invokes OnAgentDone before ResultDecorate/Respond for
             # non-streaming QQ. Keep the final observation for ALL origins,
             # including private and directed group turns, until after-send.
+            if (
+                observation.raw_response is _response
+                and _response.role == 'assistant'
+            ):
+                messages = getattr(run_context, 'messages', None)
+                if isinstance(messages, list) and messages:
+                    tail = messages[-1]
+                    if (
+                        isinstance(tail, Message)
+                        and tail.role == 'assistant'
+                        and not tail.tool_calls
+                        and isinstance(tail.content, list)
+                    ):
+                        tail_content = tail.content
+                        text_parts = [
+                            part
+                            for part in tail_content
+                            if isinstance(part, TextPart)
+                        ]
+                        if text_parts and all(
+                            isinstance(part, (TextPart, ThinkPart))
+                            for part in tail_content
+                        ):
+                            original_text = ''.join(
+                                part.text for part in text_parts
+                            )
+                            completion_text = _response.completion_text
+                            if isinstance(completion_text, str):
+                                if (
+                                    observation.outcome == 'review_exhausted'
+                                    and not completion_text
+                                ):
+                                    messages.pop()
+                                elif (
+                                    completion_text
+                                    and completion_text != original_text
+                                ):
+                                    tail.content = [
+                                        TextPart(text=completion_text)
+                                    ]
             event.set_extra(_SHIO_AGENT_ERROR_TOKEN_EXTRA, None)
             return
         event.set_extra(SYS001_FINAL_AGENT_OBSERVATION_EXTRA, None)

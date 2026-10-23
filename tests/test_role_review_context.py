@@ -6,10 +6,30 @@ from datetime import datetime, timezone
 import pytest
 
 from astrbot_plugin_shio.core.character_dialogue import REVIEW_REFERENCE_EXTRA
+from astrbot_plugin_shio.core.natural_context import CONTEXT_EXTRA
 from astrbot_plugin_shio.core.sys001 import SYS001_TURN_EXTRA
 from test_dialogue_preparation import FakeProvider, PERSONA, cfg, mk, req, turn
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_review_receives_frozen_group_topic_before_current_short_question():
+    provider = FakeProvider('{"action":"keep"}')
+    config = cfg(prep='off')
+    config['sys001']['final_review'] = {'mode':'core','timeout_seconds':30}
+    plugin = mk(provider=provider,config=config)
+    event = turn()
+    event.set_extra(CONTEXT_EXTRA, {
+        'status': 'available',
+        'records': (('earlier', '[alice]: EXT_DOCK_GREEN_SCREEN，拔掉扩展坞就正常。'),),
+    })
+    outcome = await plugin._review_final_text(
+        event, event.get_extra(SYS001_TURN_EXTRA), '先排查扩展坞和线材。')
+    assert not outcome.exhausted
+    prompt = provider.calls[-1]['prompt']
+    evidence = json.loads(prompt.split('CURRENT_EVENT_CONTEXT:\n',1)[1].split('\n\nTEXT:',1)[0])
+    assert 'EXT_DOCK_GREEN_SCREEN' in json.dumps(evidence,ensure_ascii=False)
+    assert 'alice' in json.dumps(evidence,ensure_ascii=False)
 
 
 @pytest.mark.parametrize('scene,expected', [

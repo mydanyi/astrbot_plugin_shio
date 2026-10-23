@@ -13,6 +13,7 @@ import astrbot_plugin_shio.core.character_dialogue as character_dialogue
 import astrbot_plugin_shio.core.natural_context as natural_context
 import astrbot_plugin_shio.core.sys001 as sys001
 from astrbot.core.message.components import Plain
+from astrbot.builtin_stars.astrbot.group_chat_context import GROUP_HISTORY_HEADER
 from test_bug001_boundary_pipeline import _event
 from test_dialogue_preparation import FORMAL, FakeProvider, cfg, mk, req
 
@@ -1552,8 +1553,13 @@ async def test_source_id_gate_uses_projected_original_evidence(kind):
     calls_before = len(_calls(provider))
     await plugin.attach_turn_and_project_capabilities(event, request)
     parts = list(request.extra_user_content_parts)
-    assert len(parts) == len(before_parts) + 4
-    assert parts[3:-1] == before_parts
+    history_parts = [p for p in parts if isinstance(p, agent_message.TextPart)
+                     and p.text.startswith(GROUP_HISTORY_HEADER)]
+    assert len(history_parts) == (1 if kind == 'history' else 0)
+    if history_parts:
+        assert expected in history_parts[0].text and history_parts[0]._no_save
+    assert len(parts) == len(before_parts) + 4 + len(history_parts)
+    assert parts[3:3 + len(before_parts)] == before_parts
     assert parts[-1].text == formatted
     assert getattr(parts[-1], '_no_save', False) is True
     assert len(_calls(provider)) == calls_before
