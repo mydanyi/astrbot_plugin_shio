@@ -60,6 +60,7 @@ from .core.sys001 import (
     master_alert_quiet_deadline,
     parse_final_review_decision,
     strip_auxiliary_meme_markers,
+    strip_orphan_empty_meme_json,
     admit_ingress,
     TurnLifecycle,
     TurnSnapshot,
@@ -3071,6 +3072,51 @@ class ShioPlugin(Star):
             candidate = usable_decision.replacement_text
             repairs += 1
 
+    def _clean_tool_meme_reply(
+        self, event: AstrMessageEvent, snapshot: TurnSnapshot, response: LLMResponse
+    ) -> str | None:
+        if event.get_extra("meme_manager_semantic_mode") != "tool":
+            return None
+        if getattr(response, "role", None) != "assistant":
+            return None
+        if getattr(response, "tools_call_name", None):
+            return None
+        user_text = str(getattr(snapshot, "message_text", "") or "")
+        _req = event.get_extra(_SHIO_AGENT_REQUEST_EXTRA)
+        if _req is not None:
+            prompt_text = getattr(_req, "prompt", None)
+            if prompt_text:
+                user_text = user_text + "\n" + str(prompt_text)
+        original_text = getattr(response, "completion_text", None)
+        if isinstance(original_text, str):
+            cleaned_text = strip_orphan_empty_meme_json(original_text, user_text=user_text)
+            if cleaned_text != original_text:
+                response.completion_text = cleaned_text
+                if not cleaned_text:
+                    event.set_extra("shio.sys001.empty_meme_selection_response", response)
+            result_chain = getattr(response, "result_chain", None)
+            _parts = getattr(result_chain, "chain", None)
+            if result_chain:
+                if isinstance(_parts, list) and _parts and isinstance(_parts[-1], Plain):
+                    if isinstance(_parts[-1].text, str):
+                        _last_cleaned = strip_orphan_empty_meme_json(
+                            _parts[-1].text, user_text=user_text
+                        )
+                        if _last_cleaned != _parts[-1].text:
+                            if _last_cleaned:
+                                _parts[-1].text = _last_cleaned
+                            else:
+                                _parts.pop()
+            if (
+                not cleaned_text
+                and cleaned_text != original_text
+                and event.get_extra("meme_manager_semantic_selected_ids")
+                and not _parts
+            ):
+                response.result_chain = MessageChain([Plain("")])
+                event.set_extra("meme_manager_image_only_reply", True)
+        return user_text
+
     @filter.on_llm_response(priority=100000)
     async def observe_final_agent_response(
         self, event: AstrMessageEvent, response: LLMResponse
@@ -3094,6 +3140,8 @@ class ShioPlugin(Star):
             FinalAgentObservation,
         ):
             return
+        user_text = self._clean_tool_meme_reply(event, snapshot, response)
+        clean_meme_selection = user_text is not None
         review = _FinalReviewOutcome(str(getattr(response, "completion_text", "")))
         if isinstance(response.completion_text, str) and response.completion_text:
             try:
@@ -3113,7 +3161,14 @@ class ShioPlugin(Star):
                 if isinstance(fence, ActiveEventFence):
                     fence.discard(event)
                 return
-            response.completion_text = review.text
+            if clean_meme_selection and isinstance(review.text, str):
+                _reviewed_text = strip_orphan_empty_meme_json(
+                    review.text, user_text=user_text
+                )
+                if _reviewed_text:
+                    response.completion_text = _reviewed_text
+            else:
+                response.completion_text = review.text
         if review.exhausted and not review.accepted_last_reply:
             if self._final_review_settings().get(
                 "send_last_reply_on_review_exhausted", False
@@ -3239,7 +3294,24 @@ class ShioPlugin(Star):
         if (
             isinstance(snapshot, TurnSnapshot)
             and isinstance(observation, FinalAgentObservation)
-            and observation.outcome in {"final_text", "review_exhausted"}
+            and observation.raw_response is _response
+        ):
+            self._clean_tool_meme_reply(event, snapshot, _response)
+        empty_meme_response = event.get_extra(
+            "shio.sys001.empty_meme_selection_response"
+        )
+        if empty_meme_response is _response:
+            event.set_extra("shio.sys001.empty_meme_selection_response", None)
+        if (
+            isinstance(snapshot, TurnSnapshot)
+            and isinstance(observation, FinalAgentObservation)
+            and (
+                observation.outcome in {"final_text", "review_exhausted"}
+                or (
+                    observation.outcome in {"empty", "reasoning_only"}
+                    and empty_meme_response is _response
+                )
+            )
         ):
             # AstrBot invokes OnAgentDone before ResultDecorate/Respond for
             # non-streaming QQ. Keep the final observation for ALL origins,
@@ -3273,8 +3345,11 @@ class ShioPlugin(Star):
                             completion_text = _response.completion_text
                             if isinstance(completion_text, str):
                                 if (
-                                    observation.outcome == 'review_exhausted'
-                                    and not completion_text
+                                    not completion_text
+                                    and (
+                                        observation.outcome == 'review_exhausted'
+                                        or empty_meme_response is _response
+                                    )
                                 ):
                                     messages.pop()
                                 elif (
