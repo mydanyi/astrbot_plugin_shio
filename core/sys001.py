@@ -796,6 +796,24 @@ def strip_auxiliary_meme_markers(text: str, user_text: str = "") -> str:
     return pattern.sub(replace_marker, text).strip()
 
 
+_ORPHAN_EMPTY_MEME_JSON_RE = re.compile(
+    r'(?:\A[ \t]*|\r?\n[ \t]*(?:\r?\n[ \t]*)*)'
+    r'\{[ \t]*"meme_id"[ \t]*:[ \t]*""[ \t]*\}[ \t]*(?:\r?\n[ \t]*)*\Z'
+)
+
+
+def strip_orphan_empty_meme_json(text: str, user_text: str = "") -> str:
+    if not isinstance(text, str):
+        return text
+    lowered = (user_text or "").lower()
+    if "json" in lowered or "meme_id" in lowered:
+        return text
+    match = _ORPHAN_EMPTY_MEME_JSON_RE.search(text)
+    if not match:
+        return text
+    return text[:match.start()]
+
+
 def parse_final_review_decision(value: Any, original_text: str) -> FinalReviewDecision | None:
     """Accept only a small, explicit review contract without hidden markers.
 

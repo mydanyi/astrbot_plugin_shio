@@ -521,6 +521,121 @@ async def main():
                 if not ok:
                     failures.append(name)
 
+            saved_streaming_response = config["provider_settings"].get("streaming_response")
+            cases = [
+                ("请用两句短话回复。", "第一句。\n第二句。\n\n{\"meme_id\":\"\"}", ["第一句。", "第二句。"], "第一句。\n第二句。", False),
+                ("请原样输出 JSON {\"meme_id\":\"\"}。", "{\"meme_id\":\"\"}", ["{\"meme_id\":\"\"}"], "{\"meme_id\":\"\"}", False),
+                ("这次也说两句。", "{ \"meme_id\" : \"\" }", [], None, False),
+            ]
+            meme_id = None
+            if with_meme:
+                image_path = image_dir / "fixture.png"
+                import hashlib
+                from data.plugins.meme_manager.backend.semantic.storage import load_metadata, save_metadata
+                pack_dir = image_dir.parent.parent
+                digest = hashlib.sha256(image_path.read_bytes()).hexdigest()
+                meta = load_metadata(pack_dir)
+                meta.setdefault("images", {})[digest] = {
+                    "content_sha256": digest,
+                    "relative_path": "memes/happy/fixture.png",
+                    "category": "happy",
+                }
+                save_metadata(pack_dir, meta)
+                reloaded = load_metadata(pack_dir)
+                entry_id = None
+                for eid, entry in (reloaded.get("images") or {}).items():
+                    if entry.get("relative_path") == "memes/happy/fixture.png":
+                        entry_id = eid
+                        break
+                assert entry_id is not None, "meme metadata entry was not created for fixture.png"
+                meme_id = "meme:" + entry_id
+                cases.append(("这台掌机用起来怎么样？", "手感挺好。\n续航也够用。\n\n{\"meme_id\":\"" + meme_id + "\"}", ["手感挺好。", "续航也够用。"], "手感挺好。\n续航也够用。", True))
+                cases.append(("这下真开心。", '{"meme_id":"' + meme_id + '"}', [], None, True))
+            try:
+                for stream in (False, True):
+                    config["provider_settings"]["streaming_response"] = stream
+                    await scheduler.stages[1].initialize(pipeline_context)
+                    for idx, (user_text, output, expected_bubbles, expected_history, expect_image) in enumerate(cases, start=1):
+                        captures.clear()
+                        endpoint.requests.clear()
+                        event = await event_from_qq(adapter, private=False, number=90 + idx + (10 if stream else 0), sender="101", text=user_text)
+
+                        def _before_response(_event=event, _with_meme=with_meme):
+                            _event.set_extra("meme_manager_semantic_mode", "tool")
+                            if _with_meme:
+                                _event.set_extra("meme_manager_semantic_active", True)
+                                runtime_pack_ids = _event.get_extra("meme_manager_runtime_pack_ids")
+                                if not runtime_pack_ids:
+                                    runtime_pack_ids = ["builtin-default"]
+                                    _event.set_extra("meme_manager_runtime_pack_ids", runtime_pack_ids)
+                                _event.set_extra("meme_manager_semantic_verified_pack_ids", ",".join(runtime_pack_ids))
+                        endpoint.before_response = _before_response
+                        cid_before = await context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
+                        conv_before = await context.conversation_manager.get_conversation(event.unified_msg_origin, cid_before)
+                        history_before = json.loads(conv_before.history) if conv_before and conv_before.history else []
+                        assistant_count_before = sum(1 for entry in history_before if entry.get("role") == "assistant")
+                        endpoint.responses = [{"role": "assistant", "content": output}]
+                        try:
+                            await asyncio.wait_for(scheduler.execute(event), timeout=25)
+                        finally:
+                            endpoint.before_response = None
+                        cid = await context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
+                        conv = await context.conversation_manager.get_conversation(event.unified_msg_origin, cid)
+                        history = json.loads(conv.history)
+                        last_assistant = None
+                        for entry in history:
+                            if entry.get("role") == "assistant":
+                                content = entry.get("content")
+                                if isinstance(content, str):
+                                    last_assistant = content
+                                elif isinstance(content, list):
+                                    last_assistant = "".join(p.get("text", "") for p in content if p.get("type") == "text")
+                        assistant_count_after = sum(1 for entry in history if entry.get("role") == "assistant")
+                        bubbles = text_bubbles(captures)
+                        image_count = 0
+                        for p in captures:
+                            for part in (p.get("params", {}) or {}).get("message", []) or []:
+                                if isinstance(part, dict) and part.get("type") == "image":
+                                    image_count += 1
+                        flagged = bool(event.get_extra("meme_manager_semantic_response_processed"))
+                        one_request = len(endpoint.requests) == 1
+                        stream_flag = bool(endpoint.requests[0].get("stream")) if endpoint.requests else False
+                        history_ok = (assistant_count_before == assistant_count_after) if expected_history is None else (last_assistant == expected_history)
+                        expected_image_count = 1 if expect_image else 0
+                        source_has_meme_id = meme_id is not None and meme_id in output
+                        ok = (
+                            one_request
+                            and stream_flag is stream
+                            and bubbles == expected_bubbles
+                            and history_ok
+                            and image_count == expected_image_count
+                        )
+                        if expect_image:
+                            ok = ok and flagged and source_has_meme_id
+                        print("CASE " + json.dumps({
+                            "scenario": "streaming_response_" + str(stream).lower() + "_case_" + str(idx),
+                            "mode": "regression_meme_convert" if expect_image else "text",
+                            "ok": ok,
+                            "stream": stream_flag,
+                            "requests": len(endpoint.requests),
+                            "expected_bubbles": expected_bubbles,
+                            "actual_bubbles": bubbles,
+                            "expected_images": 1 if expect_image else 0,
+                            "actual_images": image_count,
+                            "expected_history": expected_history,
+                            "actual_history": last_assistant,
+                            "response_processed": flagged,
+                            "source_has_meme_id": source_has_meme_id,
+                            "assistant_count_before": assistant_count_before,
+                            "assistant_count_after": assistant_count_after,
+                            "transport": "group",
+                        }, ensure_ascii=False), flush=True)
+                        if not ok:
+                            failures.append("streaming_response_" + str(stream).lower() + "_case_" + str(idx))
+            finally:
+                config["provider_settings"]["streaming_response"] = saved_streaming_response
+                await scheduler.stages[1].initialize(pipeline_context)
+
             # A private batch must keep both messages just like a group batch;
             # a group's later speaker may differ from the first one.
             config["provider_settings"]["buffer_intermediate_messages"] = False
